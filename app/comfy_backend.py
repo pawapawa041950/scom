@@ -1,0 +1,297 @@
+"""Embedded ComfyUI backend: launch as a local subprocess and drive via API.
+
+Responsibilities:
+  * Generate an ``extra_model_paths.yaml`` mapping our models/{diffusion,vae,te}
+    folders onto ComfyUI's expected categories.
+  * Start ``main.py`` as a subprocess bound to 127.0.0.1 on a chosen port.
+  * Wait until the HTTP server is reachable.
+  * Queue prompts, stream progress over the websocket, and return the decoded
+    output image bytes.
+"""
+from __future__ import annotations
+
+import json
+import socket
+import subprocess
+import sys
+import threading
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+import uuid
+from collections import deque
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Callable, Optional
+
+import websocket  # websocket-client
+
+from . import config
+from .textutil import strip_ansi
+
+
+def _free_port(preferred: int = 8199) -> int:
+    """Return a usable localhost port, preferring ``preferred``."""
+    for port in (preferred, 0):
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            try:
+                s.bind(("127.0.0.1", port))
+                return s.getsockname()[1]
+            except OSError:
+                continue
+    raise RuntimeError("could not allocate a localhost port")
+
+
+def write_extra_model_paths(paths: config.AppPaths) -> Path:
+    """Write extra_model_paths.yaml pointing ComfyUI at our models folder."""
+    models = paths.models
+    yaml_text = (
+        "scom:\n"
+        f"  base_path: {models.as_posix()}\n"
+        "  is_default: true\n"
+        "  diffusion_models: diffusion_models/\n"
+        "  vae: vae/\n"
+        "  text_encoders: text_encoders/\n"
+    )
+    out = paths.user_data / "extra_model_paths.yaml"
+    out.write_text(yaml_text, encoding="utf-8")
+    return out
+
+
+@dataclass
+class Progress:
+    """A progress update streamed from the backend during generation."""
+    value: int = 0
+    maximum: int = 0
+    note: str = ""
+
+
+class BackendError(RuntimeError):
+    pass
+
+
+class ComfyBackend:
+    """Manages the ComfyUI subprocess and exposes a simple generate() API."""
+
+    def __init__(self, paths: Optional[config.AppPaths] = None, port: int = 8199):
+        self.paths = paths or config.AppPaths()
+        self.port = port
+        self.host = "127.0.0.1"
+        self.client_id = uuid.uuid4().hex
+        self._proc: Optional[subprocess.Popen] = None
+        self._log_thread: Optional[threading.Thread] = None
+        self._log_tail: deque[str] = deque(maxlen=40)
+
+    # ----- lifecycle -------------------------------------------------------
+    @property
+    def base_url(self) -> str:
+        return f"http://{self.host}:{self.port}"
+
+    def is_running(self) -> bool:
+        return self._proc is not None and self._proc.poll() is None
+
+    def start(self, log: Optional[Callable[[str], None]] = None,
+              timeout: float = 120.0) -> None:
+        """Launch ComfyUI and block until it responds, or raise BackendError."""
+        log = log or (lambda _m: None)
+        if self.is_running():
+            return
+
+        comfy = self.paths.comfyui
+        if comfy is None:
+            raise BackendError(
+                "ComfyUI が見つかりません。SCOM_COMFYUI_DIR を設定するか "
+                "vendor/ComfyUI に配置してください（README 参照）。"
+            )
+
+        config.ensure_model_dirs()
+        extra_paths = write_extra_model_paths(self.paths)
+        self.port = _free_port(self.port)
+
+        cmd = [
+            str(self.paths.backend_python),
+            str(comfy / "main.py"),
+            "--listen", self.host,
+            "--port", str(self.port),
+            "--extra-model-paths-config", str(extra_paths),
+            "--output-directory", str(self.paths.user_data / "output"),
+            "--preview-method", "auto",  # stream latent previews over the ws
+            "--disable-auto-launch",
+        ]
+        (self.paths.user_data / "output").mkdir(parents=True, exist_ok=True)
+        log(f"ComfyUI を起動中: {' '.join(cmd)}")
+
+        creationflags = 0
+        if sys.platform == "win32":
+            creationflags = subprocess.CREATE_NO_WINDOW  # type: ignore[attr-defined]
+
+        self._proc = subprocess.Popen(
+            cmd,
+            cwd=str(comfy),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+            creationflags=creationflags,
+        )
+        # Drain stdout on a daemon thread so a quiet subprocess never blocks the
+        # readiness poll below.
+        self._start_log_reader(log)
+
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if self._proc.poll() is not None:
+                time.sleep(0.2)  # let the reader flush the final lines
+                raise BackendError(
+                    f"ComfyUI が早期終了しました (code {self._proc.returncode})。\n"
+                    + "\n".join(self._log_tail)
+                )
+            if self._ping():
+                log(f"ComfyUI 準備完了: {self.base_url}")
+                return
+            time.sleep(0.4)
+        self.stop()
+        raise BackendError("制限時間内に ComfyUI が起動しませんでした")
+
+    def _start_log_reader(self, log: Callable[[str], None]) -> None:
+        def reader() -> None:
+            assert self._proc and self._proc.stdout
+            for raw in self._proc.stdout:
+                raw = raw.rstrip("\r\n")
+                clean = strip_ansi(raw).rstrip()
+                if clean:
+                    self._log_tail.append(clean)  # plain text for error messages
+                    log(raw)                       # raw (with ANSI) for colored display
+
+        self._log_thread = threading.Thread(target=reader, daemon=True)
+        self._log_thread.start()
+
+    def _ping(self) -> bool:
+        try:
+            with urllib.request.urlopen(self.base_url + "/system_stats", timeout=2):
+                return True
+        except (urllib.error.URLError, OSError):
+            return False
+
+    def stop(self) -> None:
+        if self._proc and self._proc.poll() is None:
+            self._proc.terminate()
+            try:
+                self._proc.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                self._proc.kill()
+        self._proc = None
+
+    # ----- generation ------------------------------------------------------
+    def _post_prompt(self, graph: dict) -> str:
+        payload = json.dumps({"prompt": graph, "client_id": self.client_id}).encode()
+        req = urllib.request.Request(
+            self.base_url + "/prompt", data=payload,
+            headers={"Content-Type": "application/json"},
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                data = json.loads(resp.read())
+        except urllib.error.HTTPError as e:
+            detail = e.read().decode(errors="replace")
+            raise BackendError(f"prompt が拒否されました: {detail}") from e
+        return data["prompt_id"]
+
+    def _fetch_image(self, filename: str, subfolder: str, ftype: str) -> bytes:
+        qs = urllib.parse.urlencode(
+            {"filename": filename, "subfolder": subfolder, "type": ftype}
+        )
+        with urllib.request.urlopen(self.base_url + "/view?" + qs, timeout=30) as resp:
+            return resp.read()
+
+    def _history_images(self, prompt_id: str) -> list[bytes]:
+        with urllib.request.urlopen(
+            self.base_url + f"/history/{prompt_id}", timeout=30
+        ) as resp:
+            history = json.loads(resp.read())
+        entry = history.get(prompt_id, {})
+        images: list[bytes] = []
+        for node_out in entry.get("outputs", {}).values():
+            for img in node_out.get("images", []):
+                images.append(
+                    self._fetch_image(img["filename"], img.get("subfolder", ""),
+                                      img.get("type", "output"))
+                )
+        return images
+
+    def generate(self, graph: dict,
+                 on_progress: Optional[Callable[[Progress], None]] = None,
+                 on_preview: Optional[Callable[[bytes], None]] = None,
+                 cancel: Optional[Callable[[], bool]] = None) -> list[bytes]:
+        """Run a graph to completion and return output PNG bytes.
+
+        ``on_progress`` receives Progress updates; ``on_preview`` receives raw
+        JPEG/PNG bytes of intermediate latent previews; ``cancel`` is polled
+        and, if it returns True, the run is interrupted.
+        """
+        if not self.is_running():
+            raise BackendError("バックエンドが起動していません")
+        on_progress = on_progress or (lambda _p: None)
+        on_preview = on_preview or (lambda _b: None)
+        cancel = cancel or (lambda: False)
+
+        ws = websocket.WebSocket()
+        ws.connect(
+            f"ws://{self.host}:{self.port}/ws?clientId={self.client_id}", timeout=10
+        )
+        ws.settimeout(1.0)
+
+        prompt_id = self._post_prompt(graph)
+        try:
+            while True:
+                if cancel():
+                    self.interrupt()
+                    raise BackendError("生成をキャンセルしました")
+                try:
+                    msg = ws.recv()
+                except websocket.WebSocketTimeoutException:
+                    continue
+                if isinstance(msg, (bytes, bytearray)):
+                    # Binary frame: [4B event][4B image format][image bytes].
+                    # event 1 == PREVIEW_IMAGE.
+                    if len(msg) > 8 and int.from_bytes(msg[:4], "big") == 1:
+                        on_preview(bytes(msg[8:]))
+                    continue
+                event = json.loads(msg)
+                etype = event.get("type")
+                data = event.get("data", {})
+                if etype == "progress":
+                    on_progress(Progress(
+                        value=data.get("value", 0),
+                        maximum=data.get("max", 0),
+                        note="サンプリング",
+                    ))
+                elif etype == "executing":
+                    if data.get("node") is None and data.get("prompt_id") == prompt_id:
+                        break  # finished
+                elif etype == "execution_error" and data.get("prompt_id") == prompt_id:
+                    raise BackendError(
+                        f"実行エラー: {data.get('exception_message', data)}"
+                    )
+        finally:
+            try:
+                ws.close()
+            except Exception:
+                pass
+
+        return self._history_images(prompt_id)
+
+    def interrupt(self) -> None:
+        try:
+            req = urllib.request.Request(self.base_url + "/interrupt", data=b"")
+            urllib.request.urlopen(req, timeout=5)
+        except Exception:
+            pass
+
+    def object_info(self, class_type: str) -> dict:
+        """Fetch node metadata (used to discover valid sampler/clip options)."""
+        with urllib.request.urlopen(
+            self.base_url + f"/object_info/{class_type}", timeout=10
+        ) as resp:
+            return json.loads(resp.read())
