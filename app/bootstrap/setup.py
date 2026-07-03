@@ -24,13 +24,17 @@ from .downloader import download
 
 LogCb = Callable[[str], None]
 
-COMFYUI_REF = os.environ.get("SCOM_COMFYUI_REF", "master")
-COMFYUI_ZIP = f"https://github.com/comfyanonymous/ComfyUI/archive/refs/heads/{COMFYUI_REF}.zip"
+# Pin ComfyUI to a specific released tag for reproducible installs. The short
+# /archive/<ref>.zip form resolves tags, branches, and commit SHAs alike, so
+# SCOM_COMFYUI_REF can be overridden with any of them (e.g. "master").
+COMFYUI_REF = os.environ.get("SCOM_COMFYUI_REF", "v0.26.0")
+COMFYUI_ZIP = f"https://github.com/comfyanonymous/ComfyUI/archive/{COMFYUI_REF}.zip"
 
 # Bump when a newer ComfyUI is required (e.g. for a new model architecture such
 # as Krea-2). Changing this re-fetches ComfyUI and reinstalls its deps on
-# machines that were provisioned with an older copy.
-COMFYUI_MARKER = os.environ.get("SCOM_COMFYUI_MARKER", "2026.06-krea2")
+# machines that were provisioned with an older copy. Tied to the pinned ref so
+# the provisioned version is self-documenting.
+COMFYUI_MARKER = os.environ.get("SCOM_COMFYUI_MARKER", "v0.26.0")
 
 # Fixed (non-model) steps, in order: (step_id, title).
 # Technical names (uv / PyTorch / ComfyUI) are kept in English by request.
@@ -222,8 +226,12 @@ class FirstRunSetup:
                  cancel=cancel)
         emit("comfyui", title, "running", 0.92, "展開中…")
         with zipfile.ZipFile(zip_path) as zf:
+            # GitHub archives nest everything under a single top-level folder
+            # whose name varies by ref (e.g. tag "v0.26.0" -> "ComfyUI-0.26.0",
+            # branch "master" -> "ComfyUI-master"). Read it rather than guess.
+            top = zf.namelist()[0].split("/")[0]
             zf.extractall(self.paths.backend_root)
-        extracted = self.paths.backend_root / f"ComfyUI-{COMFYUI_REF}"
+        extracted = self.paths.backend_root / top
         if extracted.exists():
             if self.paths.managed_comfyui.exists():
                 shutil.rmtree(self.paths.managed_comfyui)
