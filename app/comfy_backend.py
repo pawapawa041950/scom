@@ -184,7 +184,19 @@ class ComfyBackend:
 
     def stop(self) -> None:
         if self._proc and self._proc.poll() is None:
-            self._proc.terminate()
+            if sys.platform == "win32":
+                # Kill the whole process TREE. uv-managed venvs use a
+                # trampoline python.exe that launches the real interpreter as
+                # a child; terminate() alone kills only the trampoline and
+                # orphans the actual ComfyUI process (which then keeps the
+                # SQLite DB locked for every later launch).
+                subprocess.run(
+                    ["taskkill", "/PID", str(self._proc.pid), "/T", "/F"],
+                    capture_output=True,
+                    creationflags=subprocess.CREATE_NO_WINDOW,
+                )
+            else:
+                self._proc.terminate()
             try:
                 self._proc.wait(timeout=10)
             except subprocess.TimeoutExpired:

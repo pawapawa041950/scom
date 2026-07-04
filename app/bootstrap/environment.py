@@ -18,13 +18,20 @@ from typing import Optional
 # never from the PyPI default, which would pull a mismatched/CPU build.
 TORCH_PACKAGES = ["torch", "torchvision", "torchaudio"]
 
-# Signature of the package set above. Bumped implicitly whenever the list
-# changes so an already-provisioned backend re-runs the torch step.
-TORCH_PKGSET = ",".join(TORCH_PACKAGES)
+# Revision of the torch provisioning rules. Bump to force already-provisioned
+# backends to re-run the torch step (e.g. when CUDA_TABLE changes).
+# rev2: cu130 — comfy_kitchen's INT8 GEMM kernels need the CUDA 13 runtime;
+# on cu128 int8 models fall back to dequant+bf16 matmul (~2x slower).
+TORCH_SETUP_REV = "2"
+
+# Signature of the package set + provisioning rules. A mismatch with the
+# manifest re-runs the torch step.
+TORCH_PKGSET = ",".join(TORCH_PACKAGES) + ";rev" + TORCH_SETUP_REV
 
 # Ordered high -> low. Each entry: (cuda tag, minimum Windows driver version).
 # Pick the highest CUDA whose minimum driver <= the installed driver.
 CUDA_TABLE = [
+    ("cu130", 580.88),
     ("cu128", 570.00),
     ("cu126", 560.76),
     ("cu124", 551.61),

@@ -202,7 +202,7 @@ class FirstRunSetup:
         uv_manager.pip_install(
             self.paths.uv_path, self.paths.backend_python, log,
             packages=list(environment.TORCH_PACKAGES),
-            index_url=plan.index_url, cancel=cancel,
+            index_url=plan.index_url, upgrade=True, cancel=cancel,
         )
         self.manifest.set(torch_tag=plan.tag, torch_pkgset=environment.TORCH_PKGSET)
         emit("torch", title, "done", 1.0, "インストール完了")

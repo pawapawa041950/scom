@@ -82,8 +82,14 @@ def pip_install(uv_path: Path, venv_python: Path, log: LogCb,
                 packages: Optional[list[str]] = None,
                 requirements: Optional[Path] = None,
                 index_url: Optional[str] = None,
+                upgrade: bool = False,
                 cancel: Optional[Callable[[], bool]] = None) -> None:
     args = ["pip", "install", "--python", str(venv_python)]
+    if upgrade:
+        # Without this an already-installed package satisfies the bare
+        # requirement even when the target index carries a newer build
+        # (e.g. switching torch from +cu128 to +cu130 wheels).
+        args += ["--upgrade"]
     if index_url:
         args += ["--index-url", index_url]
     if requirements:
