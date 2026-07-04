@@ -29,6 +29,12 @@ DEFAULTS: dict[str, Any] = {
     "te2": "",
     "dual_te": False,
     "clip_type": "stable_diffusion",
+    # Model merges: JSON list of entries, each
+    #   {"id": int, "name": str, "models": [["file", weight], ...],
+    #    "quant": ""|"fp8"|"int8_convrot", "low_memory": bool}
+    # merge_seq is the last id handed out (numbering never reuses ids).
+    "merges": "[]",
+    "merge_seq": 0,
     # prompts (initial-only)
     "prompt": "",
     "negative": DEFAULT_NEGATIVE,

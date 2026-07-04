@@ -1,33 +1,44 @@
 """PySide6 main window: model selection, generation settings, preview."""
 from __future__ import annotations
 
+import json
 import random
 from typing import Optional
 
 from PySide6.QtCore import (
     Qt, QThread, Signal, QObject, QRegularExpression, QTimer, QEvent,
 )
-from PySide6.QtGui import QImage, QPixmap, QRegularExpressionValidator
+from PySide6.QtCore import QUrl
+from PySide6.QtGui import (
+    QBrush, QColor, QDesktopServices, QImage, QPixmap,
+    QRegularExpressionValidator,
+)
 from PySide6.QtWidgets import (
     QApplication, QComboBox, QDoubleSpinBox, QFormLayout, QGridLayout,
     QGroupBox, QHBoxLayout, QLabel, QLineEdit, QMainWindow, QMessageBox,
-    QPlainTextEdit, QProgressBar, QPushButton, QSpinBox, QSplitter,
-    QStackedWidget, QVBoxLayout, QWidget, QCheckBox,
+    QPlainTextEdit, QProgressBar, QPushButton, QSizePolicy, QSpinBox,
+    QSplitter, QStackedWidget, QVBoxLayout, QWidget, QCheckBox,
 )
 
-from .. import config, settings, metadata, modelinfo
+from .. import config, settings, metadata, modelinfo, prompt_presets
 from . import ansi_log
 from .widgets import GrowingTextEdit
 from ..comfy_backend import ComfyBackend, BackendError, Progress
 from ..workflow import (
-    GenParams, build_graph, SAMPLERS, SCHEDULERS,
-    CLIP_TYPES_SINGLE, CLIP_TYPES_DUAL, DEFAULT_NEGATIVE,
+    GenParams, build_graph, build_merge_graph, merge_pin_key, merge_recipe,
+    SAMPLERS, SCHEDULERS, CLIP_TYPES_SINGLE, CLIP_TYPES_DUAL, DEFAULT_NEGATIVE,
 )
 
 MAX_SEED = 2**63 - 1
 
 # Image format option that disables saving generated images to disk.
 NO_SAVE = "保存しない"
+
+# Merge entries in the diffusion combo: shown at the top of the list with a
+# colored prefix; the item data is "__merge__:<id>".
+MERGE_PREFIX = "マージモデル："
+MERGE_TOKEN = "__merge__"
+MERGE_COLOR = "#1a7f37"  # green tint for merge entries
 
 
 class _StartWorker(QObject):
@@ -53,7 +64,8 @@ class _StartWorker(QObject):
 class _GenWorker(QObject):
     progress = Signal(Progress)
     preview = Signal(bytes)
-    done = Signal(list)  # list[bytes]
+    cached = Signal(list)  # node ids served from the backend output cache
+    done = Signal(list)    # list[bytes]
     failed = Signal(str)
 
     def __init__(self, backend: ComfyBackend, graph: dict):
@@ -72,6 +84,7 @@ class _GenWorker(QObject):
                 on_progress=self.progress.emit,
                 on_preview=self.preview.emit,
                 cancel=lambda: self._cancel,
+                on_cached=self.cached.emit,
             )
             self.done.emit(images)
         except BackendError as e:
@@ -99,6 +112,17 @@ class MainWindow(QMainWindow):
 
         # Persisted settings. prompt/negative are read as initial values only.
         self.settings, settings_error = settings.load(self.paths.settings_path)
+        # Named merge entries: {"id", "name", "models", "quant", "low_memory"}.
+        self._merges: list[dict] = self._load_merges()
+        self._merge_seq = int(self.settings.get("merge_seq", 0) or 0)
+        self._merge_seq = max([self._merge_seq]
+                              + [int(e["id"]) for e in self._merges])
+        # Entries known to be built in backend RAM this session (best effort;
+        # corrected via execution_cached events whenever an entry is used).
+        self._merge_built_ids: set[int] = set()
+        self._last_merge_id: Optional[int] = None   # entry used by last gen
+        self._merge_was_cached = False              # node "4" was a cache hit
+        self._merge_dlg = None  # non-modal MergeDialog (at most one)
         self._loading = True
         self._save_timer = QTimer(self)
         self._save_timer.setSingleShot(True)
@@ -107,6 +131,7 @@ class MainWindow(QMainWindow):
 
         self._build_ui()
         self.refresh_models()       # fill combos before applying saved selection
+        self._reload_prompt_presets(quiet=True)
         self._apply_settings()
         self._loading = False
         self._connect_autosave()
@@ -131,27 +156,29 @@ class MainWindow(QMainWindow):
     def _build_ui(self) -> None:
         splitter = QSplitter(Qt.Horizontal)
 
-        # Left column: models, settings, image, action
+        # Left block, two columns: 1 = preset/models, 2 = settings/image,
+        # with the prompt box spanning both columns underneath.
         left = QWidget()
-        left_layout = QVBoxLayout(left)
-        left_layout.addWidget(self._build_preset_box())
-        left_layout.addWidget(self._build_model_box())
-        left_layout.addWidget(self._build_settings_box())
-        left_layout.addWidget(self._build_image_box())
-        left_layout.addWidget(self._build_action_box())
-        left_layout.addStretch(1)
-        left.setMinimumWidth(380)
-        left.setMaximumWidth(480)
+        grid = QGridLayout(left)
+        col1 = QVBoxLayout()
+        col1.addWidget(self._build_model_box())
+        col1.addStretch(1)
+        col2 = QVBoxLayout()
+        col2.addWidget(self._build_settings_box())
+        col2.addWidget(self._build_image_box())
+        col2.addStretch(1)
+        grid.addLayout(col1, 0, 0)
+        grid.addLayout(col2, 0, 1)
+        grid.addWidget(self._build_prompt_box(), 1, 0, 1, 2)
+        grid.setColumnStretch(0, 1)
+        grid.setColumnStretch(1, 1)
+        grid.setRowStretch(1, 1)  # prompt area takes the remaining height
+        left.setMinimumWidth(660)
 
-        # Middle column: prompt settings
-        middle = QWidget()
-        middle_layout = QVBoxLayout(middle)
-        middle_layout.addWidget(self._build_prompt_box())
-        middle.setMinimumWidth(280)
-
-        # Right column: preview + log
+        # Right column: action buttons above the preview, log below
         right = QWidget()
         right_layout = QVBoxLayout(right)
+        right_layout.addWidget(self._build_action_box())
         self.preview = QLabel("プレビュー")
         self.preview.setAlignment(Qt.AlignCenter)
         self.preview.setMinimumSize(512, 512)
@@ -168,21 +195,20 @@ class MainWindow(QMainWindow):
         right_layout.addWidget(self.log_view, stretch=1)
 
         splitter.addWidget(left)
-        splitter.addWidget(middle)
         splitter.addWidget(right)
-        splitter.setStretchFactor(2, 1)  # preview/log column expands
+        splitter.setStretchFactor(1, 1)  # preview/log column expands
         self.setCentralWidget(splitter)
 
         self.status = self.statusBar()
         self.status.addPermanentWidget(self.progress)
         self.status.showMessage("バックエンドを起動中…")
 
-    def _build_preset_box(self) -> QWidget:
-        """Preset selector above the Models box. Picking anima/krea2 filters the
-        model dropdowns to that family and auto-selects its model/vae/te/CLIP."""
-        w = QWidget()
-        row = QHBoxLayout(w)
-        row.setContentsMargins(0, 0, 0, 0)
+    def _build_model_box(self) -> QGroupBox:
+        box = QGroupBox("Models")
+        form = QFormLayout(box)
+
+        # Preset: picking anima/krea2 filters the model dropdowns to that
+        # family and auto-selects its model/vae/te/CLIP.
         self.cb_preset = QComboBox()
         self.cb_preset.addItem("anima", "anima")
         self.cb_preset.addItem("krea2", "krea2")
@@ -193,15 +219,6 @@ class MainWindow(QMainWindow):
             "Text encoder・CLIP type に絞り込み＆自動選択します"
         )
         self.cb_preset.currentIndexChanged.connect(self._on_preset_changed)
-        lbl = QLabel("Preset")
-        f = lbl.font(); f.setBold(True); lbl.setFont(f)
-        row.addWidget(lbl)
-        row.addWidget(self.cb_preset, stretch=1)
-        return w
-
-    def _build_model_box(self) -> QGroupBox:
-        box = QGroupBox("Models")
-        form = QFormLayout(box)
 
         self.cb_diffusion = QComboBox()
         self.cb_vae = QComboBox()
@@ -217,23 +234,29 @@ class MainWindow(QMainWindow):
         # (e.g. a krea2 diffusion needs CLIP type 'krea2' + a Qwen3-VL encoder).
         self.cb_diffusion.currentTextChanged.connect(self._on_diffusion_changed)
 
+        merge_btn = QPushButton("マージ設定…")
+        merge_btn.clicked.connect(self._open_merge_dialog)
         refresh = QPushButton("再スキャン")
         refresh.clicked.connect(self.refresh_models)
         manage = QPushButton("モデル管理…")
         manage.clicked.connect(self.open_models_dialog)
         btn_row = QHBoxLayout()
-        btn_row.addWidget(refresh)
-        btn_row.addWidget(manage)
+        btn_row.addWidget(merge_btn, stretch=1)
+        btn_row.addWidget(refresh, stretch=1)
+        btn_row.addWidget(manage, stretch=1)
         btns = QWidget(); btns.setLayout(btn_row)
         btn_row.setContentsMargins(0, 0, 0, 0)
 
+        form.addRow("表示モデル:", self.cb_preset)
         form.addRow("Diffusion:", self.cb_diffusion)
         form.addRow("VAE:", self.cb_vae)
         form.addRow("Text encoder 1:", self.cb_te1)
         form.addRow("", self.chk_dual_te)
         form.addRow("Text encoder 2:", self.cb_te2)
         form.addRow("CLIP type:", self.cb_clip_type)
-        form.addRow("", btns)
+        # Single-widget row: spans the label column too, so the three buttons
+        # get the group box's full width (their labels were getting clipped).
+        form.addRow(btns)
         self.cb_te2.setEnabled(False)
         return box
 
@@ -249,6 +272,32 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.txt_prompt)
         layout.addWidget(QLabel("Negative"))
         layout.addWidget(self.txt_negative)
+
+        # Prompt presets: pick a named entry from prompts.csv and append its
+        # prompt/negative to the fields with the pen button.
+        self.cb_prompt_preset = QComboBox()
+        self.cb_prompt_preset.setToolTip(
+            "prompts.csv のプリセット（1列目: 設定名、2列目: プロンプト、"
+            "3列目: ネガティブプロンプト）")
+        btn_apply = QPushButton("✏")
+        btn_apply.setFixedWidth(32)
+        btn_apply.setToolTip("選択中のプリセットをプロンプト欄・ネガティブ欄に追記")
+        btn_apply.clicked.connect(self._apply_prompt_preset)
+        btn_edit = QPushButton("📝")
+        btn_edit.setFixedWidth(32)
+        btn_edit.setToolTip("設定ファイル (prompts.csv) を開いて編集")
+        btn_edit.clicked.connect(self._open_prompt_csv)
+        btn_reload = QPushButton("🔄")
+        btn_reload.setFixedWidth(32)
+        btn_reload.setToolTip("設定ファイルを再読み込み")
+        btn_reload.clicked.connect(self._reload_prompt_presets)
+        preset_row = QHBoxLayout()
+        preset_row.addWidget(self.cb_prompt_preset, stretch=1)
+        preset_row.addWidget(btn_apply)
+        preset_row.addWidget(btn_edit)
+        preset_row.addWidget(btn_reload)
+        layout.addLayout(preset_row)
+
         layout.addStretch(1)
         # Shift+Enter in either prompt field starts generation.
         self.txt_prompt.installEventFilter(self)
@@ -308,17 +357,24 @@ class MainWindow(QMainWindow):
         w = QWidget()
         row = QHBoxLayout(w)
         row.setContentsMargins(0, 0, 0, 0)
-        self.btn_continuous = QPushButton("連続")
-        self.btn_continuous.setCheckable(True)
-        self.btn_continuous.setMinimumHeight(40)
+        # 連続 is a checkbox: two states with an unmistakable ON/OFF look
+        # (a pressed QPushButton reads poorly). Same isChecked/setChecked API.
+        self.btn_continuous = QCheckBox("連続")
         self.btn_continuous.setToolTip("ONの間、生成が終わるたびに自動で次を生成します")
+        self.btn_continuous.setMinimumHeight(40)
         self.btn_generate = QPushButton("生成")
-        self.btn_generate.setMinimumHeight(40)
         self.btn_generate.clicked.connect(self.on_generate)
         self.btn_cancel = QPushButton("キャンセル")
         self.btn_cancel.setEnabled(False)
         self.btn_cancel.clicked.connect(self.on_cancel)
-        row.addWidget(self.btn_continuous, stretch=1)
+        # 生成 stays about twice キャンセル; Ignored size policy makes the
+        # layout use the stretch ratios alone instead of the text size hints.
+        for b in (self.btn_generate, self.btn_cancel):
+            b.setMinimumHeight(40)
+            sp = b.sizePolicy()
+            sp.setHorizontalPolicy(QSizePolicy.Ignored)
+            b.setSizePolicy(sp)
+        row.addWidget(self.btn_continuous)
         row.addWidget(self.btn_generate, stretch=2)
         row.addWidget(self.btn_cancel, stretch=1)
         # Progress moved to the status bar to save vertical space here.
@@ -439,6 +495,8 @@ class MainWindow(QMainWindow):
 
     def _on_diffusion_changed(self, name: str) -> None:
         """Auto-align CLIP type / text encoder to the selected model's family."""
+        if self._merge_selected():
+            return  # the merge recipe decides family; nothing to auto-align
         if self._loading:
             return  # honor saved settings on startup; only react to user picks
         if self._diffusion_family(name) == "krea2" and not self.chk_dual_te.isChecked():
@@ -451,7 +509,9 @@ class MainWindow(QMainWindow):
     def _krea2_config_warning(self, params: GenParams) -> Optional[str]:
         """Pre-flight check: translate the cryptic backend mismatch into a
         clear, actionable message before a Krea-2 run is even submitted."""
-        if self._diffusion_family(params.diffusion) != "krea2":
+        # For a merge, the family is judged from the first source model.
+        name = params.merge_models[0][0] if params.merge_models else params.diffusion
+        if self._diffusion_family(name) != "krea2":
             return None
         msgs = []
         if params.clip_type != "krea2":
@@ -463,6 +523,255 @@ class MainWindow(QMainWindow):
             return None
         return ("選択中のモデルは Krea-2 です。次を直してください:\n\n"
                 + "\n".join(msgs))
+
+    # ----- model merge (マージモデル) ---------------------------------------
+    def _load_merges(self) -> list[dict]:
+        """Load merge entries from settings, migrating the old single-recipe
+        keys (merge_models/merge_quant/merge_fp8/merge_low_memory)."""
+        try:
+            merges = json.loads(str(self.settings.get("merges", "[]")))
+            out = []
+            for e in merges:
+                out.append({
+                    "id": int(e["id"]),
+                    "name": str(e["name"]),
+                    "models": [(str(n), float(w)) for n, w in e["models"]],
+                    "quant": str(e.get("quant", "")),
+                    "low_memory": bool(e.get("low_memory", False)),
+                })
+            if out:
+                return out
+        except (ValueError, TypeError, KeyError):
+            pass
+        # Migration: a pre-multi-merge settings file with a single recipe.
+        try:
+            old = [(str(n), float(w)) for n, w in
+                   json.loads(str(self.settings.get("merge_models", "[]")))]
+        except (ValueError, TypeError):
+            old = []
+        if len(old) < 2:
+            return []
+        quant = str(self.settings.get("merge_quant", ""))
+        if not quant and self.settings.get("merge_fp8"):
+            quant = "fp8"
+        return [{"id": 1, "name": "マージモデル1", "models": old,
+                 "quant": quant,
+                 "low_memory": bool(self.settings.get("merge_low_memory", False))}]
+
+    def _merge_selected(self) -> bool:
+        data = self.cb_diffusion.currentData()
+        return isinstance(data, str) and data.startswith(MERGE_TOKEN)
+
+    def _selected_merge_entry(self) -> Optional[dict]:
+        data = self.cb_diffusion.currentData()
+        if not (isinstance(data, str) and data.startswith(MERGE_TOKEN)):
+            return None
+        try:
+            entry_id = int(data.split(":", 1)[1])
+        except (IndexError, ValueError):
+            return None
+        return self._merge_entry_by_id(entry_id)
+
+    def _merge_entry_by_id(self, entry_id: int) -> Optional[dict]:
+        for e in self._merges:
+            if int(e["id"]) == entry_id:
+                return e
+        return None
+
+    def _push_merge_state(self) -> None:
+        """Refresh the merge window's entry list (if it is open)."""
+        if self._merge_dlg is None:
+            return
+        try:
+            self._merge_dlg.set_entries(self._merges, self._merge_built_ids)
+        except RuntimeError:  # underlying Qt object was deleted
+            self._merge_dlg = None
+
+    def _open_merge_dialog(self) -> None:
+        from .merge_dialog import MergeDialog
+        # Non-modal, at most one instance; re-opening replaces it so the model
+        # list is always current.
+        if self._merge_dlg is not None:
+            try:
+                self._merge_dlg.close()
+                self._merge_dlg.deleteLater()
+            except RuntimeError:
+                pass
+        # Parentless on purpose: a QDialog with a parent always stays on top
+        # of it, but this window should be able to go behind the main window.
+        dlg = MergeDialog(
+            self._all_models.get("diffusion_models", []),
+            self._diffusion_family,
+            config.models_root() / "diffusion_models", None)
+        dlg.merge_requested.connect(self._on_merge_requested)
+        dlg.save_requested.connect(self._on_save_requested)
+        dlg.delete_requested.connect(self._on_merge_delete)
+        dlg.rename_requested.connect(self._on_merge_rename)
+        dlg.free_memory_requested.connect(self._on_free_memory)
+        self._merge_dlg = dlg
+        self._push_merge_state()
+        dlg.show()
+
+    def _on_merge_requested(self, entries, quant: str, low_memory: bool) -> None:
+        """マージ button: register a new entry and build it in backend RAM."""
+        models = [(str(n), float(w)) for n, w in entries]
+        try:
+            graph = build_merge_graph(models, quant, low_memory)
+        except ValueError as e:
+            QMessageBox.warning(self, "入力不足", str(e))
+            return
+        self._merge_seq += 1
+        entry = {"id": self._merge_seq, "name": f"マージモデル{self._merge_seq}",
+                 "models": models, "quant": str(quant),
+                 "low_memory": bool(low_memory)}
+        self._merges.append(entry)
+        self._schedule_save()
+        self._apply_preset_filter()  # the new entry appears in the dropdown
+        self._push_merge_state()
+        if self._merge_dlg is not None:
+            self._merge_dlg.select_entry(entry["id"])
+        self._run_merge(graph, saving=False, entry_id=entry["id"])
+
+    def _on_save_requested(self, entries, quant: str, low_memory: bool,
+                           filename: str) -> None:
+        models = [(str(n), float(w)) for n, w in entries]
+        try:
+            graph = build_merge_graph(models, quant, low_memory,
+                                      save_to=filename)
+        except ValueError as e:
+            QMessageBox.warning(self, "入力不足", str(e))
+            return
+        self._run_merge(graph, saving=True, entry_id=None)
+
+    def _on_merge_delete(self, entry_id: int) -> None:
+        entry = self._merge_entry_by_id(entry_id)
+        self._merges = [e for e in self._merges
+                        if int(e["id"]) != entry_id]
+        self._merge_built_ids.discard(entry_id)
+        # Free its pinned model from backend RAM (per-entry, via our node's
+        # management route).
+        if entry is not None and self.backend.is_running():
+            try:
+                self.backend.release_merge(
+                    merge_recipe(entry["models"]), entry["quant"],
+                    entry["low_memory"])
+            except OSError as e:
+                self.append_log(f"メモリ解放に失敗: {e}")
+        was_selected = (self.cb_diffusion.currentData()
+                        == f"{MERGE_TOKEN}:{entry_id}")
+        self._apply_preset_filter()
+        if was_selected:
+            # Fall back to the first regular model (after the merge entries).
+            self.cb_diffusion.setCurrentIndex(
+                min(len(self._merges), self.cb_diffusion.count() - 1))
+        self._schedule_save()
+        self._push_merge_state()
+        name = entry["name"] if entry else f"id={entry_id}"
+        self.append_log(f"{name} を一覧から削除し、メモリを解放しました")
+
+    def _on_merge_rename(self, entry_id: int, name: str) -> None:
+        e = self._merge_entry_by_id(entry_id)
+        if e is None or not name.strip():
+            return
+        e["name"] = name.strip()
+        self._apply_preset_filter()  # dropdown labels follow the new name
+        self._schedule_save()
+        self._push_merge_state()
+
+    def _on_free_memory(self) -> None:
+        if not self.backend.is_running():
+            QMessageBox.warning(self, "未準備", "バックエンドが起動していません。")
+            return
+        try:
+            self.backend.release_all_merges()
+            self.backend.free_memory()
+        except OSError as e:
+            self.append_log(f"メモリ解放に失敗: {e}")
+            return
+        self._merge_built_ids.clear()
+        self._push_merge_state()
+        self.append_log("バックエンドのキャッシュとモデルをすべて解放しました"
+                        "（次回使用時に自動で再構築されます）")
+
+    def _sync_merge_states(self) -> None:
+        """Refresh ●/○ from the backend's pin cache (the source of truth)."""
+        if not self.backend.is_running():
+            return
+        try:
+            pinned = set(self.backend.merge_pinned())
+        except OSError:
+            return
+        self._merge_built_ids = {
+            int(e["id"]) for e in self._merges
+            if merge_pin_key(e["models"], e["quant"], e["low_memory"])
+            in pinned}
+        self._push_merge_state()
+
+    def _run_merge(self, graph: dict, saving: bool,
+                   entry_id: Optional[int]) -> None:
+        """Run a merge-only prompt (build in RAM / save to file) off-thread."""
+        if not self.backend.is_running():
+            QMessageBox.warning(
+                self, "未準備",
+                "バックエンドがまだ起動していません。起動完了後、"
+                "生成時に自動でマージされます。")
+            return
+        if self._gen_thread is not None:
+            QMessageBox.information(
+                self, "実行中",
+                "生成の完了後に実行してください（生成時に自動でマージされます）。")
+            return
+        self._last_gen_ok = False  # keep continuous mode from chaining a merge
+        self.btn_generate.setEnabled(False)
+        self.btn_cancel.setEnabled(True)
+        self.progress.setValue(0)
+        note = ("マージモデルを保存中…" if saving
+                else "マージモデルをメインメモリ上に構築中…")
+        self.status.showMessage(note)
+        self.append_log(note)
+
+        self._gen_thread = QThread(self)
+        self._gen_worker = _GenWorker(self.backend, graph)
+        self._gen_worker.moveToThread(self._gen_thread)
+        self._gen_thread.started.connect(self._gen_worker.run)
+        self._gen_worker.progress.connect(self._on_progress)
+        # NOTE: must be a bound method, not a lambda. Signals connected to a
+        # plain callable run in the EMITTING (worker) thread; only QObject
+        # bound methods get queued to the GUI thread. A lambda here executed
+        # _on_merge_done -> dialog widget updates off the GUI thread
+        # ("Cannot set parent ... different thread" warnings).
+        self._merge_run_ctx = (saving, entry_id)
+        self._gen_worker.done.connect(self._on_merge_worker_done)
+        self._gen_worker.failed.connect(self._on_gen_failed)
+        self._gen_worker.done.connect(self._gen_thread.quit)
+        self._gen_worker.failed.connect(self._gen_thread.quit)
+        self._gen_thread.finished.connect(self._cleanup_gen_thread)
+        self._gen_thread.start()
+
+    def _on_merge_worker_done(self, _images: list) -> None:
+        saving, entry_id = getattr(self, "_merge_run_ctx", (False, None))
+        self._on_merge_done(saving, entry_id)
+
+    def _on_merge_done(self, saved: bool, entry_id: Optional[int]) -> None:
+        if entry_id is not None:
+            self._merge_built_ids.add(entry_id)
+        self._sync_merge_states()
+        if saved:
+            self.status.showMessage("マージモデルを保存しました")
+            self.append_log("マージモデルを models/diffusion_models に保存しました")
+            self.refresh_models()  # the new file appears in the dropdowns
+        else:
+            e = self._merge_entry_by_id(entry_id) if entry_id else None
+            name = e["name"] if e else "マージモデル"
+            self.status.showMessage(f"{name} を構築しました")
+            self.append_log(
+                f"{name} をメインメモリ上に構築しました"
+                "（同じ構成での生成はこのモデルを再利用します）")
+            # Building it means the user intends to generate with it.
+            idx = self.cb_diffusion.findData(f"{MERGE_TOKEN}:{entry_id}")
+            if idx >= 0:
+                self.cb_diffusion.setCurrentIndex(idx)
+        self._push_merge_state()
 
     # ----- preset filtering (family judged from file content) -------------
     def _current_preset(self) -> str:
@@ -484,8 +793,22 @@ class MainWindow(QMainWindow):
         if not hasattr(self, "_all_models"):
             return
         preset = self._current_preset()
+        prev_data = self.cb_diffusion.currentData()
         self._fill_combo(self.cb_diffusion, self._filter_for_preset(
             "diffusion_models", self._all_models["diffusion_models"], preset))
+        # Merge entries go at the top of the list, every preset (their rows
+        # pick from all families), with a green tint to stand out.
+        self.cb_diffusion.blockSignals(True)
+        for i, e in enumerate(self._merges):
+            self.cb_diffusion.insertItem(
+                i, MERGE_PREFIX + e["name"], f"{MERGE_TOKEN}:{e['id']}")
+            self.cb_diffusion.setItemData(
+                i, QBrush(QColor(MERGE_COLOR)), Qt.ForegroundRole)
+        if isinstance(prev_data, str) and prev_data.startswith(MERGE_TOKEN):
+            idx = self.cb_diffusion.findData(prev_data)
+            if idx >= 0:
+                self.cb_diffusion.setCurrentIndex(idx)
+        self.cb_diffusion.blockSignals(False)
         self._fill_combo(self.cb_vae, self._filter_for_preset(
             "vae", self._all_models["vae"], preset))
         te = self._filter_for_preset(
@@ -538,7 +861,15 @@ class MainWindow(QMainWindow):
         s = self.settings
         # Preset first: it filters the model dropdowns before we restore picks.
         self._set_preset(str(s.get("preset", "all")))
-        self.cb_diffusion.setCurrentText(str(s.get("diffusion", "")))
+        # Merge selections are stored as their data token ("__merge__:<id>");
+        # they are restorable because unbuilt entries auto-merge at generation.
+        saved_diffusion = str(s.get("diffusion", ""))
+        if saved_diffusion.startswith(MERGE_TOKEN):
+            idx = self.cb_diffusion.findData(saved_diffusion)
+            if idx >= 0:
+                self.cb_diffusion.setCurrentIndex(idx)
+        else:
+            self.cb_diffusion.setCurrentText(saved_diffusion)
         self.cb_vae.setCurrentText(str(s.get("vae", "")))
         self.cb_te1.setCurrentText(str(s.get("te1", "")))
         self.cb_te2.setCurrentText(str(s.get("te2", "")))
@@ -588,14 +919,24 @@ class MainWindow(QMainWindow):
         if getattr(self, "_settings_broken", False):
             return  # don't overwrite a hand-broken settings.toml
         # Persist everything except prompt/negative, which keep their file values.
+        # Merge selections persist as their data token, not the display text.
+        diffusion = (self.cb_diffusion.currentData()
+                     if self._merge_selected()
+                     else self.cb_diffusion.currentText())
         data = {
             "preset": self._current_preset(),
-            "diffusion": self.cb_diffusion.currentText(),
+            "diffusion": str(diffusion),
             "vae": self.cb_vae.currentText(),
             "te1": self.cb_te1.currentText(),
             "te2": self.cb_te2.currentText(),
             "dual_te": self.chk_dual_te.isChecked(),
             "clip_type": self.cb_clip_type.currentText(),
+            "merges": json.dumps(
+                [{"id": e["id"], "name": e["name"],
+                  "models": [[n, w] for n, w in e["models"]],
+                  "quant": e["quant"], "low_memory": e["low_memory"]}
+                 for e in self._merges], ensure_ascii=False),
+            "merge_seq": int(self._merge_seq),
             "prompt": self.settings.get("prompt", ""),
             "negative": self.settings.get("negative", DEFAULT_NEGATIVE),
             "width": self.sp_width.value(),
@@ -662,8 +1003,13 @@ class MainWindow(QMainWindow):
             seed = random.randint(0, MAX_SEED)
             self._set_seed(seed)
 
+        entry = self._selected_merge_entry()
+        self._last_merge_id = int(entry["id"]) if entry else None
         return GenParams(
-            diffusion=self.cb_diffusion.currentText().strip(),
+            diffusion="" if entry else self.cb_diffusion.currentText().strip(),
+            merge_models=list(entry["models"]) if entry else [],
+            merge_quant=entry["quant"] if entry else "",
+            merge_low_memory=entry["low_memory"] if entry else False,
             vae=self.cb_vae.currentText().strip(),
             te=[t for t in te if t],
             clip_type=self.cb_clip_type.currentText(),
@@ -679,6 +1025,54 @@ class MainWindow(QMainWindow):
             batch_size=self.sp_batch.value(),
             weight_dtype=self.cb_dtype.currentText(),
         )
+
+    # ----- prompt presets (prompts.csv) -------------------------------------
+    def _reload_prompt_presets(self, *_args, quiet: bool = False) -> None:
+        try:
+            self._prompt_presets = prompt_presets.load(self.paths.prompts_path)
+        except (OSError, ValueError) as e:
+            self.append_log(f"prompts.csv の読み込みエラー: {e}")
+            return
+        current = self.cb_prompt_preset.currentText()
+        self.cb_prompt_preset.blockSignals(True)
+        self.cb_prompt_preset.clear()
+        self.cb_prompt_preset.addItems([n for n, _p, _n in self._prompt_presets])
+        idx = self.cb_prompt_preset.findText(current)
+        if idx >= 0:
+            self.cb_prompt_preset.setCurrentIndex(idx)
+        self.cb_prompt_preset.blockSignals(False)
+        if not quiet:
+            self.append_log(
+                f"プロンプトプリセットを {len(self._prompt_presets)} 件読み込みました")
+
+    def _apply_prompt_preset(self) -> None:
+        i = self.cb_prompt_preset.currentIndex()
+        if i < 0 or i >= len(getattr(self, "_prompt_presets", [])):
+            return
+        _name, prompt, negative = self._prompt_presets[i]
+        self._append_prompt_text(self.txt_prompt, prompt)
+        self._append_prompt_text(self.txt_negative, negative)
+
+    @staticmethod
+    def _append_prompt_text(edit, text: str) -> None:
+        """Append preset text, comma-separated after any existing content."""
+        if not text:
+            return
+        current = edit.toPlainText()
+        if current.strip():
+            sep = "" if current.rstrip().endswith(",") else ","
+            edit.setPlainText(current.rstrip() + sep + " " + text)
+        else:
+            edit.setPlainText(text)
+
+    def _open_prompt_csv(self) -> None:
+        path = self.paths.prompts_path
+        try:
+            prompt_presets.ensure_file(path)
+        except OSError as e:
+            self.append_log(f"prompts.csv を作成できませんでした: {e}")
+            return
+        QDesktopServices.openUrl(QUrl.fromLocalFile(str(path)))
 
     def eventFilter(self, obj, event) -> bool:  # noqa: N802 (Qt signature)
         # Shift+Enter in a prompt field triggers generation.
@@ -696,6 +1090,12 @@ class MainWindow(QMainWindow):
             return
         if self._gen_thread is not None:
             return
+        if self._merge_selected() and self._selected_merge_entry() is None:
+            QMessageBox.warning(self, "マージ未設定",
+                                "選択中のマージモデルが見つかりません。")
+            self._open_merge_dialog()
+            return
+        self._merge_was_cached = False
         try:
             params = self._collect_params()
             warn = self._krea2_config_warning(params)
@@ -722,6 +1122,7 @@ class MainWindow(QMainWindow):
         self._gen_thread.started.connect(self._gen_worker.run)
         self._gen_worker.progress.connect(self._on_progress)
         self._gen_worker.preview.connect(self._on_preview_frame)
+        self._gen_worker.cached.connect(self._on_cached_nodes)
         self._gen_worker.done.connect(self._on_gen_done)
         self._gen_worker.failed.connect(self._on_gen_failed)
         self._gen_worker.done.connect(self._gen_thread.quit)
@@ -751,11 +1152,24 @@ class MainWindow(QMainWindow):
         self.append_log(f"完了: {len(images)} 枚")
         self._last_gen_ok = True
         self._last_images = images
+        # A merge generation guarantees the merged model is (now) in backend
+        # RAM — auto-built, reused from the pin cache, or a plain cache hit.
+        # Sync ●/○ from the backend's pin cache (the source of truth).
+        if (self._last_params is not None and self._last_params.merge_models
+                and self._last_merge_id is not None):
+            self._merge_built_ids.add(self._last_merge_id)
+            self._sync_merge_states()
         if images:
             self._show_image(images[0])
             self._save_outputs(images)
         if self.chk_randomize.isChecked():
             self._set_seed(-1)
+
+    def _on_cached_nodes(self, nodes: list) -> None:
+        # Node "4" is the merge node in every merge graph; seeing it in the
+        # execution_cached list means the merged model came straight from RAM.
+        if "4" in nodes:
+            self._merge_was_cached = True
 
     def _save_outputs(self, images: list) -> list:
         """Save each generated image to output/ with embedded metadata."""
@@ -801,6 +1215,14 @@ class MainWindow(QMainWindow):
         p = self._last_params
         if p is None:
             return "", {}
+        if p.merge_models:
+            # Record the merge recipe so the image stays reproducible.
+            model_name = ("merge(" + ", ".join(
+                f"{n}:{w:g}" for n, w in p.merge_models) + ")")
+            if p.merge_quant:
+                model_name += f" {p.merge_quant}"
+        else:
+            model_name = p.diffusion
         meta = {
             "prompt": p.prompt,
             "negative": p.negative,
@@ -811,7 +1233,7 @@ class MainWindow(QMainWindow):
             "seed": p.seed,
             "width": p.width,
             "height": p.height,
-            "model": p.diffusion,
+            "model": model_name,
             "vae": p.vae,
             "text_encoder": ", ".join(p.te),
             "clip_type": p.clip_type,
@@ -856,6 +1278,13 @@ class MainWindow(QMainWindow):
             self._show_image(self._last_images[0])
 
     def closeEvent(self, event) -> None:  # noqa: N802
+        # The merge window is parentless (so it can go behind us); close it
+        # explicitly or the app would keep running after the main window.
+        if self._merge_dlg is not None:
+            try:
+                self._merge_dlg.close()
+            except RuntimeError:
+                pass
         self.append_log("バックエンドを終了中…")
         if self._gen_worker:
             self._gen_worker.cancel()

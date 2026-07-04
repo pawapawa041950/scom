@@ -19,6 +19,7 @@ dist/
 userdata/
 output/
 settings.toml
+prompts.csv
 
 # Downloaded / vendored ComfyUI backend
 vendor/

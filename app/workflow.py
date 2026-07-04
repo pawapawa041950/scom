@@ -10,6 +10,7 @@ ComfyUI ``/prompt`` endpoint.
 """
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, field
 
 # Common option lists surfaced in the UI. These mirror ComfyUI's built-ins.
@@ -44,6 +45,15 @@ DEFAULT_NEGATIVE = (
 class GenParams:
     diffusion: str
     vae: str
+    # Optional multi-model merge: [(filename, weight), ...]. With 2+ entries
+    # the diffusion model comes from the ScomMergeModel custom node (weighted
+    # average materialized in RAM; see app/comfy_custom_nodes.py) and
+    # ``diffusion`` is ignored. Weights are relative (need not sum to 1).
+    merge_models: list[tuple[str, float]] = field(default_factory=list)
+    # Output precision of the merge: "" (bf16) | "fp8" | "int8_convrot".
+    merge_quant: str = ""
+    # True: fold sources one at a time (low RAM); False: all at once (fp32).
+    merge_low_memory: bool = False
     te: list[str] = field(default_factory=list)  # 1 -> CLIPLoader, 2 -> DualCLIPLoader
     clip_type: str = "stable_diffusion"
     prompt: str = ""
@@ -60,9 +70,61 @@ class GenParams:
     filename_prefix: str = "scom"
 
 
+# Quantization choices for the merged model (node input "quantize").
+MERGE_QUANT_MODES = ("", "fp8", "int8_convrot")
+
+
+def _validate_merge(merge_models: list[tuple[str, float]],
+                    quant: str = "") -> None:
+    if len(merge_models) < 2:
+        raise ValueError("マージには2個以上のモデルが必要です")
+    for name, w in merge_models:
+        if not name:
+            raise ValueError("マージ対象のモデル名が空です")
+        if w <= 0:
+            raise ValueError(f"マージ比率は正の数値が必要です: {name} = {w}")
+    if quant not in MERGE_QUANT_MODES:
+        raise ValueError(f"不明な量子化形式です: {quant}")
+
+
+def merge_recipe(merge_models: list[tuple[str, float]]) -> str:
+    """The merge node's recipe input. A stable string matters: both ComfyUI's
+    output cache and the node's own pin cache key on it, so an identical
+    config reuses the merged model already sitting in RAM."""
+    return json.dumps([[n, float(w)] for n, w in merge_models])
+
+
+def merge_pin_key(merge_models: list[tuple[str, float]], quant: str,
+                  low_memory: bool) -> str:
+    """Key of the backend pin cache entry (must mirror the node's _pin_key)."""
+    return json.dumps([merge_recipe(merge_models), quant, bool(low_memory)])
+
+
+def _merge_node(merge_models: list[tuple[str, float]], quant: str,
+                low_memory: bool, save_to: str = "") -> dict:
+    return {
+        "class_type": "ScomMergeModel",
+        "inputs": {"recipe": merge_recipe(merge_models), "quantize": quant,
+                   "low_memory": bool(low_memory), "save_to": save_to},
+    }
+
+
+def build_merge_graph(merge_models: list[tuple[str, float]], quant: str = "",
+                      low_memory: bool = False, save_to: str = "") -> dict:
+    """Merge-only prompt: build (or refresh) the merged model in backend RAM.
+
+    With ``save_to`` the merged model is also written to the diffusion_models
+    folder as a safetensors file. The node id matches build_graph's diffusion
+    node, so a following generation with the same config is a cache hit.
+    """
+    _validate_merge(merge_models, quant)
+    return {"4": _merge_node(merge_models, quant, low_memory, save_to)}
+
+
 def build_graph(p: GenParams) -> dict:
     """Return a ComfyUI API-format prompt graph for the given parameters."""
-    if not p.diffusion:
+    merging = len(p.merge_models) >= 2
+    if not merging and not p.diffusion:
         raise ValueError("diffusion model is required")
     if not p.vae:
         raise ValueError("vae model is required")
@@ -71,10 +133,15 @@ def build_graph(p: GenParams) -> dict:
 
     graph: dict[str, dict] = {}
 
-    graph["4"] = {
-        "class_type": "UNETLoader",
-        "inputs": {"unet_name": p.diffusion, "weight_dtype": p.weight_dtype},
-    }
+    if merging:
+        _validate_merge(p.merge_models, p.merge_quant)
+        graph["4"] = _merge_node(p.merge_models, p.merge_quant,
+                                 p.merge_low_memory)
+    else:
+        graph["4"] = {
+            "class_type": "UNETLoader",
+            "inputs": {"unet_name": p.diffusion, "weight_dtype": p.weight_dtype},
+        }
     graph["5"] = {
         "class_type": "VAELoader",
         "inputs": {"vae_name": p.vae},

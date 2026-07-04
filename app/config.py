@@ -158,6 +158,11 @@ class AppPaths:
         return self.base / "settings.toml"
 
     @property
+    def prompts_path(self) -> Path:
+        """User-editable prompt-preset CSV, kept next to the executable."""
+        return self.base / "prompts.csv"
+
+    @property
     def output_dir(self) -> Path:
         """Where generated images are saved, next to the executable."""
         p = self.base / "output"

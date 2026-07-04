@@ -28,6 +28,7 @@ from typing import Callable, Optional
 import websocket  # websocket-client
 
 from . import config
+from .comfy_custom_nodes import ensure_custom_nodes
 from .textutil import strip_ansi
 
 
@@ -44,8 +45,14 @@ def _free_port(preferred: int = 8199) -> int:
 
 
 def write_extra_model_paths(paths: config.AppPaths) -> Path:
-    """Write extra_model_paths.yaml pointing ComfyUI at our models folder."""
+    """Write extra_model_paths.yaml pointing ComfyUI at our models folder.
+
+    Also installs the scom custom nodes (ScomMergeModel) and registers their
+    directory — an absolute path passes through ComfyUI's os.path.join with
+    base_path unchanged, so it can live outside the models tree.
+    """
     models = paths.models
+    nodes_dir = ensure_custom_nodes(paths)
     yaml_text = (
         "scom:\n"
         f"  base_path: {models.as_posix()}\n"
@@ -53,6 +60,7 @@ def write_extra_model_paths(paths: config.AppPaths) -> Path:
         "  diffusion_models: diffusion_models/\n"
         "  vae: vae/\n"
         "  text_encoders: text_encoders/\n"
+        f"  custom_nodes: {nodes_dir.as_posix()}\n"
     )
     out = paths.user_data / "extra_model_paths.yaml"
     out.write_text(yaml_text, encoding="utf-8")
@@ -223,18 +231,23 @@ class ComfyBackend:
     def generate(self, graph: dict,
                  on_progress: Optional[Callable[[Progress], None]] = None,
                  on_preview: Optional[Callable[[bytes], None]] = None,
-                 cancel: Optional[Callable[[], bool]] = None) -> list[bytes]:
+                 cancel: Optional[Callable[[], bool]] = None,
+                 on_cached: Optional[Callable[[list], None]] = None) -> list[bytes]:
         """Run a graph to completion and return output PNG bytes.
 
         ``on_progress`` receives Progress updates; ``on_preview`` receives raw
         JPEG/PNG bytes of intermediate latent previews; ``cancel`` is polled
-        and, if it returns True, the run is interrupted.
+        and, if it returns True, the run is interrupted. ``on_cached`` receives
+        the node ids served from the backend's output cache (sent once at the
+        start of execution) — the app uses it to tell whether a merged model
+        was still in RAM or had to be rebuilt.
         """
         if not self.is_running():
             raise BackendError("バックエンドが起動していません")
         on_progress = on_progress or (lambda _p: None)
         on_preview = on_preview or (lambda _b: None)
         cancel = cancel or (lambda: False)
+        on_cached = on_cached or (lambda _n: None)
 
         ws = websocket.WebSocket()
         ws.connect(
@@ -267,6 +280,9 @@ class ComfyBackend:
                         maximum=data.get("max", 0),
                         note="サンプリング",
                     ))
+                elif etype == "execution_cached":
+                    if data.get("prompt_id") == prompt_id:
+                        on_cached(list(data.get("nodes", [])))
                 elif etype == "executing":
                     if data.get("node") is None and data.get("prompt_id") == prompt_id:
                         break  # finished
@@ -288,6 +304,47 @@ class ComfyBackend:
             urllib.request.urlopen(req, timeout=5)
         except Exception:
             pass
+
+    def free_memory(self) -> None:
+        """Ask the backend to drop ALL cached node outputs and loaded models.
+
+        ComfyUI has no per-entry cache eviction, so this is all-or-nothing;
+        anything still needed is rebuilt/reloaded on next use. (Pinned merged
+        models are separate — see release_merge/release_all_merges.)
+        """
+        payload = json.dumps({"unload_models": True, "free_memory": True}).encode()
+        req = urllib.request.Request(
+            self.base_url + "/free", data=payload,
+            headers={"Content-Type": "application/json"},
+        )
+        urllib.request.urlopen(req, timeout=10)
+
+    # ----- scom merge pin cache (routes served by our custom node) ---------
+    def merge_pinned(self) -> list[str]:
+        """Pin-cache keys of merged models currently held in backend RAM."""
+        with urllib.request.urlopen(self.base_url + "/scom/merges",
+                                    timeout=5) as resp:
+            return list(json.loads(resp.read()).get("pinned", []))
+
+    def _post_merge_release(self, payload: dict) -> int:
+        req = urllib.request.Request(
+            self.base_url + "/scom/merge_release",
+            data=json.dumps(payload).encode(),
+            headers={"Content-Type": "application/json"},
+        )
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            return int(json.loads(resp.read()).get("released", 0))
+
+    def release_merge(self, recipe: str, quantize: str,
+                      low_memory: bool) -> int:
+        """Free one pinned merged model from backend RAM."""
+        return self._post_merge_release({
+            "recipe": recipe, "quantize": quantize,
+            "low_memory": bool(low_memory)})
+
+    def release_all_merges(self) -> int:
+        """Free every pinned merged model from backend RAM."""
+        return self._post_merge_release({"all": True})
 
     def object_info(self, class_type: str) -> dict:
         """Fetch node metadata (used to discover valid sampler/clip options)."""
