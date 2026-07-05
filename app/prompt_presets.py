@@ -12,12 +12,14 @@ from __future__ import annotations
 import csv
 from pathlib import Path
 
-# Seed content for a freshly created file: one example row users can copy.
+# Seed content for a freshly created file (the app's default presets).
 TEMPLATE = (
-    "# 1列目: 設定名、2列目: プロンプト、3列目: ネガティブプロンプト\n"
-    "# 行頭が # の行はコメントとして無視されます\n"
-    "# 1個目の設定はアプリ起動時にプロンプト欄・ネガティブ欄へ読み込まれます\n"
-    'サンプル,"masterpiece, best quality","worst quality, low quality, blurry"\n'
+    "#1個目の設定が起動時読み込まれます。\n"
+    '#必ずダブルクォーテーション( " )で値を囲ってください。\n'
+    "\n"
+    '#名前, "プロンプト", "ネガティブプロンプト"\n'
+    '"Anima品質タグ","masterpiece, best quality, score_7, safe, ",'
+    '"worst quality, low quality, score_1, score_2, score_3, artist name, "'
 )
 
 
