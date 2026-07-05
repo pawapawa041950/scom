@@ -558,6 +558,13 @@ class MainWindow(QMainWindow):
                  "quant": quant,
                  "low_memory": bool(self.settings.get("merge_low_memory", False))}]
 
+    def _merge_family(self, entry: dict) -> str:
+        """Family of a merge entry, judged from its first source model
+        (same convention as _krea2_config_warning)."""
+        if not entry.get("models"):
+            return "unknown"
+        return self._diffusion_family(entry["models"][0][0])
+
     def _merge_selected(self) -> bool:
         data = self.cb_diffusion.currentData()
         return isinstance(data, str) and data.startswith(MERGE_TOKEN)
@@ -661,9 +668,16 @@ class MainWindow(QMainWindow):
                         == f"{MERGE_TOKEN}:{entry_id}")
         self._apply_preset_filter()
         if was_selected:
-            # Fall back to the first regular model (after the merge entries).
+            # Fall back to the first regular model (after the merge entries
+            # still shown under the current preset).
+            first_regular = 0
+            for i in range(self.cb_diffusion.count()):
+                data = self.cb_diffusion.itemData(i)
+                if not (isinstance(data, str) and data.startswith(MERGE_TOKEN)):
+                    first_regular = i
+                    break
             self.cb_diffusion.setCurrentIndex(
-                min(len(self._merges), self.cb_diffusion.count() - 1))
+                min(first_regular, self.cb_diffusion.count() - 1))
         self._schedule_save()
         self._push_merge_state()
         name = entry["name"] if entry else f"id={entry_id}"
@@ -796,10 +810,13 @@ class MainWindow(QMainWindow):
         prev_data = self.cb_diffusion.currentData()
         self._fill_combo(self.cb_diffusion, self._filter_for_preset(
             "diffusion_models", self._all_models["diffusion_models"], preset))
-        # Merge entries go at the top of the list, every preset (their rows
-        # pick from all families), with a green tint to stand out.
+        # Merge entries go at the top of the list, filtered like regular
+        # models (family judged from the first source model), with a green
+        # tint to stand out.
         self.cb_diffusion.blockSignals(True)
-        for i, e in enumerate(self._merges):
+        shown = [e for e in self._merges
+                 if preset == "all" or self._merge_family(e) in (preset, "shared")]
+        for i, e in enumerate(shown):
             self.cb_diffusion.insertItem(
                 i, MERGE_PREFIX + e["name"], f"{MERGE_TOKEN}:{e['id']}")
             self.cb_diffusion.setItemData(
