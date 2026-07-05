@@ -22,7 +22,7 @@ from PySide6.QtWidgets import (
 
 from .. import config, settings, metadata, modelinfo, prompt_presets
 from . import ansi_log
-from .widgets import GrowingTextEdit
+from .widgets import GrowingTextEdit, WideComboBox
 from ..comfy_backend import ComfyBackend, BackendError, Progress
 from ..workflow import (
     GenParams, build_graph, build_merge_graph, merge_pin_key, merge_recipe,
@@ -209,7 +209,7 @@ class MainWindow(QMainWindow):
 
         # Preset: picking anima/krea2 filters the model dropdowns to that
         # family and auto-selects its model/vae/te/CLIP.
-        self.cb_preset = QComboBox()
+        self.cb_preset = WideComboBox()
         self.cb_preset.addItem("anima", "anima")
         self.cb_preset.addItem("krea2", "krea2")
         self.cb_preset.addItem("すべて", "all")
@@ -220,14 +220,14 @@ class MainWindow(QMainWindow):
         )
         self.cb_preset.currentIndexChanged.connect(self._on_preset_changed)
 
-        self.cb_diffusion = QComboBox()
-        self.cb_vae = QComboBox()
-        self.cb_te1 = QComboBox()
-        self.cb_te2 = QComboBox()
+        self.cb_diffusion = WideComboBox()
+        self.cb_vae = WideComboBox()
+        self.cb_te1 = WideComboBox()
+        self.cb_te2 = WideComboBox()
         self.chk_dual_te = QCheckBox("2つ目の text encoder を使用 (DualCLIPLoader)")
         self.chk_dual_te.toggled.connect(self._on_dual_toggled)
 
-        self.cb_clip_type = QComboBox()
+        self.cb_clip_type = WideComboBox()
         self.cb_clip_type.addItems(CLIP_TYPES_SINGLE)
 
         # Picking a model auto-aligns the CLIP type / text encoder to its family
@@ -275,7 +275,7 @@ class MainWindow(QMainWindow):
 
         # Prompt presets: pick a named entry from prompts.csv and append its
         # prompt/negative to the fields with the pen button.
-        self.cb_prompt_preset = QComboBox()
+        self.cb_prompt_preset = WideComboBox()
         self.cb_prompt_preset.setToolTip(
             "prompts.csv のプリセット（1列目: 設定名、2列目: プロンプト、"
             "3列目: ネガティブプロンプト）")
@@ -317,9 +317,9 @@ class MainWindow(QMainWindow):
         self.sp_batch = QSpinBox(); self.sp_batch.setRange(1, 16)
         self.sp_batch.setValue(1)
 
-        self.cb_sampler = QComboBox(); self.cb_sampler.addItems(SAMPLERS)
+        self.cb_sampler = WideComboBox(); self.cb_sampler.addItems(SAMPLERS)
         self.cb_sampler.setCurrentText("er_sde")
-        self.cb_scheduler = QComboBox(); self.cb_scheduler.addItems(SCHEDULERS)
+        self.cb_scheduler = WideComboBox(); self.cb_scheduler.addItems(SCHEDULERS)
         self.cb_scheduler.setCurrentText("simple")
 
         # Seeds can exceed 32-bit (QSpinBox limit), so use a text field.
@@ -331,7 +331,7 @@ class MainWindow(QMainWindow):
         self.chk_randomize = QCheckBox("生成ごとに seed をランダム化")
         self.chk_randomize.setChecked(True)
 
-        self.cb_dtype = QComboBox()
+        self.cb_dtype = WideComboBox()
         self.cb_dtype.addItems(["default", "fp8_e4m3fn", "fp8_e5m2"])
 
         r = 0
@@ -386,7 +386,7 @@ class MainWindow(QMainWindow):
         box = QGroupBox("Image")
         row = QHBoxLayout(box)
 
-        self.cb_img_format = QComboBox()
+        self.cb_img_format = WideComboBox()
         self.cb_img_format.addItems(["png", "jpg", "webp", NO_SAVE])  # index 0/1/2/3
 
         # One compact quality control per format, swapped on format change.

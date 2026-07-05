@@ -3,9 +3,30 @@ from __future__ import annotations
 
 from PySide6.QtCore import QRect, Qt
 from PySide6.QtWidgets import (
-    QCheckBox, QHBoxLayout, QLabel, QProgressBar, QProxyStyle, QStyle,
-    QTextEdit, QWidget,
+    QCheckBox, QComboBox, QHBoxLayout, QLabel, QProgressBar, QProxyStyle,
+    QStyle, QTextEdit, QWidget,
 )
+
+
+class WideComboBox(QComboBox):
+    """A combo box whose popup grows to fit its longest item.
+
+    The closed control stays at its layout width (long names are elided
+    there), but the dropdown list widens so every item is fully readable.
+    """
+
+    def showPopup(self) -> None:
+        view = self.view()
+        fm = view.fontMetrics()
+        widest = max((fm.horizontalAdvance(self.itemText(i))
+                      for i in range(self.count())), default=0)
+        # room for text margins + scrollbar; never narrower than the combo
+        needed = widest + view.verticalScrollBar().sizeHint().width() + 24
+        screen = self.screen()
+        if screen is not None:
+            needed = min(needed, int(screen.availableGeometry().width() * 0.8))
+        view.setMinimumWidth(max(needed, self.width()))
+        super().showPopup()
 
 
 class CompactSpinStyle(QProxyStyle):

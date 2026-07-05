@@ -22,6 +22,8 @@ from PySide6.QtWidgets import (
     QVBoxLayout, QWidget,
 )
 
+from .widgets import WideComboBox
+
 # Returns "anima" | "krea2" | "shared" | "unknown" for a diffusion file name.
 FamilyFn = Callable[[str], str]
 
@@ -103,7 +105,7 @@ class MergeDialog(QDialog):
         self.chk_quant = QCheckBox("量子化する")
         self.chk_quant.setToolTip(
             "マージ結果の重みを低精度化してメモリ/VRAM を節約します")
-        self.cb_quant = QComboBox()
+        self.cb_quant = WideComboBox()
         self.cb_quant.addItem("fp8", "fp8")
         self.cb_quant.addItem("int8 ConvRot", "int8_convrot")
         self.cb_quant.setItemData(
@@ -263,7 +265,7 @@ class MergeDialog(QDialog):
         h = QHBoxLayout(w)
         h.setContentsMargins(0, 0, 0, 0)
 
-        combo = QComboBox()
+        combo = WideComboBox()
         combo.addItem("")
         combo.addItems(self._models)
         combo.setCurrentText(name)
