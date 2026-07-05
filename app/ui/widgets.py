@@ -1,10 +1,36 @@
 """Small reusable UI widgets."""
 from __future__ import annotations
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import QRect, Qt
 from PySide6.QtWidgets import (
-    QCheckBox, QHBoxLayout, QLabel, QProgressBar, QTextEdit, QWidget,
+    QCheckBox, QHBoxLayout, QLabel, QProgressBar, QProxyStyle, QStyle,
+    QTextEdit, QWidget,
 )
+
+
+class CompactSpinStyle(QProxyStyle):
+    """Stack a spin box's up/down buttons vertically in a narrow column.
+
+    The Windows 11 style places the two buttons side by side, which squeezes
+    the number display; only the subcontrol rects are overridden so the
+    native rendering (theme colors, chevron arrows, hover) is kept.
+    """
+    BTN_W = 16
+
+    def subControlRect(self, cc, opt, sc, widget=None):
+        if cc == QStyle.CC_SpinBox:
+            r = opt.rect
+            if sc == QStyle.SC_SpinBoxUp:
+                return QRect(r.right() - self.BTN_W, r.top(),
+                             self.BTN_W, r.height() // 2)
+            if sc == QStyle.SC_SpinBoxDown:
+                return QRect(r.right() - self.BTN_W,
+                             r.top() + r.height() // 2,
+                             self.BTN_W, r.height() - r.height() // 2)
+            if sc == QStyle.SC_SpinBoxEditField:
+                return QRect(r.left() + 4, r.top(),
+                             r.width() - self.BTN_W - 8, r.height())
+        return super().subControlRect(cc, opt, sc, widget)
 
 
 class GrowingTextEdit(QTextEdit):
