@@ -72,7 +72,11 @@ def scan_models(kind: str) -> list[str]:
     found: list[str] = []
     for path in root.rglob("*"):
         if path.is_file() and path.suffix.lower() in MODEL_EXTENSIONS:
-            found.append(path.relative_to(root).as_posix())
+            # OS-native separators: ComfyUI lists files via os.path.relpath
+            # and its prompt validation requires an exact string match, so a
+            # subfolder file must be sent as "sub\\file.safetensors" on
+            # Windows, not "sub/file.safetensors".
+            found.append(str(path.relative_to(root)))
     return sorted(found, key=str.lower)
 
 
