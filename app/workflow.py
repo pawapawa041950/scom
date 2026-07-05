@@ -45,10 +45,11 @@ DEFAULT_NEGATIVE = (
 class GenParams:
     diffusion: str
     vae: str
-    # Optional multi-model merge: [(filename, weight), ...]. With 2+ entries
-    # the diffusion model comes from the ScomMergeModel custom node (weighted
+    # Optional model merge: [(filename, weight), ...]. When non-empty the
+    # diffusion model comes from the ScomMergeModel custom node (weighted
     # average materialized in RAM; see app/comfy_custom_nodes.py) and
     # ``diffusion`` is ignored. Weights are relative (need not sum to 1).
+    # A single entry is just that model, optionally quantized, pinned in RAM.
     merge_models: list[tuple[str, float]] = field(default_factory=list)
     # Output precision of the merge: "" (bf16) | "fp8" | "int8_convrot".
     merge_quant: str = ""
@@ -76,8 +77,10 @@ MERGE_QUANT_MODES = ("", "fp8", "int8_convrot")
 
 def _validate_merge(merge_models: list[tuple[str, float]],
                     quant: str = "") -> None:
-    if len(merge_models) < 2:
-        raise ValueError("マージには2個以上のモデルが必要です")
+    # A single model is allowed: the "merge" is then just (optionally
+    # quantized) materialization of that model into backend RAM.
+    if len(merge_models) < 1:
+        raise ValueError("マージには1個以上のモデルが必要です")
     for name, w in merge_models:
         if not name:
             raise ValueError("マージ対象のモデル名が空です")
@@ -123,7 +126,7 @@ def build_merge_graph(merge_models: list[tuple[str, float]], quant: str = "",
 
 def build_graph(p: GenParams) -> dict:
     """Return a ComfyUI API-format prompt graph for the given parameters."""
-    merging = len(p.merge_models) >= 2
+    merging = len(p.merge_models) >= 1
     if not merging and not p.diffusion:
         raise ValueError("diffusion model is required")
     if not p.vae:

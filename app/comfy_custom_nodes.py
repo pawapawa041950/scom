@@ -210,6 +210,42 @@ except Exception:  # noqa: BLE001 - the node still works without the routes
     logging.exception("scom: failed to register /scom/* routes")
 
 
+def _patch_int8_rowwise():
+    """Load third-party "int8_rowwise" checkpoints (e.g. Krea int8-convrot
+    releases). Their tensors are identical to the supported int8_tensorwise
+    per-channel layout (int8 weight [N,K] + fp32 scale [N,1], optional
+    ConvRot); only the comfy_quant format string differs, so rewrite it
+    before the state dict reaches ComfyUI's quantized-module loader."""
+    orig = comfy.sd.load_diffusion_model_state_dict
+    if getattr(orig, "_scom_int8_rowwise", False):
+        return
+
+    def patched(sd, *args, **kwargs):
+        for k in list(sd):
+            if not k.endswith("comfy_quant"):
+                continue
+            try:
+                conf = json.loads(bytes(sd[k].numpy().tobytes()))
+            except (ValueError, AttributeError, RuntimeError):
+                continue
+            if not isinstance(conf, dict) or conf.get("format") != "int8_rowwise":
+                continue
+            conf["format"] = "int8_tensorwise"
+            conf.pop("per_row", None)
+            sd[k] = torch.tensor(
+                list(json.dumps(conf).encode("utf-8")), dtype=torch.uint8)
+        return orig(sd, *args, **kwargs)
+
+    patched._scom_int8_rowwise = True
+    comfy.sd.load_diffusion_model_state_dict = patched
+
+
+try:
+    _patch_int8_rowwise()
+except Exception:  # noqa: BLE001 - only int8_rowwise files are affected
+    logging.exception("scom: failed to patch int8_rowwise support")
+
+
 class ScomMergeModel:
     """Materialize a weighted average of N diffusion models in main memory."""
 
@@ -235,8 +271,8 @@ class ScomMergeModel:
 
     def merge(self, recipe, quantize="", low_memory=False, save_to=""):
         entries = json.loads(recipe)
-        if not isinstance(entries, list) or len(entries) < 2:
-            raise ValueError("マージには2個以上のモデルが必要です")
+        if not isinstance(entries, list) or len(entries) < 1:
+            raise ValueError("マージには1個以上のモデルが必要です")
         weights = [float(w) for _n, w in entries]
         if any(w <= 0 for w in weights):
             raise ValueError("マージ比率は正の数値で指定してください")

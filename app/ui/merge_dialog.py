@@ -400,9 +400,10 @@ class MergeDialog(QDialog):
         return self.entries(), self.quant_value(), self.chk_lowmem.isChecked()
 
     def _validate(self, entries) -> bool:
-        if len(entries) < 2:
+        # 1 model is fine: that is a quantize-only (or copy-only) build.
+        if len(entries) < 1:
             QMessageBox.warning(self, "入力不足",
-                                "マージには2個以上のモデルを選択してください。")
+                                "モデルを1個以上選択してください。")
             return False
         return True
 
