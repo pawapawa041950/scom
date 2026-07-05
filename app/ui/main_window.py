@@ -288,7 +288,7 @@ class MainWindow(QMainWindow):
         btn_reload = QPushButton("再読込み")
         btn_reload.setToolTip("設定ファイルを再読み込み")
         btn_reload.clicked.connect(self._reload_prompt_presets)
-        layout.addWidget(QLabel("プロンプト入力"))
+        layout.addWidget(QLabel("プロンプト入力 (prompts.csvの1個目の設定が起動時↑に設定されます)"))
         preset_row = QHBoxLayout()
         preset_row.addWidget(self.cb_prompt_preset, stretch=1)
         preset_row.addWidget(btn_apply)
@@ -891,9 +891,13 @@ class MainWindow(QMainWindow):
         self.chk_dual_te.setChecked(bool(s.get("dual_te", False)))
         self._on_dual_toggled(self.chk_dual_te.isChecked())  # sync clip list
         self.cb_clip_type.setCurrentText(str(s.get("clip_type", "stable_diffusion")))
-        # prompt/negative: initial values only
-        self.txt_prompt.setPlainText(str(s.get("prompt", "")))
-        self.txt_negative.setPlainText(str(s.get("negative", DEFAULT_NEGATIVE)))
+        # prompt/negative: startup values come from the first prompts.csv
+        # entry (already loaded); without one the constructor defaults stay.
+        presets = getattr(self, "_prompt_presets", [])
+        if presets:
+            _name, prompt, negative = presets[0]
+            self.txt_prompt.setPlainText(prompt)
+            self.txt_negative.setPlainText(negative)
         self.sp_width.setValue(int(s.get("width", 1024)))
         self.sp_height.setValue(int(s.get("height", 1024)))
         self.sp_steps.setValue(int(s.get("steps", 30)))
@@ -952,8 +956,6 @@ class MainWindow(QMainWindow):
                   "quant": e["quant"], "low_memory": e["low_memory"]}
                  for e in self._merges], ensure_ascii=False),
             "merge_seq": int(self._merge_seq),
-            "prompt": self.settings.get("prompt", ""),
-            "negative": self.settings.get("negative", DEFAULT_NEGATIVE),
             "width": self.sp_width.value(),
             "height": self.sp_height.value(),
             "steps": self.sp_steps.value(),
@@ -1044,6 +1046,9 @@ class MainWindow(QMainWindow):
     # ----- prompt presets (prompts.csv) -------------------------------------
     def _reload_prompt_presets(self, *_args, quiet: bool = False) -> None:
         try:
+            # Created on first run so the sample preset seeds the prompt
+            # fields at startup (the first entry is the startup prompt).
+            prompt_presets.ensure_file(self.paths.prompts_path)
             self._prompt_presets = prompt_presets.load(self.paths.prompts_path)
         except (OSError, ValueError) as e:
             self.append_log(f"prompts.csv の読み込みエラー: {e}")
