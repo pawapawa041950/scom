@@ -21,9 +21,18 @@ re-merge) and model management moves it VRAM<->RAM like any other model.
 Linear weights to per-tensor scaled float8_e4m3fn (Comfy-Org "fp8_scaled"
 layout), "int8_convrot" produces ComfyUI v0.27's native INT8 ConvRot format
 (group-wise Hadamard rotation + per-row INT8; only the main DiT ``blocks.``
-Linear layers, matching public INT8-ConvRot checkpoints). ``save_to``
-additionally writes the merged state dict as a safetensors file into the
-app's diffusion_models folder.
+Linear layers, matching public INT8-ConvRot checkpoints), "int4_convrot"
+produces an int4/int8 hybrid built on the ConvRot W4A4 format added after
+v0.27 (packed 4-bit weights, group-64 scales, needs comfy-kitchen >=
+0.2.17): q/k/v/up projections go int4 with nearest rounding, the
+error-prone output-side projections (attn output / MLP down) go int8, adaLN
+modulation and anima's llm_adapter stay high precision, and the matmul is
+pinned to int8 via ``linear_dtype`` — full 4-bit compute and stochastic
+rounding were each verified to visibly degrade anima-sized models.
+"int4_convrot_full" is the same minus the int8 exemption: every eligible
+layer goes int4 (smallest file; fine on krea2-sized models, visibly lossy
+on small ones). ``save_to`` additionally writes the merged state dict as a
+safetensors file into the app's diffusion_models folder.
 """
 from __future__ import annotations
 
@@ -92,8 +101,16 @@ def _load_patcher(name):
     return comfy.sd.load_diffusion_model(path)
 
 
-QUANT_MODES = ("", "fp8", "int8_convrot")
+QUANT_MODES = ("", "fp8", "int8_convrot", "int4_convrot",
+               "int4_convrot_full")
 _CONVROT_GROUP = 256
+_INT4_QUANT_GROUP = 64  # scale group of the packed int4 (convrot_w4a4) layout
+# The default int4 mode is a mix: the second/output matmul of each attention
+# and MLP (down/output projections) measured the highest int4 weight error on
+# anima (0.16-0.29 vs 0.15 elsewhere) and stays int8. Names cover anima
+# (output_proj/layer2) and krea2 (wo/down); q/k/v/up/gate go int4.
+# "int4_convrot_full" skips this exemption (smallest file; big models only).
+_INT4_KEEP_INT8 = ("output_proj", "o_proj", "layer2", "wo", "down")
 
 
 def _quant_eligible(mode, key, bare, quantizable, ndim, in_features):
@@ -102,12 +119,27 @@ def _quant_eligible(mode, key, bare, quantizable, ndim, in_features):
         raise ValueError("不明な量子化形式です: {}".format(mode))
     if not mode or key not in quantizable or ndim != 2:
         return False
-    if mode == "int8_convrot":
-        # Conservative policy matching public INT8-ConvRot checkpoints: only
-        # the main DiT blocks (krea2: blocks.*, anima: net.blocks.*); the
+    if mode in ("int8_convrot", "int4_convrot", "int4_convrot_full"):
+        # Conservative policy matching public ConvRot checkpoints: only the
+        # main DiT blocks (krea2: blocks.*, anima: net.blocks.*); the
         # sensitive embed/final/txt layers stay high precision. The Hadamard
-        # rotation also needs in_features divisible by the group size.
-        return "blocks." in bare and in_features % _CONVROT_GROUP == 0
+        # rotation also needs in_features divisible by the group size (256,
+        # a multiple of the int4 scale group 64).
+        if "blocks." not in bare or in_features % _CONVROT_GROUP != 0:
+            return False
+        # Text-conditioning paths stay high precision like the official
+        # checkpoints (Comfy-Org's krea2 int8 leaves all 32 txtfusion
+        # linears at bf16; anima's llm_adapter is its equivalent). Their
+        # names contain "blocks." too, hence the explicit exclusion.
+        if "txtfusion" in bare or bare.startswith("llm_adapter."):
+            return False
+        if mode.startswith("int4_convrot"):
+            # int4 is far less forgiving than int8 (verified: quantizing
+            # these produces pure noise). Public ConvRot checkpoints keep
+            # the adaLN modulation layers high precision.
+            if "adaln" in bare:
+                return False
+        return True
     return True
 
 
@@ -122,15 +154,45 @@ def _quantize_out(bare, acc32, mode):
         return ({bare: q, layer + ".weight_scale": scale.to(torch.float32)},
                 {"format": "float8_e4m3fn",
                  "full_precision_matrix_mult": True})
+    if mode == "int4_convrot_full" or (
+            mode == "int4_convrot"
+            and layer.rsplit(".", 1)[-1] not in _INT4_KEEP_INT8):
+        # convrot_w4a4: Hadamard rotation + packed 4-bit weights with
+        # group-64 scales (post-v0.27 format; comfy-kitchen >= 0.2.17).
+        # In the hybrid "int4_convrot" mode the output-side projections
+        # (see _INT4_KEEP_INT8) fall through to the int8 branch below;
+        # "int4_convrot_full" quantizes every eligible layer to int4.
+        layout = getattr(comfy.quant_ops, "TensorCoreConvRotW4A4Layout", None)
+        if layout is None or not hasattr(layout, "quantize"):
+            raise RuntimeError(
+                "int4 ConvRot 量子化にはこの ComfyUI / comfy_kitchen が"
+                "対応していません")
+        # linear_dtype "int8": weights are stored packed int4 (1/4 size) but
+        # the matmul runs int8 (W4A8). Full W4A4 (activations also 4-bit,
+        # the loader default on int4-capable GPUs) was verified to produce
+        # pure noise on anima-sized models, while W4A8 matches int8 speed.
+        # stochastic_rounding=0 -> nearest rounding: measured 0.21 -> 0.15
+        # relative weight error on anima; at 4 bits the extra stochastic
+        # noise is clearly visible in the output.
+        qdata, params = layout.quantize(
+            acc32, convrot_groupsize=_CONVROT_GROUP,
+            quant_group_size=_INT4_QUANT_GROUP, stochastic_rounding=0,
+            linear_dtype="int8")
+        return ({bare: qdata, layer + ".weight_scale": params.scale},
+                {"format": "convrot_w4a4",
+                 "convrot_groupsize": _CONVROT_GROUP,
+                 "linear_dtype": "int8"})
     # int8_convrot: group-wise Hadamard rotation + per-row INT8 (ComfyUI
     # v0.27 native format; kernels from comfy_kitchen, eager path on CPU).
     layout = getattr(comfy.quant_ops, "TensorWiseINT8Layout", None)
     if layout is None or not hasattr(layout, "quantize"):
         raise RuntimeError(
             "int8 ConvRot 量子化にはこの ComfyUI / comfy_kitchen が対応していません")
+    # stochastic_rounding=0 -> nearest rounding, matching the official
+    # Comfy-Org int8 checkpoints (stochastic measured 1.44x their error).
     qdata, params = layout.quantize(
         acc32, is_weight=True, per_channel=True, convrot=True,
-        convrot_groupsize=_CONVROT_GROUP, stochastic_rounding=seed)
+        convrot_groupsize=_CONVROT_GROUP, stochastic_rounding=0)
     return ({bare: qdata, layer + ".weight_scale": params.scale},
             {"format": "int8_tensorwise", "convrot": True,
              "convrot_groupsize": _CONVROT_GROUP})
@@ -255,6 +317,7 @@ class ScomMergeModel:
             # JSON: [["file.safetensors", weight], ...] (relative weights)
             "recipe": ("STRING", {"default": "[]", "multiline": True}),
             # "" (no quantization) | "fp8" | "int8_convrot"
+            # | "int4_convrot" (hybrid) | "int4_convrot_full" (all int4)
             "quantize": ("STRING", {"default": ""}),
             # True: one source at a time (bf16 accumulator, low RAM);
             # False: all sources at once (fp32 combine, best precision).

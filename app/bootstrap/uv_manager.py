@@ -54,6 +54,9 @@ def _run_uv(uv_path: Path, args: list[str], log: LogCb,
     creationflags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
     proc = subprocess.Popen(
         cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+        # uv emits UTF-8; without this Windows decodes as the ANSI code page
+        # (cp932) and multi-byte progress glyphs crash the reader thread.
+        encoding="utf-8", errors="replace",
         bufsize=1, creationflags=creationflags,
     )
     assert proc.stdout

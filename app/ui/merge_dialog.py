@@ -108,6 +108,8 @@ class MergeDialog(QDialog):
         self.cb_quant = WideComboBox()
         self.cb_quant.addItem("fp8", "fp8")
         self.cb_quant.addItem("int8 ConvRot", "int8_convrot")
+        self.cb_quant.addItem("int4 ConvRot（ハイブリッド）", "int4_convrot")
+        self.cb_quant.addItem("int4 ConvRot（完全4bit）", "int4_convrot_full")
         self.cb_quant.setItemData(
             0, "Linear 層を float8_e4m3fn（per-tensor scale）に量子化。"
                "サイズ約1/2、わずかに精度低下", Qt.ToolTipRole)
@@ -116,6 +118,17 @@ class MergeDialog(QDialog):
                "RTX 30 系以上の INT8 Tensor Core で高速。"
                "DiT ブロックのみ量子化（sensitive 層は高精度維持）",
             Qt.ToolTipRole)
+        self.cb_quant.setItemData(
+            2, "回転（Hadamard）ベースの INT4/INT8 ハイブリッド（convrot_w4a4）。"
+               "Q/K/V/up 系は int4、誤差の大きい出力側 projection は int8、"
+               "行列積は int8 で実行（速度は int8 と同等・サイズはより小さい）。"
+               "int8 よりわずかに精度低下（adaLN 等の sensitive 層は高精度維持）",
+            Qt.ToolTipRole)
+        self.cb_quant.setItemData(
+            3, "対象の Linear 層をすべて int4 にする最小サイズ版。"
+               "krea2 級の大モデル向き。anima 等の小モデルでは劣化が"
+               "目立つためハイブリッド推奨（adaLN 等の sensitive 層は"
+               "高精度維持）", Qt.ToolTipRole)
         self.cb_quant.setEnabled(False)
         self.chk_quant.toggled.connect(self._sync_quant_enabled)
         quant_row = QHBoxLayout()
@@ -359,7 +372,8 @@ class MergeDialog(QDialog):
         return out
 
     def quant_value(self) -> str:
-        """Selected quantization mode: "" | "fp8" | "int8_convrot"."""
+        """Selected quantization mode: "" | "fp8" | "int8_convrot"
+        | "int4_convrot" | "int4_convrot_full"."""
         if not self.chk_quant.isChecked():
             return ""
         return self.cb_quant.currentData() or ""

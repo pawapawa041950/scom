@@ -51,7 +51,8 @@ class GenParams:
     # ``diffusion`` is ignored. Weights are relative (need not sum to 1).
     # A single entry is just that model, optionally quantized, pinned in RAM.
     merge_models: list[tuple[str, float]] = field(default_factory=list)
-    # Output precision of the merge: "" (bf16) | "fp8" | "int8_convrot".
+    # Output precision of the merge: "" (bf16) | "fp8" | "int8_convrot"
+    # | "int4_convrot" (int4/int8 hybrid) | "int4_convrot_full" (all int4).
     merge_quant: str = ""
     # True: fold sources one at a time (low RAM); False: all at once (fp32).
     merge_low_memory: bool = False
@@ -72,7 +73,8 @@ class GenParams:
 
 
 # Quantization choices for the merged model (node input "quantize").
-MERGE_QUANT_MODES = ("", "fp8", "int8_convrot")
+MERGE_QUANT_MODES = ("", "fp8", "int8_convrot", "int4_convrot",
+                     "int4_convrot_full")
 
 
 def _validate_merge(merge_models: list[tuple[str, float]],
