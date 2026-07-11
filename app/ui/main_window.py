@@ -20,7 +20,7 @@ from PySide6.QtWidgets import (
     QSplitter, QStackedWidget, QVBoxLayout, QWidget, QCheckBox,
 )
 
-from .. import config, settings, metadata, modelinfo, prompt_presets
+from .. import config, settings, metadata, modelinfo, prompt_presets, xyz
 from . import ansi_log
 from .widgets import GrowingTextEdit, WideComboBox
 from ..comfy_backend import ComfyBackend, BackendError, Progress
@@ -93,6 +93,59 @@ class _GenWorker(QObject):
             self.failed.emit(f"unexpected error: {e}")
 
 
+class _XyzWorker(QObject):
+    """Runs the XYZ plot cells sequentially off the UI thread.
+
+    セル単位のエラーは placeholder (None) にして続行するが、最初のセルで
+    失敗した場合は設定不備とみなして全体を中止する。
+    """
+    progress = Signal(Progress)
+    preview = Signal(bytes)
+    cell_done = Signal(int, int)    # finished count, total
+    cell_image = Signal(int, bytes)  # grid index, png (直後の逐次保存用)
+    cell_error = Signal(int, str)   # grid index, message
+    done = Signal(object)           # {grid_index: png bytes | None}
+    failed = Signal(str)
+
+    def __init__(self, backend: ComfyBackend, jobs: list):
+        super().__init__()
+        self.backend = backend
+        self.jobs = jobs  # list[(grid_index, graph)]
+        self._cancel = False
+
+    def cancel(self) -> None:
+        self._cancel = True
+
+    def run(self) -> None:
+        results: dict[int, Optional[bytes]] = {}
+        try:
+            for n, (idx, graph) in enumerate(self.jobs):
+                if self._cancel:
+                    raise BackendError("生成をキャンセルしました")
+                try:
+                    images = self.backend.generate(
+                        graph,
+                        on_progress=self.progress.emit,
+                        on_preview=self.preview.emit,
+                        cancel=lambda: self._cancel,
+                    )
+                except BackendError as e:
+                    if self._cancel or n == 0:
+                        raise
+                    results[idx] = None
+                    self.cell_error.emit(idx, str(e))
+                else:
+                    results[idx] = images[0] if images else None
+                    if results[idx]:
+                        self.cell_image.emit(idx, results[idx])
+                self.cell_done.emit(n + 1, len(self.jobs))
+            self.done.emit(results)
+        except BackendError as e:
+            self.failed.emit(str(e))
+        except Exception as e:  # pragma: no cover - defensive
+            self.failed.emit(f"unexpected error: {e}")
+
+
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
@@ -123,6 +176,11 @@ class MainWindow(QMainWindow):
         self._last_merge_id: Optional[int] = None   # entry used by last gen
         self._merge_was_cached = False              # node "4" was a cache hit
         self._merge_dlg = None  # non-modal MergeDialog (at most one)
+        # XYZ plot: non-modal dialog + sequential-cell worker state.
+        self._xyz_dlg = None
+        self._xyz_thread: Optional[QThread] = None
+        self._xyz_worker: Optional[_XyzWorker] = None
+        self._xyz_ctx: Optional[dict] = None
         self._loading = True
         self._save_timer = QTimer(self)
         self._save_timer.setSingleShot(True)
@@ -357,6 +415,13 @@ class MainWindow(QMainWindow):
         row.setContentsMargins(0, 0, 0, 0)
         # 連続 is a checkbox: two states with an unmistakable ON/OFF look
         # (a pressed QPushButton reads poorly). Same isChecked/setChecked API.
+        self.btn_xyz = QPushButton("XYZ")
+        self.btn_xyz.setToolTip(
+            "XYZ プロット: 複数パラメータの値の組み合わせで生成し、"
+            "1枚のグリッド画像にまとめます")
+        self.btn_xyz.setMinimumHeight(40)
+        self.btn_xyz.setMaximumWidth(56)
+        self.btn_xyz.clicked.connect(self._open_xyz_dialog)
         self.btn_continuous = QCheckBox("連続")
         self.btn_continuous.setToolTip("ONの間、生成が終わるたびに自動で次を生成します")
         self.btn_continuous.setMinimumHeight(40)
@@ -372,6 +437,7 @@ class MainWindow(QMainWindow):
             sp = b.sizePolicy()
             sp.setHorizontalPolicy(QSizePolicy.Ignored)
             b.setSizePolicy(sp)
+        row.addWidget(self.btn_xyz)
         row.addWidget(self.btn_continuous)
         row.addWidget(self.btn_generate, stretch=2)
         row.addWidget(self.btn_cancel, stretch=1)
@@ -728,7 +794,7 @@ class MainWindow(QMainWindow):
                 "バックエンドがまだ起動していません。起動完了後、"
                 "生成時に自動でマージされます。")
             return
-        if self._gen_thread is not None:
+        if self._gen_thread is not None or self._xyz_thread is not None:
             QMessageBox.information(
                 self, "実行中",
                 "生成の完了後に実行してください（生成時に自動でマージされます）。")
@@ -784,6 +850,326 @@ class MainWindow(QMainWindow):
             if idx >= 0:
                 self.cb_diffusion.setCurrentIndex(idx)
         self._push_merge_state()
+
+    # ----- XYZ plot ---------------------------------------------------------
+    def _open_xyz_dialog(self) -> None:
+        from .xyz_dialog import XyzDialog
+        # 実行中は既存ウィンドウを前面に出すだけ（作り直すと進捗表示が切れる）。
+        if self._xyz_thread is not None and self._xyz_dlg is not None:
+            try:
+                self._xyz_dlg.show()
+                self._xyz_dlg.raise_()
+                self._xyz_dlg.activateWindow()
+                return
+            except RuntimeError:
+                self._xyz_dlg = None
+        if self._xyz_dlg is not None:
+            try:
+                self._xyz_dlg.close()
+                self._xyz_dlg.deleteLater()
+            except RuntimeError:
+                pass
+        try:
+            state = json.loads(str(self.settings.get("xyz", "{}")))
+        except (ValueError, TypeError):
+            state = {}
+        # Parentless on purpose: same as the merge window, so it can go
+        # behind the main window. Model-axis choices list merge entries
+        # first (as "マージモデル：<name>" tokens), like the main dropdown.
+        choices = ([MERGE_PREFIX + e["name"] for e in self._merges]
+                   + self._all_models.get("diffusion_models", []))
+        dlg = XyzDialog(choices, state, None)
+        dlg.run_requested.connect(self._on_xyz_requested)
+        dlg.cancel_requested.connect(self.on_cancel)
+        self._xyz_dlg = dlg
+        if self._xyz_thread is not None and self._xyz_ctx is not None:
+            dlg.set_running(True, int(self._xyz_ctx.get("total", 0)))
+        dlg.show()
+
+    def _xyz_parent(self):
+        """Message-box parent: the XYZ window if alive, else the main window."""
+        if self._xyz_dlg is not None:
+            try:
+                if self._xyz_dlg.isVisible():
+                    return self._xyz_dlg
+            except RuntimeError:
+                self._xyz_dlg = None
+        return self
+
+    def _push_xyz_running(self, running: bool, total: int = 0) -> None:
+        if self._xyz_dlg is None:
+            return
+        try:
+            self._xyz_dlg.set_running(running, total)
+        except RuntimeError:
+            self._xyz_dlg = None
+
+    def _on_xyz_requested(self, spec: dict, auto: bool = False) -> None:
+        """Start an XYZ run. ``auto`` marks a continuous-mode chained run
+        (skips the many-cells confirmation so the loop keeps going)."""
+        if not self.backend.is_running():
+            QMessageBox.warning(self._xyz_parent(), "未準備",
+                                "バックエンドがまだ起動していません。")
+            return
+        if self._gen_thread is not None or self._xyz_thread is not None:
+            QMessageBox.information(self._xyz_parent(), "実行中",
+                                    "生成の完了後に実行してください。")
+            return
+        try:
+            base = self._collect_params()
+            base.batch_size = 1  # 1セル = 1枚
+            axes = [xyz.axis_by_id(a["id"]) for a in spec["axes"]]
+            values = [a["values"] for a in spec["axes"]]
+            has_model_axis = any(a.id == "model" for a in axes)
+            if not has_model_axis:
+                # モデル軸があるときは全セルでモデルが差し替わるので、ベース
+                # 選択に対する krea2 チェックは意味を持たない（整合は下で
+                # セルごとに取る）。
+                warn = self._krea2_config_warning(base)
+                if warn:
+                    QMessageBox.warning(self._xyz_parent(),
+                                        "Krea-2 の設定を確認してください", warn)
+                    return
+            plan = xyz.plan_cells(base, axes, values)
+            if has_model_axis:
+                self._xyz_align_logged = set()
+                plan = [(idx, self._resolve_xyz_model_cell(p))
+                        for idx, p in plan]
+            jobs = [(idx, build_graph(p)) for idx, p in plan]
+        except ValueError as e:
+            QMessageBox.warning(self._xyz_parent(), "入力エラー", str(e))
+            return
+        total = len(jobs)
+        if total > 64 and not auto:
+            res = QMessageBox.question(
+                self._xyz_parent(), "確認",
+                f"{total} 枚の画像を生成します。実行しますか？")
+            if res != QMessageBox.Yes:
+                return
+        # ウィンドウの入力状態を保存（次回開いたとき復元される）。
+        if self._xyz_dlg is not None:
+            try:
+                self.settings["xyz"] = json.dumps(
+                    self._xyz_dlg.state(), ensure_ascii=False)
+                self._schedule_save()
+            except RuntimeError:
+                self._xyz_dlg = None
+
+        from datetime import datetime
+        # 個別保存はセル完成のたびに行う（キャンセルしても済んだ分は残る）。
+        # フォーマットは開始時点の設定で run 全体を通して固定する。
+        cell_fmt = None
+        if spec.get("save_cells"):
+            fmt = self.cb_img_format.currentText()
+            if fmt == NO_SAVE:
+                self.append_log("Format = 保存しない のため個別画像は保存しません")
+            else:
+                cell_fmt = (fmt, *self._encode_params(fmt))
+        self._xyz_ctx = {
+            "spec": spec,
+            "base": base,
+            "params": dict(plan),
+            "nx": len(values[0]), "ny": len(values[1]), "nz": len(values[2]),
+            "total": total,
+            "stamp": datetime.now().strftime("%Y%m%d_%H%M%S"),
+            "cell_fmt": cell_fmt,   # (fmt, ext, quality) | None
+            "cells_saved": 0,
+        }
+        self._xyz_last_spec = spec   # 連続モードの次回実行用
+        self._xyz_last_ok = False
+        self._last_seed = base.seed
+        self._last_params = base
+        self._last_graph = None
+        self._last_gen_ok = False  # 連続モードに拾わせない
+        self.btn_generate.setEnabled(False)
+        self.btn_cancel.setEnabled(True)
+        self.progress.setValue(0)
+        self.status.showMessage(f"XYZ プロット生成中… (0/{total})")
+        self.append_log(
+            f"XYZ プロット開始: {total} セル "
+            f"({self._xyz_ctx['nx']}x{self._xyz_ctx['ny']}x"
+            f"{self._xyz_ctx['nz']}) seed={base.seed}")
+        self._push_xyz_running(True, total)
+
+        self._xyz_thread = QThread(self)
+        self._xyz_worker = _XyzWorker(self.backend, jobs)
+        self._xyz_worker.moveToThread(self._xyz_thread)
+        self._xyz_thread.started.connect(self._xyz_worker.run)
+        self._xyz_worker.progress.connect(self._on_progress)
+        self._xyz_worker.preview.connect(self._on_preview_frame)
+        self._xyz_worker.cell_done.connect(self._on_xyz_cell_done)
+        self._xyz_worker.cell_image.connect(self._on_xyz_cell_image)
+        self._xyz_worker.cell_error.connect(self._on_xyz_cell_error)
+        self._xyz_worker.done.connect(self._on_xyz_done)
+        self._xyz_worker.failed.connect(self._on_xyz_failed)
+        self._xyz_worker.done.connect(self._xyz_thread.quit)
+        self._xyz_worker.failed.connect(self._xyz_thread.quit)
+        self._xyz_thread.finished.connect(self._cleanup_xyz_thread)
+        self._xyz_thread.start()
+
+    def _resolve_xyz_model_cell(self, p: GenParams) -> GenParams:
+        """モデル軸のセルを解決する: マージトークンの展開 + 系統整合。
+
+        値が「マージモデル：<名前>」なら登録済みマージエントリのレシピに
+        展開する。その後、モデルの系統に合う TE / CLIP type に揃える
+        （メイン画面でモデルを選んだときの自動整合と同じ規約:
+        krea2 -> CLIP type 'krea2' + Qwen3-VL 系 TE、anima ->
+        'stable_diffusion' + Qwen3 0.6B 系 TE）。系統が判定できないモデルは
+        ベース設定のまま。整合が取れないと conditioning の次元不一致で
+        バックエンドが "mat1 and mat2 shapes cannot be multiplied" を出す。
+        """
+        from dataclasses import replace
+        if p.diffusion.startswith(MERGE_PREFIX):
+            name = p.diffusion[len(MERGE_PREFIX):]
+            entry = next((e for e in self._merges if e["name"] == name), None)
+            if entry is None:
+                raise ValueError(
+                    f"モデル軸のマージモデル「{name}」が見つかりません"
+                    "（削除または名前変更されていませんか）")
+            p = replace(p, diffusion="",
+                        merge_models=[(str(n), float(w))
+                                      for n, w in entry["models"]],
+                        merge_quant=str(entry["quant"]),
+                        merge_low_memory=bool(entry["low_memory"]))
+            fam = self._merge_family(entry)
+        else:
+            fam = self._diffusion_family(p.diffusion)
+        if fam not in ("anima", "krea2"):
+            return p
+        te_ok = bool(p.te) and self._te_family(p.te[0]) == fam
+        clip_ok = (p.clip_type == "krea2") == (fam == "krea2")
+        if te_ok and clip_ok:
+            return p
+        te = list(p.te)
+        if not te_ok:
+            for name in self._all_models.get("text_encoders", []):
+                if self._te_family(name) == fam:
+                    te = [name]
+                    break
+            else:
+                raise ValueError(
+                    f"モデル軸の {p.diffusion} は {fam} 系ですが、対応する "
+                    "text encoder が見つかりません。「モデル管理…」から"
+                    "ダウンロードしてください。")
+        clip = p.clip_type if clip_ok else (
+            "krea2" if fam == "krea2" else "stable_diffusion")
+        note = (fam, te[0], clip)
+        if note not in self._xyz_align_logged:
+            self._xyz_align_logged.add(note)
+            self.append_log(
+                f"XYZ: {fam} 系モデルには text encoder {te[0]} / "
+                f"CLIP type {clip} を使用します")
+        return replace(p, te=te, clip_type=clip)
+
+    def _on_xyz_cell_done(self, done: int, total: int) -> None:
+        self.status.showMessage(f"XYZ プロット生成中… ({done}/{total})")
+        if self._xyz_dlg is not None:
+            try:
+                self._xyz_dlg.set_progress(done)
+            except RuntimeError:
+                self._xyz_dlg = None
+
+    def _on_xyz_cell_image(self, idx: int, data: bytes) -> None:
+        """個別保存 ON のとき、セルが出来た直後にその画像を保存する。"""
+        ctx = self._xyz_ctx
+        if not ctx or not ctx.get("cell_fmt") or not metadata.AVAILABLE:
+            return
+        fmt, ext, quality = ctx["cell_fmt"]
+        path = (self.paths.output_dir
+                / f"xyz_{ctx['stamp']}_c{idx:03d}.{ext}")
+        cell_text, cell_extra = self._build_metadata(
+            ctx.get("params", {}).get(idx))
+        try:
+            metadata.save_with_metadata(
+                data, path, fmt, quality, cell_text, extra=cell_extra)
+            ctx["cells_saved"] += 1
+        except Exception as e:  # noqa: BLE001
+            self.append_log(f"保存に失敗: {e}")
+
+    def _on_xyz_cell_error(self, idx: int, msg: str) -> None:
+        self.append_log(f"XYZ セル {idx} でエラー（グレーで継続）: {msg}")
+
+    def _on_xyz_done(self, results: dict) -> None:
+        ctx = self._xyz_ctx or {}
+        spec = ctx.get("spec", {})
+        nx, ny, nz = ctx.get("nx", 1), ctx.get("ny", 1), ctx.get("nz", 1)
+        cells: list = [None] * (nx * ny * nz)
+        for idx, data in results.items():
+            cells[idx] = QImage.fromData(data) if data else None
+        labels = [a["labels"] for a in spec.get("axes", [])] or [[""]] * 3
+        grid = xyz.compose_grid(
+            cells, nx, ny, nz, labels[0], labels[1], labels[2],
+            draw_legend=bool(spec.get("legend", True)),
+            margin=int(spec.get("margin", 0)))
+        png = xyz.qimage_png_bytes(grid)
+        ok = sum(1 for v in results.values() if v)
+        self.status.showMessage(f"XYZ プロット完了（{ok}/{len(cells)} セル）")
+        self.append_log(f"XYZ プロット完了: {ok}/{len(cells)} セル成功 "
+                        f"（グリッド {grid.width()}x{grid.height()}px）")
+        self._xyz_last_ok = ok > 0  # 連続モードは成功時のみ続行
+        self._last_images = [png]
+        self._show_image(png)
+        self._save_xyz_outputs(png, results)
+        # モデル軸でマージモデルを使ったならピン状態 ●/○ を最新化。
+        if any(p.merge_models for p in ctx.get("params", {}).values()):
+            self._sync_merge_states()
+        if self.chk_randomize.isChecked():
+            self._set_seed(-1)
+
+    def _save_xyz_outputs(self, grid_png: bytes, results: dict) -> None:
+        """Save the composed grid（個別セルは生成直後に保存済み）."""
+        if not metadata.AVAILABLE:
+            self.append_log("警告: Pillow/piexif が無いため保存できません")
+            return
+        ctx = self._xyz_ctx or {}
+        spec = ctx.get("spec", {})
+        base = ctx.get("base")
+        from datetime import datetime
+        stamp = ctx.get("stamp") or datetime.now().strftime("%Y%m%d_%H%M%S")
+        # グリッド画像は本機能の成果物なので Format 設定に関わらず PNG で保存。
+        params_text, extra = self._build_metadata(base)
+        for name, a in zip(("x", "y", "z"), spec.get("axes", [])):
+            if a["id"] != "none":
+                extra[f"xyz_{name}_type"] = a["id"]
+                extra[f"xyz_{name}_values"] = ", ".join(a["labels"])
+        path = self.paths.output_dir / f"xyz_{stamp}_{self._last_seed}.png"
+        try:
+            metadata.save_with_metadata(
+                grid_png, path, "png", 6, params_text, extra=extra)
+            self.append_log(f"{path} に保存しました（メタデータ付き）")
+        except Exception as e:  # noqa: BLE001
+            self.append_log(f"グリッド画像の保存に失敗: {e}")
+        if ctx.get("cell_fmt"):
+            self.append_log(f"個別画像を {ctx.get('cells_saved', 0)} 枚"
+                            "保存しました（各セル生成直後に保存）")
+
+    def _on_xyz_failed(self, msg: str) -> None:
+        self.status.showMessage("XYZ プロット失敗")
+        self.append_log("エラー: " + msg)
+        if "キャンセル" not in msg:
+            QMessageBox.critical(self._xyz_parent(), "XYZ プロットエラー", msg)
+
+    def _cleanup_xyz_thread(self) -> None:
+        self._xyz_thread = None
+        self._xyz_worker = None
+        self._xyz_ctx = None
+        self.btn_generate.setEnabled(True)
+        self.btn_cancel.setEnabled(False)
+        self._push_xyz_running(False)
+        # XYZ 連続モード: 成功して終わり、ウィンドウの連続がONなら同じ設定で
+        # 次の実行を開始する（seed はメイン画面のランダム化設定に従う）。
+        spec = getattr(self, "_xyz_last_spec", None)
+        if not (getattr(self, "_xyz_last_ok", False) and spec is not None
+                and self._xyz_dlg is not None):
+            return
+        try:
+            chained = self._xyz_dlg.chk_continuous.isChecked()
+        except RuntimeError:
+            self._xyz_dlg = None
+            return
+        if chained:
+            QTimer.singleShot(
+                0, lambda: self._on_xyz_requested(spec, auto=True))
 
     # ----- preset filtering (family judged from file content) -------------
     def _current_preset(self) -> str:
@@ -1108,7 +1494,7 @@ class MainWindow(QMainWindow):
         if not self.backend.is_running():
             QMessageBox.warning(self, "未準備", "バックエンドがまだ起動していません。")
             return
-        if self._gen_thread is not None:
+        if self._gen_thread is not None or self._xyz_thread is not None:
             return
         if self._merge_selected() and self._selected_merge_entry() is None:
             QMessageBox.warning(self, "マージ未設定",
@@ -1156,6 +1542,15 @@ class MainWindow(QMainWindow):
         if self._gen_worker:
             self._gen_worker.cancel()
             self.append_log("キャンセルを要求しました")
+        if self._xyz_dlg is not None:
+            # XYZ の連続モードもここで止める（キャンセル = ループ終了の合図）。
+            try:
+                self._xyz_dlg.chk_continuous.setChecked(False)
+            except RuntimeError:
+                self._xyz_dlg = None
+        if self._xyz_worker:
+            self._xyz_worker.cancel()
+            self.append_log("XYZ プロットのキャンセルを要求しました")
 
     def _on_progress(self, p: Progress) -> None:
         if p.maximum:
@@ -1230,9 +1625,10 @@ class MainWindow(QMainWindow):
             return "webp", self.sp_webp_quality.value()
         return "png", self.sp_png_compress.value()  # 0..9 compress level
 
-    def _build_metadata(self) -> tuple[str, dict]:
-        """Build the parameters string + structured dict from the last run."""
-        p = self._last_params
+    def _build_metadata(self, params: Optional[GenParams] = None) -> tuple[str, dict]:
+        """Build the parameters string + structured dict from the last run
+        (or from ``params`` when given, e.g. per-cell XYZ metadata)."""
+        p = params if params is not None else self._last_params
         if p is None:
             return "", {}
         if p.merge_models:
@@ -1298,15 +1694,19 @@ class MainWindow(QMainWindow):
             self._show_image(self._last_images[0])
 
     def closeEvent(self, event) -> None:  # noqa: N802
-        # The merge window is parentless (so it can go behind us); close it
-        # explicitly or the app would keep running after the main window.
-        if self._merge_dlg is not None:
-            try:
-                self._merge_dlg.close()
-            except RuntimeError:
-                pass
+        # The merge/XYZ windows are parentless (so they can go behind us);
+        # close them explicitly or the app would keep running after the main
+        # window.
+        for dlg in (self._merge_dlg, self._xyz_dlg):
+            if dlg is not None:
+                try:
+                    dlg.close()
+                except RuntimeError:
+                    pass
         self.append_log("バックエンドを終了中…")
         if self._gen_worker:
             self._gen_worker.cancel()
+        if self._xyz_worker:
+            self._xyz_worker.cancel()
         self.backend.stop()
         super().closeEvent(event)
