@@ -450,7 +450,9 @@ class MainWindow(QMainWindow):
     # ----- image output settings (below the preview) ----------------------
     def _build_image_box(self) -> QGroupBox:
         box = QGroupBox("Image")
-        row = QHBoxLayout(box)
+        col = QVBoxLayout(box)
+        row = QHBoxLayout()
+        col.addLayout(row)
 
         self.cb_img_format = WideComboBox()
         self.cb_img_format.addItems(["png", "jpg", "webp", NO_SAVE])  # index 0/1/2/3
@@ -488,6 +490,14 @@ class MainWindow(QMainWindow):
         row.addSpacing(16)
         row.addWidget(self.stack_quality)
         row.addStretch(1)
+
+        self.chk_embed_meta = QCheckBox("画像にメタ情報を埋め込む")
+        self.chk_embed_meta.setChecked(True)
+        self.chk_embed_meta.setToolTip(
+            "ONで生成設定（プロンプト・seed 等）を画像に埋め込みます"
+            "（PNG: parameters チャンク / JPEG・WEBP: EXIF）。"
+            "OFFにするとメタ情報を一切書き込みません")
+        col.addWidget(self.chk_embed_meta)
         return box
 
     # ----- model scanning --------------------------------------------------
@@ -881,10 +891,26 @@ class MainWindow(QMainWindow):
         dlg = XyzDialog(choices, state, None)
         dlg.run_requested.connect(self._on_xyz_requested)
         dlg.cancel_requested.connect(self.on_cancel)
+        # チェック状態は実行しなくても記憶する（次回開いたとき再現）。
+        # コンストラクタでの復元後に接続するので、復元自体では発火しない。
+        dlg.chk_save_cells.toggled.connect(self._on_xyz_save_cells_toggled)
         self._xyz_dlg = dlg
         if self._xyz_thread is not None and self._xyz_ctx is not None:
             dlg.set_running(True, int(self._xyz_ctx.get("total", 0)))
         dlg.show()
+
+    def _on_xyz_save_cells_toggled(self, checked: bool) -> None:
+        """個別保存チェックの状態だけを即座に永続化する（他の入力欄は
+        実行時にまとめて保存されるので、途中入力を上書きしないよう merge）。"""
+        try:
+            st = json.loads(str(self.settings.get("xyz", "{}")))
+            if not isinstance(st, dict):
+                st = {}
+        except (ValueError, TypeError):
+            st = {}
+        st["save_cells"] = bool(checked)
+        self.settings["xyz"] = json.dumps(st, ensure_ascii=False)
+        self._schedule_save()
 
     def _xyz_parent(self):
         """Message-box parent: the XYZ window if alive, else the main window."""
@@ -974,6 +1000,7 @@ class MainWindow(QMainWindow):
             "stamp": datetime.now().strftime("%Y%m%d_%H%M%S"),
             "cell_fmt": cell_fmt,   # (fmt, ext, quality) | None
             "cells_saved": 0,
+            "embed": self.chk_embed_meta.isChecked(),  # run 全体で固定
         }
         self._xyz_last_spec = spec   # 連続モードの次回実行用
         self._xyz_last_ok = False
@@ -1081,7 +1108,8 @@ class MainWindow(QMainWindow):
             ctx.get("params", {}).get(idx))
         try:
             metadata.save_with_metadata(
-                data, path, fmt, quality, cell_text, extra=cell_extra)
+                data, path, fmt, quality, cell_text, extra=cell_extra,
+                embed=bool(ctx.get("embed", True)))
             ctx["cells_saved"] += 1
         except Exception as e:  # noqa: BLE001
             self.append_log(f"保存に失敗: {e}")
@@ -1132,11 +1160,14 @@ class MainWindow(QMainWindow):
             if a["id"] != "none":
                 extra[f"xyz_{name}_type"] = a["id"]
                 extra[f"xyz_{name}_values"] = ", ".join(a["labels"])
+        embed = bool(ctx.get("embed", True))
         path = self.paths.output_dir / f"xyz_{stamp}_{self._last_seed}.png"
         try:
             metadata.save_with_metadata(
-                grid_png, path, "png", 6, params_text, extra=extra)
-            self.append_log(f"{path} に保存しました（メタデータ付き）")
+                grid_png, path, "png", 6, params_text, extra=extra,
+                embed=embed)
+            note = "メタデータ付き" if embed else "メタデータなし"
+            self.append_log(f"{path} に保存しました（{note}）")
         except Exception as e:  # noqa: BLE001
             self.append_log(f"グリッド画像の保存に失敗: {e}")
         if ctx.get("cell_fmt"):
@@ -1300,6 +1331,7 @@ class MainWindow(QMainWindow):
         self.sp_png_compress.setValue(int(s.get("png_compress", 6)))
         self.sp_jpg_quality.setValue(int(s.get("jpg_quality", 92)))
         self.sp_webp_quality.setValue(int(s.get("webp_quality", 90)))
+        self.chk_embed_meta.setChecked(bool(s.get("embed_metadata", True)))
 
     def _connect_autosave(self) -> None:
         """Save whenever any persisted control changes."""
@@ -1313,6 +1345,7 @@ class MainWindow(QMainWindow):
         self.sp_cfg.valueChanged.connect(self._schedule_save)
         self.chk_dual_te.toggled.connect(self._schedule_save)
         self.chk_randomize.toggled.connect(self._schedule_save)
+        self.chk_embed_meta.toggled.connect(self._schedule_save)
         self.ed_seed.textChanged.connect(self._schedule_save)
 
     def _schedule_save(self, *args) -> None:
@@ -1353,6 +1386,7 @@ class MainWindow(QMainWindow):
             "randomize": self.chk_randomize.isChecked(),
             "dtype": self.cb_dtype.currentText(),
             "image_format": self.cb_img_format.currentText(),
+            "embed_metadata": self.chk_embed_meta.isChecked(),
             "png_compress": self.sp_png_compress.value(),
             "jpg_quality": self.sp_jpg_quality.value(),
             "webp_quality": self.sp_webp_quality.value(),
@@ -1601,18 +1635,20 @@ class MainWindow(QMainWindow):
         params_text, extra = self._build_metadata()
         stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         saved = []
+        embed = self.chk_embed_meta.isChecked()
         for i, data in enumerate(images):
             path = out / f"scom_{stamp}_{self._last_seed}_{i}.{ext}"
             try:
                 metadata.save_with_metadata(
                     data, path, fmt, quality, params_text,
-                    extra=extra, comfy_prompt=self._last_graph,
+                    extra=extra, comfy_prompt=self._last_graph, embed=embed,
                 )
                 saved.append(path)
             except Exception as e:  # noqa: BLE001
                 self.append_log(f"保存に失敗: {e}")
         if saved:
-            self.append_log(f"{out} に {len(saved)} 枚保存しました（メタデータ付き）")
+            note = "メタデータ付き" if embed else "メタデータなし"
+            self.append_log(f"{out} に {len(saved)} 枚保存しました（{note}）")
         else:
             self.append_log("警告: 画像を保存できませんでした")
         return saved

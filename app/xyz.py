@@ -100,6 +100,22 @@ def _split_csv(text: str, strip: bool = True) -> list[str]:
     return [s for s in values if s != ""]
 
 
+def split_values(text: str) -> list[str]:
+    """値欄の文字列を値リストに分解する（選択式軸のチェック状態の判定用）。"""
+    return _split_csv(text)
+
+
+def join_values(values: list[str]) -> str:
+    """値リストを値欄の文字列に戻す。カンマ・引用符・前後の空白を含む値は
+    CSV 流儀（"..." で囲み、内部の " は "" に）で引用する。"""
+    out = []
+    for v in values:
+        if "," in v or '"' in v or v != v.strip():
+            v = '"' + v.replace('"', '""') + '"'
+        out.append(v)
+    return ", ".join(out)
+
+
 def _parse_numeric(vals: list[str], is_float: bool) -> list:
     re_count = _RE_FLOAT_COUNT if is_float else _RE_INT_COUNT
     re_step = _RE_FLOAT_STEP if is_float else _RE_INT_STEP

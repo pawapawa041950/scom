@@ -62,30 +62,34 @@ def _exif_bytes(params_text: str) -> bytes:
 
 def save_with_metadata(png_bytes: bytes, path: Path, fmt: str, quality: int,
                        params_text: str, extra: Optional[dict] = None,
-                       comfy_prompt: Optional[dict] = None) -> None:
+                       comfy_prompt: Optional[dict] = None,
+                       embed: bool = True) -> None:
     """Save ``png_bytes`` (decoded) to ``path`` as ``fmt`` with embedded metadata.
 
     ``quality`` is the PNG compress level (0-9) for PNG, or the 1-100 quality
-    for JPEG/WEBP.
+    for JPEG/WEBP. ``embed=False`` はメタ情報（parameters/EXIF/Software 等）を
+    一切書き込まないプレーン保存。
     """
     img = Image.open(io.BytesIO(png_bytes))
     if fmt == "png":
-        info = PngImagePlugin.PngInfo()
-        info.add_text("Software", APP_SIGNATURE)
-        info.add_text("parameters", params_text)
-        if extra:
-            info.add_text("scom", json.dumps(extra, ensure_ascii=False))
-        if comfy_prompt:
-            info.add_text("prompt", json.dumps(comfy_prompt))
+        info = None
+        if embed:
+            info = PngImagePlugin.PngInfo()
+            info.add_text("Software", APP_SIGNATURE)
+            info.add_text("parameters", params_text)
+            if extra:
+                info.add_text("scom", json.dumps(extra, ensure_ascii=False))
+            if comfy_prompt:
+                info.add_text("prompt", json.dumps(comfy_prompt))
         img.save(str(path), "PNG", compress_level=int(quality), pnginfo=info)
     elif fmt == "jpg":
-        img.convert("RGB").save(
-            str(path), "JPEG", quality=int(quality), exif=_exif_bytes(params_text)
-        )
+        kw = {"exif": _exif_bytes(params_text)} if embed else {}
+        img.convert("RGB").save(str(path), "JPEG", quality=int(quality), **kw)
     elif fmt == "webp":
+        kw = {"exif": _exif_bytes(params_text)} if embed else {}
         img.save(
             str(path), "WEBP", quality=int(quality),
-            exif=_exif_bytes(params_text), lossless=(int(quality) >= 100),
+            lossless=(int(quality) >= 100), **kw
         )
     else:  # pragma: no cover - unknown format
         img.save(str(path))

@@ -12,7 +12,8 @@ from typing import Optional
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
     QCheckBox, QDialog, QGridLayout, QHBoxLayout, QLabel, QLineEdit, QMenu,
-    QMessageBox, QProgressBar, QPushButton, QSpinBox, QVBoxLayout,
+    QMessageBox, QProgressBar, QPushButton, QSpinBox, QVBoxLayout, QWidget,
+    QWidgetAction,
 )
 
 from .widgets import WideComboBox
@@ -54,7 +55,9 @@ class XyzDialog(QDialog):
             ed = QLineEdit()
             ed.setToolTip(xyz.VALUE_SYNTAX_HELP)
             btn = QPushButton("候補▾")
-            btn.setToolTip("この軸で選べる値を一覧から追記します")
+            btn.setToolTip(
+                "この軸で選べる値の一覧。チェックの付け外しがそのまま"
+                "値欄に反映されます（リストは開いたまま連続で操作できます）")
             count = QLabel("")
             count.setMinimumWidth(64)
             grid.addWidget(cb, i, 1)
@@ -79,9 +82,10 @@ class XyzDialog(QDialog):
         self.chk_legend = QCheckBox("凡例を描画")
         self.chk_legend.setChecked(True)
         self.chk_save_cells = QCheckBox("各セル画像も個別に保存")
+        self.chk_save_cells.setChecked(True)
         self.chk_save_cells.setToolTip(
             "グリッド画像に加えて、セルごとの画像もメイン画面の Format 設定で"
-            "output に保存します")
+            "output に保存します（各セルの生成直後に保存）")
         opt_row.addWidget(self.chk_legend)
         opt_row.addWidget(self.chk_save_cells)
         opt_row.addSpacing(16)
@@ -156,7 +160,7 @@ class XyzDialog(QDialog):
                     self._axis_index(str(st.get(f"{name}_type", "none"))))
                 row["edit"].setText(str(st.get(f"{name}_values", "")))
             self.chk_legend.setChecked(bool(st.get("legend", True)))
-            self.chk_save_cells.setChecked(bool(st.get("save_cells", False)))
+            self.chk_save_cells.setChecked(bool(st.get("save_cells", True)))
             self.sp_margin.setValue(int(st.get("margin", 0)))
         except (TypeError, ValueError):
             pass  # 壊れた保存状態は既定値のまま
@@ -179,29 +183,66 @@ class XyzDialog(QDialog):
         self._update_counts()
 
     def _show_choices_menu(self, row: dict) -> None:
+        menu = self._build_choices_menu(row)
+        if menu is not None:
+            menu.exec(row["btn"].mapToGlobal(row["btn"].rect().bottomLeft()))
+
+    def _build_choices_menu(self, row: dict):
+        """チェック式の候補メニューを作る。
+
+        各候補が QCheckBox（QWidgetAction 経由）なのでクリックしてもメニューは
+        閉じず、続けて付け外しできる。チェック状態は値欄の現在値から復元され、
+        付け外しのたびに値欄へ即時反映される（値数・生成枚数の表示も追随）。
+        """
         axis = self._axis_def(row)
         choices = self._axis_choices(axis)
         if not choices:
-            return
+            return None
         menu = QMenu(self)
-        act_all = menu.addAction("すべて追加")
-        menu.addSeparator()
-        acts = {menu.addAction(c): c for c in choices}
-        picked = menu.exec(row["btn"].mapToGlobal(row["btn"].rect().bottomLeft()))
-        if picked is None:
-            return
-        add = choices if picked is act_all else [acts[picked]]
-        self._append_values(row["edit"], add)
+        current = set(xyz.split_values(row["edit"].text()))
+        pairs: list[tuple[str, QCheckBox]] = []
 
-    @staticmethod
-    def _append_values(edit: QLineEdit, values: list[str]) -> None:
-        cur = edit.text().strip()
-        joined = ", ".join(values)
-        if cur:
-            sep = "" if cur.endswith(",") else ","
-            edit.setText(f"{cur}{sep} {joined}")
-        else:
-            edit.setText(joined)
+        def sync() -> None:
+            row["edit"].setText(xyz.join_values(
+                [c for c, cb in pairs if cb.isChecked()]))
+
+        def set_all(state: bool) -> None:
+            for _c, cb in pairs:
+                cb.blockSignals(True)
+                cb.setChecked(state)
+                cb.blockSignals(False)
+            sync()
+
+        head = QWidget()
+        hl = QHBoxLayout(head)
+        hl.setContentsMargins(8, 4, 8, 4)
+        btn_all = QPushButton("全選択")
+        btn_none = QPushButton("全解除")
+        btn_all.clicked.connect(lambda: set_all(True))
+        btn_none.clicked.connect(lambda: set_all(False))
+        hl.addWidget(btn_all)
+        hl.addWidget(btn_none)
+        hl.addStretch(1)
+        head_act = QWidgetAction(menu)
+        head_act.setDefaultWidget(head)
+        menu.addAction(head_act)
+        menu.addSeparator()
+
+        for c in choices:
+            cb = QCheckBox(c.replace("&", "&&"))  # & はアクセラレータ扱いを回避
+            cb.setChecked(c in current)
+            cb.toggled.connect(lambda *_a: sync())
+            wrap = QWidget()
+            wl = QHBoxLayout(wrap)
+            wl.setContentsMargins(8, 2, 8, 2)
+            wl.addWidget(cb)
+            act = QWidgetAction(menu)
+            act.setDefaultWidget(wrap)
+            menu.addAction(act)
+            pairs.append((c, cb))
+        menu._scom_pairs = pairs      # 状態の取得用（テストでも使う）
+        menu._scom_set_all = set_all
+        return menu
 
     # ----- counts / validation --------------------------------------------------
     def _parsed(self, row: dict) -> list:
