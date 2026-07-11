@@ -113,6 +113,15 @@ _INT4_QUANT_GROUP = 64  # scale group of the packed int4 (convrot_w4a4) layout
 _INT4_KEEP_INT8 = ("output_proj", "o_proj", "layer2", "wo", "down")
 
 
+def _int4_output_side(layer):
+    """Output-side projection (kept int8 in the hybrid int4 mode)?"""
+    if layer.rsplit(".", 1)[-1] in _INT4_KEEP_INT8:
+        return True
+    # SDXL naming: attention output = "...attn.to_out.0",
+    # feed-forward second matmul = "...ff.net.2".
+    return ".to_out." in layer + "." or layer.endswith("ff.net.2")
+
+
 def _quant_eligible(mode, key, bare, quantizable, ndim, in_features):
     """Is this tensor a quantization target for the chosen mode?"""
     if mode not in QUANT_MODES:
@@ -154,9 +163,14 @@ def _quantize_out(bare, acc32, mode):
         return ({bare: q, layer + ".weight_scale": scale.to(torch.float32)},
                 {"format": "float8_e4m3fn",
                  "full_precision_matrix_mult": True})
-    if mode == "int4_convrot_full" or (
-            mode == "int4_convrot"
-            and layer.rsplit(".", 1)[-1] not in _INT4_KEEP_INT8):
+    # ".attn2.to_k" は int4 にしない（両 int4 モード共通）: ComfyUI の
+    # SD-UNet アーキテクチャ判定が attn2.to_k.weight の形状から context_dim
+    # を読むため、パック形状 (K が半分) だと判定不能になり
+    # "'NoneType' object has no attribute 'quant_config'" で落ちる。
+    if (mode.startswith("int4_convrot")
+            and ".attn2.to_k" not in layer
+            and (mode == "int4_convrot_full"
+                 or not _int4_output_side(layer))):
         # convrot_w4a4: Hadamard rotation + packed 4-bit weights with
         # group-64 scales (post-v0.27 format; comfy-kitchen >= 0.2.17).
         # In the hybrid "int4_convrot" mode the output-side projections

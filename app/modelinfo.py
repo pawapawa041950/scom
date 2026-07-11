@@ -25,7 +25,8 @@ from typing import Optional
 
 ANIMA = "anima"
 KREA2 = "krea2"
-SHARED = "shared"   # belongs to both families (e.g. the common Qwen-Image VAE)
+SDXL = "sdxl"
+SHARED = "shared"   # anima/krea2 共通（Qwen-Image VAE）。sdxl には含まれない。
 UNKNOWN = "unknown"
 
 # Refuse to allocate for an absurd/garbage header length.
@@ -70,11 +71,20 @@ def _classify_header(kind: str, h: dict) -> str:
         return UNKNOWN
 
     if kind == "vae":
-        return SHARED  # both families use the same Qwen-Image VAE
+        # kl-f8 (SD/SDXL) VAE: quant_conv / decoder.conv_in が特徴。
+        if "post_quant_conv.weight" in h or "decoder.conv_in.weight" in h:
+            return SDXL
+        return SHARED  # Qwen-Image VAE (anima/krea2 共通) ほか
 
     if kind == "text_encoders":
         if any("visual" in k or "vision" in k for k in keys):
             return KREA2
+        # CLIP (SDXL の clip_l/clip_g)。transformers 形式は text_model.*、
+        # チェックポイントから取り出した clip_g は open_clip 形式
+        # (transformer.resblocks.*)。
+        if any(k.startswith("text_model.")
+               or "transformer.resblocks." in k for k in keys):
+            return SDXL
         hidden = None
         for k in keys:
             if k.endswith("embed_tokens.weight"):
@@ -99,6 +109,13 @@ def _classify_header(kind: str, h: dict) -> str:
             return KREA2
         if "net" in prefixes:
             return ANIMA
+        # SD/SDXL U-Net（単体ファイル / フルチェックポイントの両形式）。
+        # パラメタ数フォールバックより先に判定しないと SDXL (~2.6-3.5B) が
+        # anima に誤分類される。
+        if any(k.startswith(("input_blocks.",
+                             "model.diffusion_model.input_blocks."))
+               for k in keys):
+            return SDXL
         p = _param_count(h, keys)
         if p >= 8_000_000_000:
             return KREA2
@@ -113,7 +130,13 @@ def _filename_family(kind: str, name: str) -> str:
     """Last-resort guess from the filename (non-safetensors / unreadable file)."""
     n = name.lower()
     if kind == "vae":
+        if "sdxl" in n or "sd_xl" in n:
+            return SDXL
         return SHARED if "qwen_image" in n else UNKNOWN
+    if "sdxl" in n or "sd_xl" in n:
+        return SDXL
+    if kind == "text_encoders" and ("clip_l" in n or "clip_g" in n):
+        return SDXL
     if "krea2" in n or "krea-2" in n:
         return KREA2
     if kind == "text_encoders" and "qwen3vl" in n:
@@ -123,6 +146,31 @@ def _filename_family(kind: str, name: str) -> str:
     if kind == "text_encoders" and ("qwen_3" in n or "qwen3" in n):
         return ANIMA
     return UNKNOWN
+
+
+def sdxl_te_kind(path: Path) -> Optional[str]:
+    """SDXL 系 TE の "clip_l" / "clip_g" 判別（それ以外は None）。
+
+    token embedding の隠れ次元で判定する: 768 -> clip_l、1280 -> clip_g
+    （open_clip 形式のスタンドアロン clip_g は ``token_embedding.weight``）。
+    ヘッダが読めない場合はファイル名で推測する。
+    """
+    h = _read_header(path) if path.suffix.lower() == ".safetensors" else None
+    if h:
+        v = (h.get("text_model.embeddings.token_embedding.weight")
+             or h.get("token_embedding.weight"))
+        shape = (v or {}).get("shape") or []
+        if len(shape) == 2:
+            if shape[1] == 768:
+                return "clip_l"
+            if shape[1] == 1280:
+                return "clip_g"
+    n = path.name.lower()
+    if "clip_l" in n:
+        return "clip_l"
+    if "clip_g" in n:
+        return "clip_g"
+    return None
 
 
 def family(kind: str, path: Path) -> str:

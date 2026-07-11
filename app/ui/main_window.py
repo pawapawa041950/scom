@@ -270,10 +270,11 @@ class MainWindow(QMainWindow):
         self.cb_preset = WideComboBox()
         self.cb_preset.addItem("anima", "anima")
         self.cb_preset.addItem("krea2", "krea2")
+        self.cb_preset.addItem("sdxl", "sdxl")
         self.cb_preset.addItem("すべて", "all")
-        self.cb_preset.setCurrentIndex(2)  # default: すべて (show everything)
+        self.cb_preset.setCurrentIndex(3)  # default: すべて (show everything)
         self.cb_preset.setToolTip(
-            "anima / krea2 を選ぶと、その構成に合うモデル・VAE・"
+            "anima / krea2 / sdxl を選ぶと、その構成に合うモデル・VAE・"
             "Text encoder・CLIP type に絞り込み＆自動選択します"
         )
         self.cb_preset.currentIndexChanged.connect(self._on_preset_changed)
@@ -558,6 +559,32 @@ class MainWindow(QMainWindow):
         return modelinfo.family(
             "text_encoders", config.models_root() / "text_encoders" / relname)
 
+    def _vae_family(self, relname: str) -> str:
+        if not relname:
+            return modelinfo.UNKNOWN
+        return modelinfo.family("vae", config.models_root() / "vae" / relname)
+
+    def _first_vae(self, families: tuple[str, ...]) -> Optional[str]:
+        """First scanned VAE whose content family is in ``families``."""
+        for name in self._all_models.get("vae", []):
+            if self._vae_family(name) in families:
+                return name
+        return None
+
+    def _sdxl_te_pair(self) -> tuple[Optional[str], Optional[str]]:
+        """(clip_l, clip_g) filenames from the scanned text encoders."""
+        root = config.models_root() / "text_encoders"
+        clip_l = clip_g = None
+        for name in self._all_models.get("text_encoders", []):
+            if self._te_family(name) != "sdxl":
+                continue
+            kind = modelinfo.sdxl_te_kind(root / name)
+            if kind == "clip_l" and clip_l is None:
+                clip_l = name
+            elif kind == "clip_g" and clip_g is None:
+                clip_g = name
+        return clip_l, clip_g
+
     def _select_te_for_family(self, fam: str) -> bool:
         """Select the first text encoder whose content matches ``fam``."""
         for i in range(self.cb_te1.count()):
@@ -573,12 +600,49 @@ class MainWindow(QMainWindow):
             return  # the merge recipe decides family; nothing to auto-align
         if self._loading:
             return  # honor saved settings on startup; only react to user picks
-        if self._diffusion_family(name) == "krea2" and not self.chk_dual_te.isChecked():
+        fam = self._diffusion_family(name)
+        if fam == "sdxl":
+            # SDXL requires dual TE (clip_l + clip_g) + CLIP type 'sdxl'
+            # + kl-f8 VAE.
+            if (self.cb_clip_type.currentText() == "sdxl"
+                    and self.chk_dual_te.isChecked()):
+                return
+            self.chk_dual_te.setChecked(True)  # switches the CLIP list to DUAL
+            idx = self.cb_clip_type.findText("sdxl")
+            if idx >= 0:
+                self.cb_clip_type.setCurrentIndex(idx)
+            clip_l, clip_g = self._sdxl_te_pair()
+            if clip_l:
+                self.cb_te1.setCurrentText(clip_l)
+            if clip_g:
+                self.cb_te2.setCurrentText(clip_g)
+            if self._vae_family(self.cb_vae.currentText()) != "sdxl":
+                v = self._first_vae(("sdxl",))
+                if v:
+                    self.cb_vae.setCurrentText(v)
+            return
+        # Coming back from an SDXL setup also needs re-aligning (dual TE and
+        # CLIP type 'sdxl' would break anima/krea2 generations).
+        from_sdxl = self.cb_clip_type.currentText() == "sdxl"
+        if fam == "krea2" and (from_sdxl or not self.chk_dual_te.isChecked()):
             # Krea-2 requires CLIP type 'krea2' and a Qwen3-VL text encoder.
+            self.chk_dual_te.setChecked(False)
             idx = self.cb_clip_type.findText("krea2")
             if idx >= 0:
                 self.cb_clip_type.setCurrentIndex(idx)
             self._select_te_for_family("krea2")
+        elif fam == "anima" and from_sdxl:
+            self.chk_dual_te.setChecked(False)
+            idx = self.cb_clip_type.findText("stable_diffusion")
+            if idx >= 0:
+                self.cb_clip_type.setCurrentIndex(idx)
+            self._select_te_for_family("anima")
+        else:
+            return
+        if self._vae_family(self.cb_vae.currentText()) == "sdxl":
+            v = self._first_vae(("shared", fam))
+            if v:
+                self.cb_vae.setCurrentText(v)
 
     def _krea2_config_warning(self, params: GenParams) -> Optional[str]:
         """Pre-flight check: translate the cryptic backend mismatch into a
@@ -597,6 +661,33 @@ class MainWindow(QMainWindow):
             return None
         return ("選択中のモデルは Krea-2 です。次を直してください:\n\n"
                 + "\n".join(msgs))
+
+    def _sdxl_config_warning(self, params: GenParams) -> Optional[str]:
+        """Pre-flight check for SDXL: dual CLIP (clip_l+clip_g) / CLIP type
+        'sdxl' / kl-f8 VAE — どれが欠けても生成は確実に失敗する。"""
+        name = params.merge_models[0][0] if params.merge_models else params.diffusion
+        if self._diffusion_family(name) != "sdxl":
+            return None
+        msgs = []
+        if params.clip_type != "sdxl":
+            msgs.append(f"・CLIP type を 'sdxl' にしてください（現在: {params.clip_type}）")
+        sdxl_tes = [t for t in params.te if self._te_family(t) == "sdxl"]
+        if len(params.te) < 2 or len(sdxl_tes) < 2:
+            msgs.append("・「2つ目の text encoder を使用」を ON にし、"
+                        "Text encoder 1/2 に SDXL 用（clip_l と clip_g）を"
+                        "選択してください")
+        if self._vae_family(params.vae) != "sdxl":
+            msgs.append("・VAE に SDXL 用（sdxl_vae 等）を選択してください")
+        if not msgs:
+            return None
+        return ("選択中のモデルは SDXL です。次を直してください:\n\n"
+                + "\n".join(msgs))
+
+    def _config_warning(self, params: GenParams) -> Optional[str]:
+        """Family-mismatch pre-flight: returns a message when the current
+        model needs a different TE/CLIP/VAE configuration."""
+        return (self._krea2_config_warning(params)
+                or self._sdxl_config_warning(params))
 
     # ----- model merge (マージモデル) ---------------------------------------
     def _load_merges(self) -> list[dict]:
@@ -949,12 +1040,12 @@ class MainWindow(QMainWindow):
             has_model_axis = any(a.id == "model" for a in axes)
             if not has_model_axis:
                 # モデル軸があるときは全セルでモデルが差し替わるので、ベース
-                # 選択に対する krea2 チェックは意味を持たない（整合は下で
+                # 選択に対する系統チェックは意味を持たない（整合は下で
                 # セルごとに取る）。
-                warn = self._krea2_config_warning(base)
+                warn = self._config_warning(base)
                 if warn:
                     QMessageBox.warning(self._xyz_parent(),
-                                        "Krea-2 の設定を確認してください", warn)
+                                        "モデル設定を確認してください", warn)
                     return
             plan = xyz.plan_cells(base, axes, values)
             if has_model_axis:
@@ -1061,11 +1152,33 @@ class MainWindow(QMainWindow):
             fam = self._merge_family(entry)
         else:
             fam = self._diffusion_family(p.diffusion)
+
+        if fam == "sdxl":
+            te_ok = (p.clip_type == "sdxl" and len(p.te) == 2
+                     and all(self._te_family(t) == "sdxl" for t in p.te))
+            vae_ok = self._vae_family(p.vae) == "sdxl"
+            if te_ok and vae_ok:
+                return p
+            clip_l, clip_g = self._sdxl_te_pair()
+            if clip_l is None or clip_g is None:
+                raise ValueError(
+                    "モデル軸に SDXL 系がありますが、SDXL 用 text encoder"
+                    "（clip_l / clip_g）が text_encoders に見つかりません。")
+            vae = p.vae if vae_ok else self._first_vae(("sdxl",))
+            if vae is None:
+                raise ValueError(
+                    "モデル軸に SDXL 系がありますが、SDXL 用 VAE が vae に"
+                    "見つかりません。")
+            self._log_xyz_align(fam, f"{clip_l} + {clip_g}", "sdxl", vae)
+            return replace(p, te=[clip_l, clip_g], clip_type="sdxl", vae=vae)
+
         if fam not in ("anima", "krea2"):
             return p
-        te_ok = bool(p.te) and self._te_family(p.te[0]) == fam
-        clip_ok = (p.clip_type == "krea2") == (fam == "krea2")
-        if te_ok and clip_ok:
+        te_ok = (len(p.te) == 1 and self._te_family(p.te[0]) == fam)
+        clip_ok = (p.clip_type != "sdxl"
+                   and (p.clip_type == "krea2") == (fam == "krea2"))
+        vae_ok = self._vae_family(p.vae) in (fam, "shared")
+        if te_ok and clip_ok and vae_ok:
             return p
         te = list(p.te)
         if not te_ok:
@@ -1080,13 +1193,20 @@ class MainWindow(QMainWindow):
                     "ダウンロードしてください。")
         clip = p.clip_type if clip_ok else (
             "krea2" if fam == "krea2" else "stable_diffusion")
-        note = (fam, te[0], clip)
+        vae = p.vae if vae_ok else self._first_vae(("shared", fam))
+        if vae is None:
+            raise ValueError(f"{fam} 用の VAE が見つかりません。")
+        self._log_xyz_align(fam, te[0], clip, vae)
+        return replace(p, te=te, clip_type=clip, vae=vae)
+
+    def _log_xyz_align(self, fam: str, te_desc: str, clip: str,
+                       vae: str) -> None:
+        note = (fam, te_desc, clip, vae)
         if note not in self._xyz_align_logged:
             self._xyz_align_logged.add(note)
             self.append_log(
-                f"XYZ: {fam} 系モデルには text encoder {te[0]} / "
-                f"CLIP type {clip} を使用します")
-        return replace(p, te=te, clip_type=clip)
+                f"XYZ: {fam} 系モデルには text encoder {te_desc} / "
+                f"CLIP type {clip} / VAE {vae} を使用します")
 
     def _on_xyz_cell_done(self, done: int, total: int) -> None:
         self.status.showMessage(f"XYZ プロット生成中… ({done}/{total})")
@@ -1213,9 +1333,13 @@ class MainWindow(QMainWindow):
     def _filter_for_preset(self, kind: str, files: list[str], preset: str) -> list[str]:
         if preset == "all":
             return files
+        # "shared" は anima/krea2 の共通ファイル（Qwen-Image VAE）を指す。
+        # sdxl プリセットには含めない。
+        allowed = {preset, "shared"} if preset in ("anima", "krea2") \
+            else {preset}
         root = config.models_root() / kind
         return [f for f in files
-                if modelinfo.family(kind, root / f) in (preset, "shared")]
+                if modelinfo.family(kind, root / f) in allowed]
 
     def _apply_preset_filter(self) -> None:
         """Repopulate the model combos with only the current preset's files."""
@@ -1253,7 +1377,7 @@ class MainWindow(QMainWindow):
         if self._loading:
             return  # startup restores exact saved picks, no auto-defaulting
         preset = self._current_preset()
-        if preset in ("anima", "krea2"):
+        if preset in ("anima", "krea2", "sdxl"):
             self._select_preset_defaults(preset)
             if not self.cb_diffusion.count():
                 self.append_log(
@@ -1267,7 +1391,22 @@ class MainWindow(QMainWindow):
         The combos are already content-filtered to this family, so the text
         encoder and VAE simply default to the first entry; the diffusion model
         prefers a turbo/base variant by name when several are present."""
-        self.chk_dual_te.setChecked(False)  # both families use a single CLIPLoader
+        if preset == "sdxl":
+            # SDXL は dual TE (clip_l + clip_g) + CLIP type 'sdxl'。
+            self.chk_dual_te.setChecked(True)
+            self._select_preferred(self.cb_diffusion, ())
+            if self.cb_vae.count():
+                self.cb_vae.setCurrentIndex(0)
+            clip_l, clip_g = self._sdxl_te_pair()
+            if clip_l:
+                self.cb_te1.setCurrentText(clip_l)
+            if clip_g:
+                self.cb_te2.setCurrentText(clip_g)
+            idx = self.cb_clip_type.findText("sdxl")
+            if idx >= 0:
+                self.cb_clip_type.setCurrentIndex(idx)
+            return
+        self.chk_dual_te.setChecked(False)  # anima/krea2 use a single CLIPLoader
         prefer = ("base",) if preset == "anima" else ("turbo",)
         self._select_preferred(self.cb_diffusion, prefer)
         if self.cb_vae.count():
@@ -1538,9 +1677,9 @@ class MainWindow(QMainWindow):
         self._merge_was_cached = False
         try:
             params = self._collect_params()
-            warn = self._krea2_config_warning(params)
+            warn = self._config_warning(params)
             if warn:
-                QMessageBox.warning(self, "Krea-2 の設定を確認してください", warn)
+                QMessageBox.warning(self, "モデル設定を確認してください", warn)
                 return
             graph = build_graph(params)
         except ValueError as e:
