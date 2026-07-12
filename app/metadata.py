@@ -45,9 +45,11 @@ def build_parameters(meta: dict) -> str:
         f"CLIP type: {meta.get('clip_type')}",
         f"Batch size: {meta.get('batch')}",
         f"Weight dtype: {meta.get('dtype')}",
-        # Marks the generating app (A1111/Civitai-style Version token).
-        f"Version: {APP_SIGNATURE}",
     ]
+    if meta.get("loras"):
+        fields.append(f"Lora: {meta.get('loras')}")
+    # Marks the generating app (A1111/Civitai-style Version token).
+    fields.append(f"Version: {APP_SIGNATURE}")
     lines.append(", ".join(str(x) for x in fields))
     return "\n".join(lines)
 

@@ -23,7 +23,7 @@ MODEL_EXTENSIONS = (".safetensors", ".sft", ".ckpt", ".pt", ".gguf", ".bin")
 # Model component subdirectories under ``models/``. Names match both the
 # ComfyUI model categories (used in extra_model_paths.yaml) and the upstream
 # Hugging Face ``split_files`` layout, so the mapping is 1:1.
-MODEL_DIRS = ("diffusion_models", "vae", "text_encoders")
+MODEL_DIRS = ("diffusion_models", "vae", "text_encoders", "loras")
 
 
 def base_dir() -> Path:

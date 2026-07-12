@@ -60,6 +60,7 @@ def write_extra_model_paths(paths: config.AppPaths) -> Path:
         "  diffusion_models: diffusion_models/\n"
         "  vae: vae/\n"
         "  text_encoders: text_encoders/\n"
+        "  loras: loras/\n"
         f"  custom_nodes: {nodes_dir.as_posix()}\n"
     )
     out = paths.user_data / "extra_model_paths.yaml"

@@ -185,6 +185,9 @@ class MainWindow(QMainWindow):
         self._merge_was_cached = False              # node "4" was a cache hit
         self._merge_dlg = None  # non-modal MergeDialog (at most one)
         self._merge_running = False  # a merge-only run is in flight
+        # Applied LoRAs: [{"name": str, "strength": float}, ...] in chain order.
+        self._loras: list[dict] = []
+        self._lora_dlg = None  # non-modal LoraDialog (at most one)
         # Per-preset (anima/krea2/sdxl) memory of the Models + 設定 values;
         # filled from settings in _apply_settings, kept fresh in _do_save.
         self._preset_conf: dict = {}
@@ -351,12 +354,32 @@ class MainWindow(QMainWindow):
         btns = QWidget(); btns.setLayout(btn_row)
         btn_row.setContentsMargins(0, 0, 0, 0)
 
+        # LoRA: 選択はブラウザウィンドウで行い、適用中の一覧をここに出す。
+        self.btn_lora = QPushButton("LoRA選択…")
+        self.btn_lora.setToolTip(
+            "LoRA の一覧（サムネイル・トリガーワード付き）を開いて"
+            "適用する LoRA を選びます")
+        self.btn_lora.clicked.connect(self._open_lora_dialog)
+        lora_head = QHBoxLayout()
+        lora_head.setContentsMargins(0, 0, 0, 0)
+        lora_head.addWidget(self.btn_lora)
+        lora_head.addStretch(1)
+        lora_head_w = QWidget()
+        lora_head_w.setLayout(lora_head)
+        self._lora_rows_box = QVBoxLayout()
+        self._lora_rows_box.setContentsMargins(0, 0, 0, 0)
+        self._lora_rows_box.setSpacing(2)
+        lora_rows_w = QWidget()
+        lora_rows_w.setLayout(self._lora_rows_box)
+
         form.addRow("Diffusion:", self.cb_diffusion)
         form.addRow("VAE:", self.cb_vae)
         form.addRow("Text encoder 1:", self.cb_te1)
         form.addRow("", self.chk_dual_te)
         form.addRow("Text encoder 2:", self.cb_te2)
         form.addRow("CLIP type:", self.cb_clip_type)
+        form.addRow("LoRA:", lora_head_w)
+        form.addRow("", lora_rows_w)
         # Single-widget row: spans the label column too, so the three buttons
         # get the group box's full width (their labels were getting clipped).
         form.addRow(btns)
@@ -553,11 +576,13 @@ class MainWindow(QMainWindow):
             "diffusion_models": config.scan_models("diffusion_models"),
             "vae": config.scan_models("vae"),
             "text_encoders": config.scan_models("text_encoders"),
+            "loras": config.scan_models("loras"),
         }
         self.append_log(
             f"モデル: diffusion_models={len(self._all_models['diffusion_models'])} "
             f"vae={len(self._all_models['vae'])} "
-            f"text_encoders={len(self._all_models['text_encoders'])}"
+            f"text_encoders={len(self._all_models['text_encoders'])} "
+            f"loras={len(self._all_models['loras'])}"
         )
         self._apply_preset_filter()
 
@@ -1025,6 +1050,106 @@ class MainWindow(QMainWindow):
             if idx >= 0:
                 self.cb_diffusion.setCurrentIndex(idx)
         self._push_merge_state()
+
+    # ----- LoRA -------------------------------------------------------------
+    def _open_lora_dialog(self) -> None:
+        from .lora_dialog import LoraDialog
+        # Non-modal, at most one instance; re-opening replaces it so the file
+        # list is always current (parentless so it can go behind us).
+        if self._lora_dlg is not None:
+            try:
+                self._lora_dlg.close()
+                self._lora_dlg.deleteLater()
+            except RuntimeError:
+                pass
+        dlg = LoraDialog(config.models_root() / "loras",
+                         self.paths.user_data / "lora_cache",
+                         self._current_preset, None)
+        dlg.apply_requested.connect(self._on_lora_apply)
+        dlg.remove_requested.connect(self._on_lora_remove)
+        dlg.insert_prompt_requested.connect(self._on_lora_insert_prompt)
+        self._lora_dlg = dlg
+        self._push_lora_state()
+        dlg.show()
+
+    def _push_lora_state(self) -> None:
+        """Refresh the LoRA window's applied marks (if it is open)."""
+        if self._lora_dlg is None:
+            return
+        try:
+            self._lora_dlg.set_applied(
+                {e["name"]: float(e["strength"]) for e in self._loras})
+        except RuntimeError:
+            self._lora_dlg = None
+
+    def _on_lora_apply(self, name: str, strength: float) -> None:
+        for e in self._loras:
+            if e["name"] == name:
+                e["strength"] = float(strength)
+                break
+        else:
+            self._loras.append({"name": name, "strength": float(strength)})
+            self.append_log(f"LoRA を適用: {name} ×{strength:g}")
+        self._rebuild_lora_rows()
+        self._push_lora_state()
+        self._schedule_save()
+
+    def _on_lora_remove(self, name: str) -> None:
+        before = len(self._loras)
+        self._loras = [e for e in self._loras if e["name"] != name]
+        if len(self._loras) != before:
+            self.append_log(f"LoRA を解除: {name}")
+        self._rebuild_lora_rows()
+        self._push_lora_state()
+        self._schedule_save()
+
+    def _on_lora_strength_changed(self, name: str, value: float) -> None:
+        for e in self._loras:
+            if e["name"] == name:
+                e["strength"] = float(value)
+        self._push_lora_state()
+        self._schedule_save()
+
+    def _on_lora_insert_prompt(self, word: str) -> None:
+        """トリガーワードをプロンプト欄の末尾に追記（重複は追加しない）。"""
+        current = self.txt_prompt.toPlainText()
+        if word in current:
+            return
+        text = current.rstrip()
+        self.txt_prompt.setPlainText(
+            (text + ", " + word) if text else word)
+
+    def _rebuild_lora_rows(self) -> None:
+        """Rebuild the applied-LoRA rows under the LoRA button."""
+        while self._lora_rows_box.count():
+            item = self._lora_rows_box.takeAt(0)
+            w = item.widget()
+            if w is not None:
+                w.deleteLater()
+        for e in self._loras:
+            name = e["name"]
+            row = QWidget()
+            h = QHBoxLayout(row)
+            h.setContentsMargins(0, 0, 0, 0)
+            trash = QPushButton("🗑")
+            trash.setFixedWidth(28)
+            trash.setToolTip("この LoRA を解除")
+            trash.clicked.connect(
+                lambda *_a, n=name: self._on_lora_remove(n))
+            lbl = QLabel(name)
+            lbl.setToolTip(name)
+            spin = QDoubleSpinBox()
+            spin.setRange(-4.0, 4.0)
+            spin.setDecimals(2)
+            spin.setSingleStep(0.05)
+            spin.setValue(float(e["strength"]))
+            spin.setToolTip("LoRA の適用強度（model / clip 共通）")
+            spin.valueChanged.connect(
+                lambda v, n=name: self._on_lora_strength_changed(n, v))
+            h.addWidget(trash)
+            h.addWidget(lbl, stretch=1)
+            h.addWidget(spin)
+            self._lora_rows_box.addWidget(row)
 
     # ----- XYZ plot ---------------------------------------------------------
     def _open_xyz_dialog(self) -> None:
@@ -1686,6 +1811,16 @@ class MainWindow(QMainWindow):
         self.sp_jpg_quality.setValue(int(s.get("jpg_quality", 92)))
         self.sp_webp_quality.setValue(int(s.get("webp_quality", 90)))
         self.chk_embed_meta.setChecked(bool(s.get("embed_metadata", True)))
+        # Applied LoRAs ("loras" JSON [[name, strength], ...]). Files that
+        # have since disappeared are kept (they may come back; generation
+        # would surface a clear backend error otherwise).
+        try:
+            raw = json.loads(str(s.get("loras", "[]")))
+            self._loras = [{"name": str(n), "strength": float(w)}
+                           for n, w in raw if str(n)]
+        except (ValueError, TypeError):
+            self._loras = []
+        self._rebuild_lora_rows()
         # Per-preset Models/設定 memory (settings "preset_conf" JSON).
         try:
             pc = json.loads(str(s.get("preset_conf", "{}")))
@@ -1739,6 +1874,9 @@ class MainWindow(QMainWindow):
                   "quant": e["quant"], "low_memory": e["low_memory"]}
                  for e in self._merges], ensure_ascii=False),
             "merge_seq": int(self._merge_seq),
+            "loras": json.dumps(
+                [[e["name"], float(e["strength"])] for e in self._loras],
+                ensure_ascii=False),
             "width": self.sp_width.value(),
             "height": self.sp_height.value(),
             "steps": self.sp_steps.value(),
@@ -1814,6 +1952,7 @@ class MainWindow(QMainWindow):
             vae=self.cb_vae.currentText().strip(),
             te=[t for t in te if t],
             clip_type=self.cb_clip_type.currentText(),
+            loras=[(e["name"], float(e["strength"])) for e in self._loras],
             prompt=self.txt_prompt.toPlainText(),
             negative=self.txt_negative.toPlainText(),
             width=self.sp_width.value(),
@@ -2056,6 +2195,8 @@ class MainWindow(QMainWindow):
             "batch": p.batch_size,
             "dtype": p.weight_dtype,
         }
+        if p.loras:
+            meta["loras"] = ", ".join(f"{n}:{w:g}" for n, w in p.loras)
         params_text = metadata.build_parameters(meta)
         return params_text, {"app": "scom", **meta}
 
@@ -2094,10 +2235,10 @@ class MainWindow(QMainWindow):
             self._show_image(self._last_images[0])
 
     def closeEvent(self, event) -> None:  # noqa: N802
-        # The merge/XYZ windows are parentless (so they can go behind us);
-        # close them explicitly or the app would keep running after the main
-        # window.
-        for dlg in (self._merge_dlg, self._xyz_dlg):
+        # The merge/XYZ/LoRA windows are parentless (so they can go behind
+        # us); close them explicitly or the app would keep running after the
+        # main window.
+        for dlg in (self._merge_dlg, self._xyz_dlg, self._lora_dlg):
             if dlg is not None:
                 try:
                     dlg.close()

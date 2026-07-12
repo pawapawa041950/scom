@@ -58,6 +58,9 @@ class GenParams:
     merge_low_memory: bool = False
     te: list[str] = field(default_factory=list)  # 1 -> CLIPLoader, 2 -> DualCLIPLoader
     clip_type: str = "stable_diffusion"
+    # Applied LoRAs: [(filename under models/loras, strength), ...], chained
+    # in order. The strength is used for both model and clip weights.
+    loras: list[tuple[str, float]] = field(default_factory=list)
     prompt: str = ""
     negative: str = ""
     width: int = 1024
@@ -167,13 +170,34 @@ def build_graph(p: GenParams) -> dict:
             "inputs": {"clip_name": p.te[0], "type": p.clip_type},
         }
 
+    # LoRA chain: model/clip flow through LoraLoader nodes in applied order.
+    # Node ids start at 20 to stay clear of the fixed 4-12 range.
+    model_src: list = ["4", 0]
+    clip_src: list = ["6", 0]
+    for i, (lora_name, strength) in enumerate(p.loras):
+        if not lora_name:
+            raise ValueError("LoRA のファイル名が空です")
+        nid = str(20 + i)
+        graph[nid] = {
+            "class_type": "LoraLoader",
+            "inputs": {
+                "lora_name": lora_name,
+                "strength_model": float(strength),
+                "strength_clip": float(strength),
+                "model": model_src,
+                "clip": clip_src,
+            },
+        }
+        model_src = [nid, 0]
+        clip_src = [nid, 1]
+
     graph["7"] = {
         "class_type": "CLIPTextEncode",
-        "inputs": {"text": p.prompt, "clip": ["6", 0]},
+        "inputs": {"text": p.prompt, "clip": clip_src},
     }
     graph["8"] = {
         "class_type": "CLIPTextEncode",
-        "inputs": {"text": p.negative, "clip": ["6", 0]},
+        "inputs": {"text": p.negative, "clip": clip_src},
     }
     graph["9"] = {
         "class_type": "EmptyLatentImage",
@@ -192,7 +216,7 @@ def build_graph(p: GenParams) -> dict:
             "sampler_name": p.sampler,
             "scheduler": p.scheduler,
             "denoise": 1.0,
-            "model": ["4", 0],
+            "model": model_src,
             "positive": ["7", 0],
             "negative": ["8", 0],
             "latent_image": ["9", 0],
