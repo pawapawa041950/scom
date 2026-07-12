@@ -103,6 +103,12 @@ class XyzDialog(QDialog):
         self.progress = QProgressBar()
         self.progress.setTextVisible(True)
         self.progress.setVisible(False)
+        # 非表示でも高さを確保する。表示/非表示で最小サイズが変わると、
+        # 最小の高さまで縮めたウィンドウで QWindowsWindow::setGeometry の
+        # 警告が出る（Windows 側との最小サイズ食い違い）。
+        sp = self.progress.sizePolicy()
+        sp.setRetainSizeWhenHidden(True)
+        self.progress.setSizePolicy(sp)
         root.addWidget(self.progress)
 
         btns = QHBoxLayout()

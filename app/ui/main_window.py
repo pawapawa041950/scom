@@ -31,6 +31,14 @@ from ..workflow import (
 
 MAX_SEED = 2**63 - 1
 
+# XYZ 軸 id -> その軸が支配する GenParams フィールド。モデル軸のプリセット
+# 適用時、軸で振っている値をプリセット設定で上書きしないための対応表。
+_XYZ_AXIS_FIELDS = {
+    "seed": {"seed"}, "steps": {"steps"}, "cfg": {"cfg"},
+    "sampler": {"sampler"}, "scheduler": {"scheduler"},
+    "size": {"width", "height"}, "dtype": {"weight_dtype"},
+}
+
 # Image format option that disables saving generated images to disk.
 NO_SAVE = "保存しない"
 
@@ -176,6 +184,11 @@ class MainWindow(QMainWindow):
         self._last_merge_id: Optional[int] = None   # entry used by last gen
         self._merge_was_cached = False              # node "4" was a cache hit
         self._merge_dlg = None  # non-modal MergeDialog (at most one)
+        self._merge_running = False  # a merge-only run is in flight
+        # Per-preset (anima/krea2/sdxl) memory of the Models + 設定 values;
+        # filled from settings in _apply_settings, kept fresh in _do_save.
+        self._preset_conf: dict = {}
+        self._active_preset: str = "anima"
         # XYZ plot: non-modal dialog + sequential-cell worker state.
         self._xyz_dlg = None
         self._xyz_thread: Optional[QThread] = None
@@ -214,29 +227,27 @@ class MainWindow(QMainWindow):
     def _build_ui(self) -> None:
         splitter = QSplitter(Qt.Horizontal)
 
-        # Left block, two columns: 1 = preset/models, 2 = settings/image,
-        # with the prompt box spanning both columns underneath.
+        # Left block: an untitled outer group bundles Models + 設定 (with the
+        # 表示モデル selector one level above them); the prompt box spans the
+        # full width underneath.
         left = QWidget()
         grid = QGridLayout(left)
-        col1 = QVBoxLayout()
-        col1.addWidget(self._build_model_box())
-        col1.addStretch(1)
-        col2 = QVBoxLayout()
-        col2.addWidget(self._build_settings_box())
-        col2.addWidget(self._build_image_box())
-        col2.addStretch(1)
-        grid.addLayout(col1, 0, 0)
-        grid.addLayout(col2, 0, 1)
-        grid.addWidget(self._build_prompt_box(), 1, 0, 1, 2)
-        grid.setColumnStretch(0, 1)
-        grid.setColumnStretch(1, 1)
+        grid.addWidget(self._build_top_group(), 0, 0)
+        grid.addWidget(self._build_prompt_box(), 1, 0)
         grid.setRowStretch(1, 1)  # prompt area takes the remaining height
         left.setMinimumWidth(660)
 
-        # Right column: action buttons above the preview, log below
+        # Right column, top to bottom: log, preview, one-line image box,
+        # action buttons.
         right = QWidget()
         right_layout = QVBoxLayout(right)
-        right_layout.addWidget(self._build_action_box())
+        self.log_view = QPlainTextEdit()
+        self.log_view.setReadOnly(True)
+        self.log_view.setMaximumBlockCount(2000)
+        self.log_view.setPlaceholderText("バックエンドログ…")
+        ansi_log.style_log(self.log_view)
+        right_layout.addWidget(self.log_view, stretch=1)
+
         self.preview = QLabel("プレビュー")
         self.preview.setAlignment(Qt.AlignCenter)
         self.preview.setMinimumSize(512, 512)
@@ -244,13 +255,8 @@ class MainWindow(QMainWindow):
             "QLabel { background:#1e1e1e; color:#888; border:1px solid #333; }"
         )
         right_layout.addWidget(self.preview, stretch=3)
-
-        self.log_view = QPlainTextEdit()
-        self.log_view.setReadOnly(True)
-        self.log_view.setMaximumBlockCount(2000)
-        self.log_view.setPlaceholderText("バックエンドログ…")
-        ansi_log.style_log(self.log_view)
-        right_layout.addWidget(self.log_view, stretch=1)
+        right_layout.addWidget(self._build_image_box())
+        right_layout.addWidget(self._build_action_box())
 
         splitter.addWidget(left)
         splitter.addWidget(right)
@@ -261,23 +267,62 @@ class MainWindow(QMainWindow):
         self.status.addPermanentWidget(self.progress)
         self.status.showMessage("バックエンドを起動中…")
 
-    def _build_model_box(self) -> QGroupBox:
-        box = QGroupBox("Models")
-        form = QFormLayout(box)
+    def _build_top_group(self) -> QWidget:
+        """Untitled outer group bundling the Models and 設定 categories.
 
-        # Preset: picking anima/krea2 filters the model dropdowns to that
-        # family and auto-selects its model/vae/te/CLIP.
+        表示モデル is a cross-category setting (it filters Models AND drives
+        the defaults), so it is drawn like the group's TITLE: a widget row
+        overlaid on the frame's top border (QGroupBox titles are text-only,
+        so the row is a floating child centered on the border line, with an
+        opaque background that interrupts the line the way a title does)."""
+        # Preset: picking anima/krea2/sdxl filters the model dropdowns to
+        # that family. The Models + 設定 values are remembered per preset
+        # (settings.toml "preset_conf") and restored on switch.
         self.cb_preset = WideComboBox()
         self.cb_preset.addItem("anima", "anima")
         self.cb_preset.addItem("krea2", "krea2")
         self.cb_preset.addItem("sdxl", "sdxl")
-        self.cb_preset.addItem("すべて", "all")
-        self.cb_preset.setCurrentIndex(3)  # default: すべて (show everything)
         self.cb_preset.setToolTip(
-            "anima / krea2 / sdxl を選ぶと、その構成に合うモデル・VAE・"
-            "Text encoder・CLIP type に絞り込み＆自動選択します"
+            "モデル・VAE・Text encoder をその系統に絞り込みます。"
+            "Models と設定カテゴリの内容は系統ごとに記憶され、"
+            "切り替えると前回の状態が復元されます"
         )
         self.cb_preset.currentIndexChanged.connect(self._on_preset_changed)
+
+        title = QWidget()
+        th = QHBoxLayout(title)
+        th.setContentsMargins(6, 0, 6, 0)
+        th.addWidget(QLabel("表示モデル:"))
+        th.addWidget(self.cb_preset)
+        title.setAutoFillBackground(True)  # hide the border line behind it
+        title_h = title.sizeHint().height()
+
+        wrap = QWidget()
+        outer = QVBoxLayout(wrap)
+        # The title row overhangs the group box by half its height.
+        outer.setContentsMargins(0, title_h // 2, 0, 0)
+        box = QGroupBox()
+        v = QVBoxLayout(box)
+        m = v.contentsMargins()
+        v.setContentsMargins(m.left(), title_h // 2 + 4, m.right(), m.bottom())
+        boxes = QHBoxLayout()
+        boxes.addWidget(self._build_model_box(), stretch=1)
+        settings_col = QVBoxLayout()
+        settings_col.addWidget(self._build_settings_box())
+        settings_col.addStretch(1)
+        boxes.addLayout(settings_col, stretch=1)
+        v.addLayout(boxes)
+        outer.addWidget(box)
+
+        title.setParent(wrap)
+        title.adjustSize()
+        title.move(14, 0)  # same left offset feel as the "Models" title
+        title.raise_()
+        return wrap
+
+    def _build_model_box(self) -> QGroupBox:
+        box = QGroupBox("Models")
+        form = QFormLayout(box)
 
         self.cb_diffusion = WideComboBox()
         self.cb_vae = WideComboBox()
@@ -306,7 +351,6 @@ class MainWindow(QMainWindow):
         btns = QWidget(); btns.setLayout(btn_row)
         btn_row.setContentsMargins(0, 0, 0, 0)
 
-        form.addRow("表示モデル:", self.cb_preset)
         form.addRow("Diffusion:", self.cb_diffusion)
         form.addRow("VAE:", self.cb_vae)
         form.addRow("Text encoder 1:", self.cb_te1)
@@ -450,10 +494,9 @@ class MainWindow(QMainWindow):
 
     # ----- image output settings (below the preview) ----------------------
     def _build_image_box(self) -> QGroupBox:
+        """One-line Image box (sits between the preview and the log)."""
         box = QGroupBox("Image")
-        col = QVBoxLayout(box)
-        row = QHBoxLayout()
-        col.addLayout(row)
+        row = QHBoxLayout(box)
 
         self.cb_img_format = WideComboBox()
         self.cb_img_format.addItems(["png", "jpg", "webp", NO_SAVE])  # index 0/1/2/3
@@ -486,19 +529,20 @@ class MainWindow(QMainWindow):
         self.stack_quality.addWidget(nosave_page)
         self.cb_img_format.currentIndexChanged.connect(self.stack_quality.setCurrentIndex)
 
-        row.addWidget(QLabel("Format"))
-        row.addWidget(self.cb_img_format)
-        row.addSpacing(16)
-        row.addWidget(self.stack_quality)
-        row.addStretch(1)
-
         self.chk_embed_meta = QCheckBox("画像にメタ情報を埋め込む")
         self.chk_embed_meta.setChecked(True)
         self.chk_embed_meta.setToolTip(
             "ONで生成設定（プロンプト・seed 等）を画像に埋め込みます"
             "（PNG: parameters チャンク / JPEG・WEBP: EXIF）。"
             "OFFにするとメタ情報を一切書き込みません")
-        col.addWidget(self.chk_embed_meta)
+
+        row.addWidget(QLabel("Format"))
+        row.addWidget(self.cb_img_format)
+        row.addSpacing(16)
+        row.addWidget(self.stack_quality)
+        row.addSpacing(16)
+        row.addWidget(self.chk_embed_meta)
+        row.addStretch(1)
         return box
 
     # ----- model scanning --------------------------------------------------
@@ -782,6 +826,8 @@ class MainWindow(QMainWindow):
         dlg.free_memory_requested.connect(self._on_free_memory)
         self._merge_dlg = dlg
         self._push_merge_state()
+        if self._merge_running:
+            dlg.set_merge_running(True)
         dlg.show()
 
     def _on_merge_requested(self, entries, quant: str, low_memory: bool) -> None:
@@ -920,16 +966,44 @@ class MainWindow(QMainWindow):
         # _on_merge_done -> dialog widget updates off the GUI thread
         # ("Cannot set parent ... different thread" warnings).
         self._merge_run_ctx = (saving, entry_id)
+        self._merge_running = True
+        self._gen_worker.progress.connect(self._on_merge_progress)
         self._gen_worker.done.connect(self._on_merge_worker_done)
         self._gen_worker.failed.connect(self._on_gen_failed)
+        self._gen_worker.done.connect(self._end_merge_progress)
+        self._gen_worker.failed.connect(self._end_merge_progress)
         self._gen_worker.done.connect(self._gen_thread.quit)
         self._gen_worker.failed.connect(self._gen_thread.quit)
         self._gen_thread.finished.connect(self._cleanup_gen_thread)
         self._gen_thread.start()
+        if self._merge_dlg is not None:
+            try:
+                self._merge_dlg.set_merge_running(True)
+            except RuntimeError:
+                self._merge_dlg = None
 
     def _on_merge_worker_done(self, _images: list) -> None:
         saving, entry_id = getattr(self, "_merge_run_ctx", (False, None))
         self._on_merge_done(saving, entry_id)
+
+    # NOTE: どちらも bound method で接続すること（_run_merge の NOTE 参照）。
+    def _on_merge_progress(self, p: Progress) -> None:
+        """Mirror merge progress onto the merge window's progress bar."""
+        if self._merge_dlg is None:
+            return
+        try:
+            self._merge_dlg.set_merge_progress(p.value, p.maximum, p.note)
+        except RuntimeError:
+            self._merge_dlg = None
+
+    def _end_merge_progress(self, *_a) -> None:
+        self._merge_running = False
+        if self._merge_dlg is None:
+            return
+        try:
+            self._merge_dlg.set_merge_running(False)
+        except RuntimeError:
+            self._merge_dlg = None
 
     def _on_merge_done(self, saved: bool, entry_id: Optional[int]) -> None:
         if entry_id is not None:
@@ -1050,7 +1124,16 @@ class MainWindow(QMainWindow):
             plan = xyz.plan_cells(base, axes, values)
             if has_model_axis:
                 self._xyz_align_logged = set()
-                plan = [(idx, self._resolve_xyz_model_cell(p))
+                # 系統ごとのプリセット設定（メモリ上）。アクティブな表示モデル
+                # は現在の UI 値、他は切り替え時に退避した値を使う（設定
+                # ファイルからは読まない）。
+                confs = dict(self._preset_conf)
+                confs[self._current_preset()] = self._collect_preset_conf()
+                # 軸で振っているパラメータはプリセット値で上書きしない。
+                locked = set()
+                for a in axes:
+                    locked |= _XYZ_AXIS_FIELDS.get(a.id, set())
+                plan = [(idx, self._resolve_xyz_model_cell(p, confs, locked))
                         for idx, p in plan]
             jobs = [(idx, build_graph(p)) for idx, p in plan]
         except ValueError as e:
@@ -1125,16 +1208,18 @@ class MainWindow(QMainWindow):
         self._xyz_thread.finished.connect(self._cleanup_xyz_thread)
         self._xyz_thread.start()
 
-    def _resolve_xyz_model_cell(self, p: GenParams) -> GenParams:
-        """モデル軸のセルを解決する: マージトークンの展開 + 系統整合。
+    def _resolve_xyz_model_cell(self, p: GenParams, confs: dict,
+                                locked: set) -> GenParams:
+        """モデル軸のセルを解決する: マージ展開 + プリセット適用 + 系統整合。
 
         値が「マージモデル：<名前>」なら登録済みマージエントリのレシピに
-        展開する。その後、モデルの系統に合う TE / CLIP type に揃える
-        （メイン画面でモデルを選んだときの自動整合と同じ規約:
-        krea2 -> CLIP type 'krea2' + Qwen3-VL 系 TE、anima ->
-        'stable_diffusion' + Qwen3 0.6B 系 TE）。系統が判定できないモデルは
-        ベース設定のまま。整合が取れないと conditioning の次元不一致で
-        バックエンドが "mat1 and mat2 shapes cannot be multiplied" を出す。
+        展開する。次に、そのモデルの系統に対応する表示モデル（プリセット）
+        の Models + 設定値（``confs`` = メモリ上の記憶。アクティブな系統は
+        現在の UI 値）をセルへ適用する — ただし軸で振っている ``locked``
+        フィールドと seed（比較可能性のため全セル共通）は上書きしない。
+        最後に TE / CLIP / VAE の系統整合を検証し、食い違いは補正する
+        （整合が取れないと conditioning の次元不一致でバックエンドが
+        "mat1 and mat2 shapes cannot be multiplied" を出す）。
         """
         from dataclasses import replace
         if p.diffusion.startswith(MERGE_PREFIX):
@@ -1152,6 +1237,15 @@ class MainWindow(QMainWindow):
             fam = self._merge_family(entry)
         else:
             fam = self._diffusion_family(p.diffusion)
+
+        conf = confs.get(fam) if fam in ("anima", "krea2", "sdxl") else None
+        if conf:
+            p = self._apply_preset_conf_to_cell(p, conf, locked)
+            note = ("preset", fam)
+            if note not in self._xyz_align_logged:
+                self._xyz_align_logged.add(note)
+                self.append_log(
+                    f"XYZ: {fam} 系セルには表示モデル {fam} の設定を適用します")
 
         if fam == "sdxl":
             te_ok = (p.clip_type == "sdxl" and len(p.te) == 2
@@ -1198,6 +1292,40 @@ class MainWindow(QMainWindow):
             raise ValueError(f"{fam} 用の VAE が見つかりません。")
         self._log_xyz_align(fam, te[0], clip, vae)
         return replace(p, te=te, clip_type=clip, vae=vae)
+
+    def _apply_preset_conf_to_cell(self, p: GenParams, conf: dict,
+                                   locked: set) -> GenParams:
+        """Apply a preset's remembered Models/設定 values to one XYZ cell.
+
+        モデル（diffusion / マージ指定）は軸の値、seed はベース値のまま。
+        ``locked`` のフィールド（軸で振っているもの）も触らない。ここで
+        入った値は続く系統整合チェックで検証される（古いファイル名等は
+        そこで補正される）。
+        """
+        from dataclasses import replace
+        kw = {}
+        te = [str(conf.get("te1", ""))]
+        if conf.get("dual_te") and str(conf.get("te2", "")).strip():
+            te.append(str(conf.get("te2")).strip())
+        te = [t for t in te if t]
+        if te:
+            kw["te"] = te
+        if str(conf.get("clip_type", "")):
+            kw["clip_type"] = str(conf["clip_type"])
+        if str(conf.get("vae", "")):
+            kw["vae"] = str(conf["vae"])
+        try:
+            fields = (("width", "width", int), ("height", "height", int),
+                      ("steps", "steps", int), ("cfg", "cfg", float),
+                      ("sampler", "sampler", str),
+                      ("scheduler", "scheduler", str),
+                      ("weight_dtype", "dtype", str))
+            for field, key, cast in fields:
+                if field not in locked and key in conf:
+                    kw[field] = cast(conf[key])
+        except (TypeError, ValueError):
+            pass  # 壊れた保存値: 適用できた分だけ使う
+        return replace(p, **kw)
 
     def _log_xyz_align(self, fam: str, te_desc: str, clip: str,
                        vae: str) -> None:
@@ -1324,11 +1452,11 @@ class MainWindow(QMainWindow):
 
     # ----- preset filtering (family judged from file content) -------------
     def _current_preset(self) -> str:
-        return self.cb_preset.currentData() or "all"
+        return self.cb_preset.currentData() or "anima"
 
     def _set_preset(self, token: str) -> None:
         i = self.cb_preset.findData(token)
-        self.cb_preset.setCurrentIndex(i if i >= 0 else self.cb_preset.findData("all"))
+        self.cb_preset.setCurrentIndex(i if i >= 0 else 0)
 
     def _filter_for_preset(self, kind: str, files: list[str], preset: str) -> list[str]:
         if preset == "all":
@@ -1373,17 +1501,90 @@ class MainWindow(QMainWindow):
         self._fill_combo(self.cb_te2, te, allow_empty=True)
 
     def _on_preset_changed(self, *_) -> None:
+        preset = self._current_preset()
+        if not self._loading:
+            # 現在の Models + 設定の内容を旧プリセットの枠に退避する。
+            # 絞り込み（_apply_preset_filter）はコンボの選択を書き換えるので、
+            # 必ずその前に退避すること。
+            old = getattr(self, "_active_preset", None)
+            if old and old != preset:
+                self._preset_conf[old] = self._collect_preset_conf()
+            self._active_preset = preset
         self._apply_preset_filter()
         if self._loading:
             return  # startup restores exact saved picks, no auto-defaulting
-        preset = self._current_preset()
-        if preset in ("anima", "krea2", "sdxl"):
-            self._select_preset_defaults(preset)
-            if not self.cb_diffusion.count():
-                self.append_log(
-                    f"{preset} のモデルが見つかりません。"
-                    "「モデル管理…」からダウンロードしてください。")
+        # 新プリセットの保存値（無ければ既定値）を復元する。
+        stored = self._preset_conf.get(preset)
+        prev_loading = self._loading
+        self._loading = True  # 復元中の自動整合・自動保存を抑止
+        try:
+            if stored:
+                self._apply_preset_conf(stored)
+            else:
+                self._select_preset_defaults(preset)
+        finally:
+            self._loading = prev_loading
+        if not self.cb_diffusion.count():
+            self.append_log(
+                f"{preset} のモデルが見つかりません。"
+                "「モデル管理…」からダウンロードしてください。")
         self._schedule_save()
+
+    # ----- per-preset Models/設定 memory -----------------------------------
+    def _collect_preset_conf(self) -> dict:
+        """Current Models + 設定 values (persisted per preset)."""
+        diffusion = (self.cb_diffusion.currentData()
+                     if self._merge_selected()
+                     else self.cb_diffusion.currentText())
+        return {
+            "diffusion": str(diffusion),
+            "vae": self.cb_vae.currentText(),
+            "te1": self.cb_te1.currentText(),
+            "te2": self.cb_te2.currentText(),
+            "dual_te": self.chk_dual_te.isChecked(),
+            "clip_type": self.cb_clip_type.currentText(),
+            "width": self.sp_width.value(),
+            "height": self.sp_height.value(),
+            "steps": self.sp_steps.value(),
+            "cfg": float(self.sp_cfg.value()),
+            "batch": self.sp_batch.value(),
+            "sampler": self.cb_sampler.currentText(),
+            "scheduler": self.cb_scheduler.currentText(),
+            "seed": self.ed_seed.text().strip() or "-1",
+            "randomize": self.chk_randomize.isChecked(),
+            "dtype": self.cb_dtype.currentText(),
+        }
+
+    def _apply_preset_conf(self, c: dict) -> None:
+        """Restore Models + 設定 values saved for a preset (combos are
+        already filtered to that preset; missing files are skipped)."""
+        try:
+            saved_diffusion = str(c.get("diffusion", ""))
+            if saved_diffusion.startswith(MERGE_TOKEN):
+                idx = self.cb_diffusion.findData(saved_diffusion)
+                if idx >= 0:
+                    self.cb_diffusion.setCurrentIndex(idx)
+            elif saved_diffusion:
+                self.cb_diffusion.setCurrentText(saved_diffusion)
+            self.cb_vae.setCurrentText(str(c.get("vae", "")))
+            self.cb_te1.setCurrentText(str(c.get("te1", "")))
+            self.cb_te2.setCurrentText(str(c.get("te2", "")))
+            self.chk_dual_te.setChecked(bool(c.get("dual_te", False)))
+            self._on_dual_toggled(self.chk_dual_te.isChecked())
+            self.cb_clip_type.setCurrentText(
+                str(c.get("clip_type", "stable_diffusion")))
+            self.sp_width.setValue(int(c.get("width", self.sp_width.value())))
+            self.sp_height.setValue(int(c.get("height", self.sp_height.value())))
+            self.sp_steps.setValue(int(c.get("steps", self.sp_steps.value())))
+            self.sp_cfg.setValue(float(c.get("cfg", self.sp_cfg.value())))
+            self.sp_batch.setValue(int(c.get("batch", self.sp_batch.value())))
+            self.cb_sampler.setCurrentText(str(c.get("sampler", "er_sde")))
+            self.cb_scheduler.setCurrentText(str(c.get("scheduler", "simple")))
+            self.ed_seed.setText(str(c.get("seed", "-1")))
+            self.chk_randomize.setChecked(bool(c.get("randomize", True)))
+            self.cb_dtype.setCurrentText(str(c.get("dtype", "default")))
+        except (TypeError, ValueError):
+            pass  # 壊れた保存値は途中まで適用（以後の保存で正される）
 
     def _select_preset_defaults(self, preset: str) -> None:
         """Pick sensible model/vae/te/CLIP defaults for the chosen family.
@@ -1431,7 +1632,21 @@ class MainWindow(QMainWindow):
         """Apply loaded settings to the widgets (called once, at startup)."""
         s = self.settings
         # Preset first: it filters the model dropdowns before we restore picks.
-        self._set_preset(str(s.get("preset", "all")))
+        # 旧バージョンの「すべて」("all") は保存されていたモデルの系統に移行。
+        preset = str(s.get("preset", ""))
+        if preset not in ("anima", "krea2", "sdxl"):
+            saved_diffusion = str(s.get("diffusion", ""))
+            if saved_diffusion.startswith(MERGE_TOKEN):
+                try:
+                    entry = self._merge_entry_by_id(
+                        int(saved_diffusion.split(":", 1)[1]))
+                except (IndexError, ValueError):
+                    entry = None
+                fam = self._merge_family(entry) if entry else "unknown"
+            else:
+                fam = self._diffusion_family(saved_diffusion)
+            preset = fam if fam in ("anima", "krea2", "sdxl") else "anima"
+        self._set_preset(preset)
         # Merge selections are stored as their data token ("__merge__:<id>");
         # they are restorable because unbuilt entries auto-merge at generation.
         saved_diffusion = str(s.get("diffusion", ""))
@@ -1471,6 +1686,13 @@ class MainWindow(QMainWindow):
         self.sp_jpg_quality.setValue(int(s.get("jpg_quality", 92)))
         self.sp_webp_quality.setValue(int(s.get("webp_quality", 90)))
         self.chk_embed_meta.setChecked(bool(s.get("embed_metadata", True)))
+        # Per-preset Models/設定 memory (settings "preset_conf" JSON).
+        try:
+            pc = json.loads(str(s.get("preset_conf", "{}")))
+            self._preset_conf = pc if isinstance(pc, dict) else {}
+        except (ValueError, TypeError):
+            self._preset_conf = {}
+        self._active_preset = self._current_preset()
 
     def _connect_autosave(self) -> None:
         """Save whenever any persisted control changes."""
@@ -1500,8 +1722,11 @@ class MainWindow(QMainWindow):
         diffusion = (self.cb_diffusion.currentData()
                      if self._merge_selected()
                      else self.cb_diffusion.currentText())
+        # Keep the active preset's slot in sync with the widgets.
+        self._preset_conf[self._current_preset()] = self._collect_preset_conf()
         data = {
             "preset": self._current_preset(),
+            "preset_conf": json.dumps(self._preset_conf, ensure_ascii=False),
             "diffusion": str(diffusion),
             "vae": self.cb_vae.currentText(),
             "te1": self.cb_te1.currentText(),

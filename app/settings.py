@@ -16,7 +16,9 @@ except ModuleNotFoundError:  # Python 3.10
 
 DEFAULTS: dict[str, Any] = {
     # models
-    "preset": "all",   # all | anima | krea2 (filters the model dropdowns)
+    "preset": "",      # anima | krea2 | sdxl (空/旧 "all" は起動時に移行)
+    # 表示モデルごとの Models + 設定カテゴリの記憶 (JSON {preset: {...}})
+    "preset_conf": "{}",
     "diffusion": "",
     "vae": "",
     "te1": "",
@@ -45,6 +47,9 @@ DEFAULTS: dict[str, Any] = {
     "png_compress": 6,       # 0..9
     "jpg_quality": 92,       # 1..100
     "webp_quality": 90,      # 1..100
+    "embed_metadata": True,  # 画像にメタ情報（parameters/EXIF）を埋め込む
+    # XYZ プロットウィンドウの入力状態 (JSON)
+    "xyz": "{}",
 }
 
 
@@ -81,7 +86,12 @@ def _fmt(value: Any) -> str:
 
 
 def save(path: Path, data: dict[str, Any]) -> None:
-    """Write all known keys (stable order) as a flat TOML table."""
+    """Write all known keys (stable order) as a flat TOML table.
+
+    注意: DEFAULTS に無いキーは保存されない（allowlist 方式）。設定キーを
+    増やしたら必ず DEFAULTS にも追加すること — 忘れると UI 上は動くのに
+    再起動で消える、という分かりにくい不具合になる。
+    """
     lines = [
         "# scom 設定ファイル（変更すると自動保存されます）。",
         "# 起動時のプロンプト/ネガティブは prompts.csv の1個目の設定から読み込まれます。",

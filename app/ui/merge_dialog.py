@@ -18,8 +18,8 @@ from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QAction
 from PySide6.QtWidgets import (
     QCheckBox, QComboBox, QDialog, QDoubleSpinBox, QHBoxLayout, QInputDialog,
-    QLabel, QListWidget, QListWidgetItem, QMenu, QMessageBox, QPushButton,
-    QVBoxLayout, QWidget,
+    QLabel, QListWidget, QListWidgetItem, QMenu, QMessageBox, QProgressBar,
+    QPushButton, QVBoxLayout, QWidget,
 )
 
 from .widgets import WideComboBox
@@ -61,6 +61,17 @@ class MergeDialog(QDialog):
         root.addWidget(note)
         panes = QHBoxLayout()
         root.addLayout(panes, stretch=1)
+
+        # マージ実行中の進捗（メインウィンドウから set_merge_* で供給）。
+        # 非表示でも高さを確保する — 表示/非表示で最小サイズが変わると
+        # QWindowsWindow::setGeometry の警告が出るため（XYZ ウィンドウと同様）。
+        self.progress = QProgressBar()
+        self.progress.setTextVisible(True)
+        self.progress.setVisible(False)
+        sp = self.progress.sizePolicy()
+        sp.setRetainSizeWhenHidden(True)
+        self.progress.setSizePolicy(sp)
+        root.addWidget(self.progress)
 
         # ----- left pane: entry list --------------------------------------
         left = QVBoxLayout()
@@ -456,3 +467,20 @@ class MergeDialog(QDialog):
         entries, quant, low_memory = self._displayed_recipe()
         self.lst.setCurrentRow(0)  # switch to 新規作成 (makes pane editable)
         self._load_recipe(entries, quant, low_memory)
+
+    # ----- progress supplied by the main window ------------------------------
+    def set_merge_running(self, running: bool) -> None:
+        self.progress.setVisible(running)
+        if running:
+            # 最初の進捗イベントが届くまではビジー（不定）表示。
+            self.progress.setMaximum(0)
+            self.progress.setValue(0)
+
+    def set_merge_progress(self, value: int, maximum: int,
+                           note: str = "") -> None:
+        if not maximum:
+            return
+        self.progress.setVisible(True)
+        self.progress.setMaximum(maximum)
+        self.progress.setValue(value)
+        self.progress.setFormat(f"{note} {value}/{maximum}".strip())
