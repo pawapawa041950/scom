@@ -31,8 +31,7 @@ DEFAULTS: dict[str, Any] = {
     # merge_seq is the last id handed out (numbering never reuses ids).
     "merges": "[]",
     "merge_seq": 0,
-    # Applied LoRAs: JSON [[filename, strength], ...] (models/loras 内)
-    "loras": "[]",
+    # NOTE: 適用中の LoRA は意図的に永続化しない（毎回まっさらで起動）。
     # generation settings
     "width": 1024,
     "height": 1024,

@@ -27,6 +27,8 @@ ANIMA = "anima"
 KREA2 = "krea2"
 SDXL = "sdxl"
 SHARED = "shared"   # anima/krea2 共通（Qwen-Image VAE）。sdxl には含まれない。
+OTHER = "other"     # アーキテクチャは特定できたが、どのプリセットでも使えない
+                    # （SD1.x/SD2.x・Flux・Qwen-Image 20B などの LoRA）
 UNKNOWN = "unknown"
 
 # Refuse to allocate for an absurd/garbage header length.
@@ -65,10 +67,88 @@ def _param_count(h: dict, keys: list[str]) -> int:
     return total
 
 
+def _lora_in_features(h: dict, keys: list[str], *substrs: str) -> Optional[int]:
+    """in_features of the first LoRA down-projection matching all substrings.
+
+    kohya は ``<module>.lora_down.weight``、diffusers/PEFT は
+    ``<module>.lora_A.weight``。どちらも形状 [rank, in_features] なので、
+    接続先モジュールの入力次元がヘッダだけで分かる。キーは '.'→'_' 正規化
+    して照合する（kohya はモジュール名の '.' を '_' に潰すため）。
+    """
+    for k in keys:
+        norm = k.replace(".", "_")
+        if not (norm.endswith("_lora_down_weight")
+                or norm.endswith("_lora_A_weight")):
+            continue
+        if all(s in norm for s in substrs):
+            shape = h[k].get("shape") or []
+            if len(shape) == 2:
+                return shape[1]
+    return None
+
+
+def _classify_lora(h: dict, keys: list[str]) -> str:
+    """LoRA ファイルの対応系統をキー名+形状から判定する。
+
+    LoRA のキーには学習対象モジュールのパスがそのまま残る（kohya:
+    lora_unet_<path>_..., diffusers: transformer.<path>.lora_A.weight,
+    comfy: diffusion_model.<path>）ので、ベースモデルのアーキテクチャが
+    特定できる。判定できたが対応プリセットが無いものは OTHER（フィルタで
+    非表示）、構造を認識できないものは UNKNOWN（常に表示 = 安全側）。
+    """
+    norm_all = " ".join(k.replace(".", "_") for k in keys)
+
+    # krea2: txtfusion（ネイティブ名）/ text_fusion（diffusers 名）は固有。
+    if "txtfusion" in norm_all or "text_fusion" in norm_all:
+        return KREA2
+
+    # anima: blocks.N.cross_attn.q_proj（hidden 2048）と llm_adapter が固有。
+    if "cross_attn_q_proj" in norm_all or "llm_adapter" in norm_all:
+        d = _lora_in_features(h, keys, "cross_attn_q_proj")
+        if d is not None and d != 2048:
+            return OTHER  # cross_attn.q_proj を持つ別アーキテクチャ
+        return ANIMA
+
+    # SD-UNet（kohya の LDM 名 input_blocks / diffusers の down_blocks）。
+    # attn2（cross-attention）の入力次元が context dim: 2048=SDXL,
+    # 768=SD1.x, 1024=SD2.x。
+    if (any(m in norm_all for m in ("input_blocks", "output_blocks",
+                                    "middle_block"))
+            or ("down_blocks" in norm_all and "attentions" in norm_all)):
+        d = (_lora_in_features(h, keys, "attn2_to_k")
+             or _lora_in_features(h, keys, "attn2_to_v"))
+        if d == 2048:
+            return SDXL
+        if d is not None:
+            return OTHER  # SD1.x / SD2.x
+        # UNet 側に手掛かりなし（attn2 を学習していない LoRA）。
+        # SDXL だけが text encoder を2つ持つ。
+        return SDXL if "lora_te2" in norm_all else UNKNOWN
+
+    if "transformer_blocks" in norm_all:
+        # Qwen-Image (20B) / Flux(diffusers名): joint-attention の
+        # add_*_proj や img_mod/img_mlp。anima とは名前も次元も別物。
+        if any(m in norm_all for m in ("add_q_proj", "add_k_proj",
+                                       "img_mod", "img_mlp", "txt_mod")):
+            return OTHER
+        # krea2 (diffusers名) 固有の gate 付き attention/FF。
+        if "to_gate" in norm_all or "ff_gate" in norm_all:
+            return KREA2
+        return UNKNOWN
+
+    if "double_blocks" in norm_all or "single_blocks" in norm_all:
+        return OTHER  # Flux / HunyuanVideo 系（kohya 名）
+
+    return UNKNOWN
+
+
 def _classify_header(kind: str, h: dict) -> str:
     keys = [k for k in h if k != "__metadata__"]
     if not keys:
         return UNKNOWN
+
+    if kind == "loras":
+        return _classify_lora(h, keys)
 
     if kind == "vae":
         # kl-f8 (SD/SDXL) VAE: quant_conv / decoder.conv_in が特徴。
@@ -171,6 +251,43 @@ def sdxl_te_kind(path: Path) -> Optional[str]:
     if "clip_g" in n:
         return "clip_g"
     return None
+
+
+# path -> (size, mtime, has_vae, has_clip)
+_builtin_cache: dict[str, tuple[int, float, bool, bool]] = {}
+
+
+def builtin_components(path: Path) -> tuple[bool, bool]:
+    """(has_builtin_vae, has_builtin_clip) for a diffusion file.
+
+    Full SD/SDXL checkpoints bundle the VAE (``first_stage_model.*`` keys) and
+    the CLIP text encoders (``conditioner.*`` for SDXL / ``cond_stage_model.*``
+    for SD1.x). UNet-only diffusion files (anima/krea2 の Qwen-Image、split
+    SDXL の UNet 単体) carry neither. Header-only, cached by size+mtime."""
+    try:
+        st = path.stat()
+    except OSError:
+        return (False, False)
+    key = str(path)
+    c = _builtin_cache.get(key)
+    if c and c[0] == st.st_size and c[1] == st.st_mtime:
+        return (c[2], c[3])
+    has_vae = has_clip = False
+    if path.suffix.lower() == ".safetensors":
+        h = _read_header(path)
+        if h:
+            has_vae = any(k.startswith("first_stage_model.") for k in h)
+            has_clip = any(k.startswith(("conditioner.", "cond_stage_model."))
+                           for k in h)
+    _builtin_cache[key] = (st.st_size, st.st_mtime, has_vae, has_clip)
+    return (has_vae, has_clip)
+
+
+def is_checkpoint(path: Path) -> bool:
+    """True if ``path`` is a full checkpoint bundling both VAE and CLIP, so it
+    can be loaded via CheckpointLoaderSimple without separate VAE/TE files."""
+    has_vae, has_clip = builtin_components(path)
+    return has_vae and has_clip
 
 
 def family(kind: str, path: Path) -> str:

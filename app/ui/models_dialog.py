@@ -13,6 +13,7 @@ from PySide6.QtWidgets import (
 from .. import config
 from ..bootstrap import models as models_mod
 from .model_selector import ModelSelector
+from .window_state import bind_geometry
 
 
 def _fmt_progress(d: int, t: int) -> str:
@@ -58,6 +59,7 @@ class ModelsDialog(QDialog):
         super().__init__(parent)
         self.setWindowTitle("scom - モデル管理")
         self.resize(720, 560)
+        bind_geometry(self, "models")
         self._paths = paths
         self._thread: QThread | None = None
 
@@ -95,6 +97,8 @@ class ModelsDialog(QDialog):
         items = [m for m in self._selector.manifest if m.filename in sel]
         if not items:
             return
+        # 選んだファイルの進捗行だけを表示してから開始する。
+        self._selector.reveal_rows([m.filename for m in items])
         for m in items:
             self._selector.rows[m.filename].set_running(0.0, "待機中")
         self.btn_download.setEnabled(False)

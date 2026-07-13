@@ -3,26 +3,28 @@ from __future__ import annotations
 
 import json
 import random
+from pathlib import Path
 from typing import Optional
 
 from PySide6.QtCore import (
-    Qt, QThread, Signal, QObject, QRegularExpression, QTimer, QEvent,
+    Qt, QThread, Signal, QObject, QRegularExpression, QTimer, QEvent, QPoint,
 )
 from PySide6.QtCore import QUrl
 from PySide6.QtGui import (
-    QBrush, QColor, QDesktopServices, QImage, QPixmap,
-    QRegularExpressionValidator,
+    QBrush, QColor, QCursor, QDesktopServices, QImage, QPixmap,
+    QRegularExpressionValidator, QTextCharFormat, QTextCursor, QTextFormat,
 )
 from PySide6.QtWidgets import (
-    QApplication, QComboBox, QDoubleSpinBox, QFormLayout, QGridLayout,
-    QGroupBox, QHBoxLayout, QLabel, QLineEdit, QMainWindow, QMessageBox,
-    QPlainTextEdit, QProgressBar, QPushButton, QSizePolicy, QSpinBox,
-    QSplitter, QStackedWidget, QVBoxLayout, QWidget, QCheckBox,
+    QApplication, QComboBox, QDoubleSpinBox, QFormLayout, QFrame,
+    QGridLayout, QGroupBox, QHBoxLayout, QLabel, QLineEdit, QMainWindow,
+    QMessageBox, QPlainTextEdit, QProgressBar, QPushButton, QSizePolicy,
+    QSpinBox, QSplitter, QStackedWidget, QVBoxLayout, QWidget, QCheckBox,
 )
 
 from .. import config, settings, metadata, modelinfo, prompt_presets, xyz
+from .. import lora as lora_meta
 from . import ansi_log
-from .widgets import GrowingTextEdit, WideComboBox
+from .widgets import FlowLayout, GrowingTextEdit, WideComboBox
 from ..comfy_backend import ComfyBackend, BackendError, Progress
 from ..workflow import (
     GenParams, build_graph, build_merge_graph, merge_pin_key, merge_recipe,
@@ -30,6 +32,17 @@ from ..workflow import (
 )
 
 MAX_SEED = 2**63 - 1
+
+# LoRA トリガーワードをプロンプト欄に挿入したときの区別用マーキング。
+# 挿入した文字範囲に専用の文字書式（背景色 + token プロパティ）を付け、
+# 見た目（背景ハイライト）とロジック（token による区間追跡）の両方で
+# 元のプロンプトと区別する。token を持つ区間はユーザーが編集しても書式が
+# 残るので、編集後のワードごとまとめて削除できる。
+_LORA_TOKEN_PROP = QTextFormat.UserProperty + 17
+# 挿入部分の色（LoRA ウィンドウのトリガーワード表示に合わせた明るい配色）。
+# 暗色テーマだと本文の文字色が明るいので、明背景に合わせて文字色も濃色に。
+_LORA_INSERT_BG = QColor("#e7edf5")   # 明るい背景
+_LORA_INSERT_FG = QColor("#22456e")   # 濃い文字色
 
 # XYZ 軸 id -> その軸が支配する GenParams フィールド。モデル軸のプリセット
 # 適用時、軸で振っている値をプリセット設定で上書きしないための対応表。
@@ -188,6 +201,12 @@ class MainWindow(QMainWindow):
         # Applied LoRAs: [{"name": str, "strength": float}, ...] in chain order.
         self._loras: list[dict] = []
         self._lora_dlg = None  # non-modal LoraDialog (at most one)
+        # LoRA カードのホバーで出すトリガーワードのポップアップ（遅延生成）。
+        self._lora_popup = None
+        self._lora_pop_timer = QTimer(self)
+        self._lora_pop_timer.setSingleShot(True)
+        self._lora_pop_timer.setInterval(220)   # 離脱後この時間で閉じる
+        self._lora_pop_timer.timeout.connect(self._hide_lora_popup)
         # Per-preset (anima/krea2/sdxl) memory of the Models + 設定 values;
         # filled from settings in _apply_settings, kept fresh in _do_save.
         self._preset_conf: dict = {}
@@ -207,6 +226,7 @@ class MainWindow(QMainWindow):
         self.refresh_models()       # fill combos before applying saved selection
         self._reload_prompt_presets(quiet=True)
         self._apply_settings()
+        self._sync_builtin_for_diffusion()  # 復元した diffusion に内蔵チェックを追従
         self._loading = False
         self._connect_autosave()
 
@@ -337,6 +357,16 @@ class MainWindow(QMainWindow):
         self.cb_clip_type = WideComboBox()
         self.cb_clip_type.addItems(CLIP_TYPES_SINGLE)
 
+        # フルチェックポイント（VAE/CLIP 内蔵）を選んだときだけ有効。ON で内蔵の
+        # VAE/CLIP を使い、下の VAE / Text encoder 指定は無視する。
+        self.chk_builtin = QCheckBox("VAE / CLIP はモデル内蔵を使用（フルモデル）")
+        self.chk_builtin.setToolTip(
+            "SDXL のフルチェックポイントなど VAE/CLIP を内蔵するモデルで有効。"
+            "ON にすると内蔵の VAE/CLIP を使い、下の VAE / Text encoder / "
+            "CLIP type の指定は無視されます。")
+        self.chk_builtin.setEnabled(False)
+        self.chk_builtin.toggled.connect(self._on_builtin_toggled)
+
         # Picking a model auto-aligns the CLIP type / text encoder to its family
         # (e.g. a krea2 diffusion needs CLIP type 'krea2' + a Qwen3-VL encoder).
         self.cb_diffusion.currentTextChanged.connect(self._on_diffusion_changed)
@@ -354,32 +384,13 @@ class MainWindow(QMainWindow):
         btns = QWidget(); btns.setLayout(btn_row)
         btn_row.setContentsMargins(0, 0, 0, 0)
 
-        # LoRA: 選択はブラウザウィンドウで行い、適用中の一覧をここに出す。
-        self.btn_lora = QPushButton("LoRA選択…")
-        self.btn_lora.setToolTip(
-            "LoRA の一覧（サムネイル・トリガーワード付き）を開いて"
-            "適用する LoRA を選びます")
-        self.btn_lora.clicked.connect(self._open_lora_dialog)
-        lora_head = QHBoxLayout()
-        lora_head.setContentsMargins(0, 0, 0, 0)
-        lora_head.addWidget(self.btn_lora)
-        lora_head.addStretch(1)
-        lora_head_w = QWidget()
-        lora_head_w.setLayout(lora_head)
-        self._lora_rows_box = QVBoxLayout()
-        self._lora_rows_box.setContentsMargins(0, 0, 0, 0)
-        self._lora_rows_box.setSpacing(2)
-        lora_rows_w = QWidget()
-        lora_rows_w.setLayout(self._lora_rows_box)
-
         form.addRow("Diffusion:", self.cb_diffusion)
+        form.addRow("", self.chk_builtin)
         form.addRow("VAE:", self.cb_vae)
         form.addRow("Text encoder 1:", self.cb_te1)
         form.addRow("", self.chk_dual_te)
         form.addRow("Text encoder 2:", self.cb_te2)
         form.addRow("CLIP type:", self.cb_clip_type)
-        form.addRow("LoRA:", lora_head_w)
-        form.addRow("", lora_rows_w)
         # Single-widget row: spans the label column too, so the three buttons
         # get the group box's full width (their labels were getting clipped).
         form.addRow(btns)
@@ -396,6 +407,17 @@ class MainWindow(QMainWindow):
         self.txt_negative.setPlainText(DEFAULT_NEGATIVE)
         layout.addWidget(QLabel("Positive"))
         layout.addWidget(self.txt_prompt)
+        # LoRA（選択ボタン + 適用中チップ）。旧「LoRA」カテゴリをここへ移設。
+        self.btn_lora = QPushButton("LoRA選択…")
+        self.btn_lora.setToolTip(
+            "LoRA の一覧（サムネイル・トリガーワード付き）を開いて"
+            "適用する LoRA を選びます")
+        self.btn_lora.clicked.connect(self._open_lora_dialog)
+        lora_row = QWidget()
+        self._lora_flow = FlowLayout(lora_row, hspacing=6, vspacing=4)
+        self._lora_flow.setContentsMargins(0, 0, 0, 0)
+        self._lora_flow.addWidget(self.btn_lora)
+        layout.addWidget(lora_row)
         layout.addWidget(QLabel("Negative"))
         layout.addWidget(self.txt_negative)
 
@@ -426,6 +448,9 @@ class MainWindow(QMainWindow):
         # Shift+Enter in either prompt field starts generation.
         self.txt_prompt.installEventFilter(self)
         self.txt_negative.installEventFilter(self)
+        # ユーザーが挿入済みハイライトを手で消したときも LoRA 窓の表示を追従。
+        self.txt_prompt.textChanged.connect(self._push_lora_inserted)
+        self.txt_negative.textChanged.connect(self._push_lora_inserted)
         return box
 
     def _build_settings_box(self) -> QGroupBox:
@@ -663,12 +688,52 @@ class MainWindow(QMainWindow):
                 return True
         return False
 
+    def _diffusion_is_checkpoint(self) -> bool:
+        """選択中の diffusion が VAE/CLIP 内蔵のフルチェックポイントか。"""
+        if self._merge_selected():
+            return False
+        name = self.cb_diffusion.currentText().strip()
+        if not name:
+            return False
+        return modelinfo.is_checkpoint(
+            config.models_root() / "diffusion_models" / name)
+
+    def _use_builtin(self) -> bool:
+        return self.chk_builtin.isEnabled() and self.chk_builtin.isChecked()
+
+    def _apply_builtin_enabled(self) -> None:
+        """内蔵利用中は VAE/TE/CLIP 指定を触れなくする（無視されるため）。"""
+        builtin = self._use_builtin()
+        for w in (self.cb_vae, self.cb_te1, self.cb_te2,
+                  self.cb_clip_type, self.chk_dual_te):
+            w.setEnabled(not builtin)
+        if not builtin:
+            self.cb_te2.setEnabled(self.chk_dual_te.isChecked())
+
+    def _sync_builtin_for_diffusion(self) -> None:
+        """diffusion 選択に合わせて内蔵チェックの有効/既定を更新する。フル
+        チェックポイントなら有効化して既定ON（＝内蔵を使う）。"""
+        is_ckpt = self._diffusion_is_checkpoint()
+        self.chk_builtin.blockSignals(True)
+        self.chk_builtin.setEnabled(is_ckpt)
+        self.chk_builtin.setChecked(is_ckpt)
+        self.chk_builtin.blockSignals(False)
+        self._apply_builtin_enabled()
+
+    def _on_builtin_toggled(self, _checked: bool) -> None:
+        self._apply_builtin_enabled()
+        self._schedule_save()
+
     def _on_diffusion_changed(self, name: str) -> None:
         """Auto-align CLIP type / text encoder to the selected model's family."""
-        if self._merge_selected():
-            return  # the merge recipe decides family; nothing to auto-align
         if self._loading:
             return  # honor saved settings on startup; only react to user picks
+        # マージ/チェックポイントを含めて内蔵チェックの状態を先に反映する。
+        self._sync_builtin_for_diffusion()
+        if self._merge_selected():
+            return  # the merge recipe decides family; nothing to auto-align
+        if self._diffusion_is_checkpoint():
+            return  # 内蔵 VAE/CLIP を使うので系統整列(clip_l/clip_g等)は不要
         fam = self._diffusion_family(name)
         if fam == "sdxl":
             # SDXL requires dual TE (clip_l + clip_g) + CLIP type 'sdxl'
@@ -755,6 +820,9 @@ class MainWindow(QMainWindow):
     def _config_warning(self, params: GenParams) -> Optional[str]:
         """Family-mismatch pre-flight: returns a message when the current
         model needs a different TE/CLIP/VAE configuration."""
+        # フルチェックポイントで内蔵 VAE/CLIP を使う場合は検証不要。
+        if params.checkpoint and not params.vae and not params.te:
+            return None
         return (self._krea2_config_warning(params)
                 or self._sdxl_config_warning(params))
 
@@ -1067,9 +1135,10 @@ class MainWindow(QMainWindow):
                          self._current_preset, None)
         dlg.apply_requested.connect(self._on_lora_apply)
         dlg.remove_requested.connect(self._on_lora_remove)
-        dlg.insert_prompt_requested.connect(self._on_lora_insert_prompt)
+        dlg.toggle_prompt_requested.connect(self._on_lora_toggle_prompt)
         self._lora_dlg = dlg
         self._push_lora_state()
+        self._push_lora_inserted()
         dlg.show()
 
     def _push_lora_state(self) -> None:
@@ -1110,46 +1179,239 @@ class MainWindow(QMainWindow):
         self._push_lora_state()
         self._schedule_save()
 
-    def _on_lora_insert_prompt(self, word: str) -> None:
-        """トリガーワードをプロンプト欄の末尾に追記（重複は追加しない）。"""
-        current = self.txt_prompt.toPlainText()
-        if word in current:
+    def _on_lora_toggle_prompt(self, token: str, negative: bool,
+                               text: str) -> None:
+        """LoRA のトリガーワードをトグルする。未挿入なら挿入（区別マーク付き）、
+        挿入済みなら（ユーザー編集後でも）その区間ごと削除する。"""
+        field = self.txt_negative if negative else self.txt_prompt
+        regions = self._find_token_regions(field, token)
+        if regions:
+            self._remove_token_regions(field, regions)
+        else:
+            self._insert_token_words(field, token, text)
+        self._push_lora_inserted()
+
+    @staticmethod
+    def _plain_char_format() -> QTextCharFormat:
+        """token を持たない通常書式（区切りや以降の入力がハイライトされない
+        ようにするため）。"""
+        fmt = QTextCharFormat()
+        fmt.clearBackground()
+        return fmt
+
+    def _token_char_format(self, token: str) -> QTextCharFormat:
+        fmt = QTextCharFormat()
+        fmt.setBackground(_LORA_INSERT_BG)
+        fmt.setForeground(_LORA_INSERT_FG)
+        fmt.setProperty(_LORA_TOKEN_PROP, token)
+        return fmt
+
+    @staticmethod
+    def _find_token_regions(field, token: str) -> list[tuple[int, int]]:
+        """指定 token の文字書式を持つ連続区間 (start, end) を左から順に返す。
+        内部編集でフラグメントが分割されていても隣接分は1区間に統合する。"""
+        doc = field.document()
+        frags: list[tuple[int, int]] = []
+        block = doc.begin()
+        while block != doc.end():
+            it = block.begin()
+            while not it.atEnd():
+                frag = it.fragment()
+                if frag.isValid() and \
+                        frag.charFormat().property(_LORA_TOKEN_PROP) == token:
+                    start = frag.position()
+                    frags.append((start, start + frag.length()))
+                it += 1
+            block = block.next()
+        frags.sort()
+        regions: list[tuple[int, int]] = []
+        for s, e in frags:
+            if regions and s <= regions[-1][1]:
+                regions[-1] = (regions[-1][0], max(regions[-1][1], e))
+            else:
+                regions.append((s, e))
+        return regions
+
+    def _remove_token_regions(self, field,
+                              regions: list[tuple[int, int]]) -> None:
+        """token 区間を削除する。区間に隣接する区切り ", " も1つ巻き込んで
+        取り除き、", ," や先頭/末尾の ", " が残らないようにする。位置ズレを
+        避けるため右端の区間から削除する。"""
+        text = field.toPlainText()
+        cursor = field.textCursor()
+        for start, end in sorted(regions, reverse=True):
+            s, e = start, end
+            if text[s - 2:s] == ", ":       # 直前の区切りを巻き込む
+                s -= 2
+            elif text[e:e + 2] == ", ":     # 先頭要素なら直後の区切りを
+                e += 2
+            cursor.setPosition(s)
+            cursor.setPosition(e, QTextCursor.KeepAnchor)
+            cursor.removeSelectedText()
+        field.setCurrentCharFormat(self._plain_char_format())
+
+    def _insert_token_words(self, field, token: str, text: str) -> None:
+        """欄末尾に、区別マーク付きでワードを追記する。"""
+        words = [w.strip() for w in text.split(",") if w.strip()]
+        if not words:
             return
-        text = current.rstrip()
-        self.txt_prompt.setPlainText(
-            (text + ", " + word) if text else word)
+        joined = ", ".join(words)
+        full = field.toPlainText()
+        stripped = full.rstrip()
+        cursor = field.textCursor()
+        # 末尾の余分な空白を除いてから追記する。
+        cursor.setPosition(len(stripped))
+        cursor.movePosition(QTextCursor.End, QTextCursor.KeepAnchor)
+        cursor.removeSelectedText()
+        if stripped:
+            cursor.insertText(", ", self._plain_char_format())
+        cursor.insertText(joined, self._token_char_format(token))
+        field.setTextCursor(cursor)
+        # 続けて入力してもハイライトされないよう書式を通常へ戻す。
+        field.setCurrentCharFormat(self._plain_char_format())
+
+    def _active_lora_tokens(self) -> set[str]:
+        """両プロンプト欄に現在挿入されている LoRA トリガーワードの token 集合。"""
+        tokens: set[str] = set()
+        for field in (self.txt_prompt, self.txt_negative):
+            doc = field.document()
+            block = doc.begin()
+            while block != doc.end():
+                it = block.begin()
+                while not it.atEnd():
+                    frag = it.fragment()
+                    if frag.isValid():
+                        tok = frag.charFormat().property(_LORA_TOKEN_PROP)
+                        if tok:
+                            tokens.add(str(tok))
+                    it += 1
+                block = block.next()
+        return tokens
+
+    def _push_lora_inserted(self) -> None:
+        """挿入済み token を LoRA ウィンドウ・カードのポップアップへ通知
+        （リンクの挿入済みハイライト更新用）。"""
+        tokens = self._active_lora_tokens()
+        if self._lora_dlg is not None:
+            try:
+                self._lora_dlg.set_inserted(tokens)
+            except RuntimeError:
+                self._lora_dlg = None
+        if self._lora_popup is not None and self._lora_popup.isVisible():
+            self._lora_popup.set_active(tokens)
+
+    # ----- LoRA card hover popup -------------------------------------------
+    def _ensure_lora_popup(self):
+        if self._lora_popup is None:
+            from .lora_dialog import TriggerWordsPopup
+            self._lora_popup = TriggerWordsPopup(self)
+            self._lora_popup.toggle_requested.connect(self._on_lora_toggle_prompt)
+            self._lora_popup.hover_changed.connect(self._on_lora_popup_hover)
+        return self._lora_popup
+
+    def _show_lora_popup(self, relname: str, anchor) -> None:
+        pos, neg = lora_meta.effective_trigger_words(
+            relname, config.models_root() / "loras",
+            self.paths.user_data / "lora_cache")
+        popup = self._ensure_lora_popup()
+        popup.set_content(relname, pos, neg, self._active_lora_tokens())
+        if not popup.has_words():        # トリガーワードが無ければ出さない
+            popup.hide()
+            return
+        self._lora_pop_timer.stop()
+        self._lora_pop_anchor = anchor
+        # サイズは set_content で確定済み。画面内に収まる位置へクランプする
+        # （はみ出すと OS 側で再配置され、setGeometry 警告の原因になる）。
+        below = anchor.mapToGlobal(QPoint(0, anchor.height() + 2))
+        screen = (anchor.screen() or self.screen()).availableGeometry()
+        y = below.y()
+        if y + popup.height() - 1 > screen.bottom():
+            # 下にはみ出すならアンカーの上側へ回す。
+            y = anchor.mapToGlobal(QPoint(0, 0)).y() - popup.height() - 2
+        # 最終的に画面内へ確実に収める（上下・左右とも）。
+        x = max(screen.left(),
+                min(below.x(), screen.right() - popup.width() + 1))
+        y = max(screen.top(), min(y, screen.bottom() - popup.height() + 1))
+        popup.move(x, y)
+        popup.show()
+        popup.raise_()
+
+    def _on_lora_popup_hover(self, over: bool) -> None:
+        # ポップアップ上にマウスがある間は閉じない。離れたら猶予後に閉じる。
+        if over:
+            self._lora_pop_timer.stop()
+        else:
+            self._lora_pop_timer.start()
+
+    def _hide_lora_popup(self, force: bool = False) -> None:
+        """カーソルがまだカード or ポップアップ上にあれば閉じない（チップの
+        子ウィジェット＝強度スピン等の上でも Leave が飛ぶため、実際の位置で
+        判定する）。force=True は無条件で閉じる（チップ再構築時など）。"""
+        if self._lora_popup is None or not self._lora_popup.isVisible():
+            return
+        if not force:
+            gp = QCursor.pos()
+            for w in (self._lora_popup, getattr(self, "_lora_pop_anchor", None)):
+                try:
+                    if (w is not None and w.isVisible()
+                            and w.rect().contains(w.mapFromGlobal(gp))):
+                        self._lora_pop_timer.start()   # まだ上にある → 保持
+                        return
+                except RuntimeError:
+                    pass                               # チップが破棄済み
+        self._lora_popup.hide()
+        self._lora_pop_anchor = None
 
     def _rebuild_lora_rows(self) -> None:
-        """Rebuild the applied-LoRA rows under the LoRA button."""
-        while self._lora_rows_box.count():
-            item = self._lora_rows_box.takeAt(0)
+        """Rebuild the applied-LoRA chips after the LoRA button (flow layout;
+        index 0 is the button itself)."""
+        self._hide_lora_popup(force=True)
+        while self._lora_flow.count() > 1:
+            item = self._lora_flow.takeAt(1)
             w = item.widget()
             if w is not None:
                 w.deleteLater()
         for e in self._loras:
             name = e["name"]
-            row = QWidget()
-            h = QHBoxLayout(row)
-            h.setContentsMargins(0, 0, 0, 0)
+            chip = QFrame()
+            chip.setObjectName("loraChip")
+            chip.setStyleSheet(
+                "#loraChip { border: 1px solid #666; border-radius: 4px; }")
+            # ホバーでトリガーワードのポップアップを出す（Enter/Leave を監視）。
+            # _lora_chip は常にポップアップの位置基準（子から入っても同じ場所）。
+            chip._lora_name = name
+            chip._lora_chip = chip
+            chip.installEventFilter(self)
+            h = QHBoxLayout(chip)
+            h.setContentsMargins(6, 1, 4, 1)
+            h.setSpacing(4)
             trash = QPushButton("🗑")
-            trash.setFixedWidth(28)
+            trash.setFixedWidth(24)
+            trash.setFlat(True)
             trash.setToolTip("この LoRA を解除")
             trash.clicked.connect(
                 lambda *_a, n=name: self._on_lora_remove(n))
-            lbl = QLabel(name)
+            lbl = QLabel(Path(name).stem)
             lbl.setToolTip(name)
             spin = QDoubleSpinBox()
             spin.setRange(-4.0, 4.0)
             spin.setDecimals(2)
             spin.setSingleStep(0.05)
             spin.setValue(float(e["strength"]))
+            spin.setFixedWidth(64)
             spin.setToolTip("LoRA の適用強度（model / clip 共通）")
             spin.valueChanged.connect(
                 lambda v, n=name: self._on_lora_strength_changed(n, v))
             h.addWidget(trash)
-            h.addWidget(lbl, stretch=1)
+            h.addWidget(lbl)
             h.addWidget(spin)
-            self._lora_rows_box.addWidget(row)
+            # 子ウィジェットに直接カーソルが入ってもポップアップが出るように
+            # 同じ監視をぶら下げる（Enter はカーソル直下のウィジェットに届く）。
+            for child in (trash, lbl, spin):
+                child._lora_name = name
+                child._lora_chip = chip
+                child.installEventFilter(self)
+            self._lora_flow.addWidget(chip)
 
     # ----- XYZ plot ---------------------------------------------------------
     def _open_xyz_dialog(self) -> None:
@@ -1354,7 +1616,7 @@ class MainWindow(QMainWindow):
                 raise ValueError(
                     f"モデル軸のマージモデル「{name}」が見つかりません"
                     "（削除または名前変更されていませんか）")
-            p = replace(p, diffusion="",
+            p = replace(p, diffusion="", checkpoint=False,
                         merge_models=[(str(n), float(w))
                                       for n, w in entry["models"]],
                         merge_quant=str(entry["quant"]),
@@ -1362,6 +1624,14 @@ class MainWindow(QMainWindow):
             fam = self._merge_family(entry)
         else:
             fam = self._diffusion_family(p.diffusion)
+            # フルチェックポイント（VAE/CLIP 内蔵）はセルでも内蔵を使う。
+            # TE/VAE の系統整列は不要（むしろ内蔵を上書きしてしまう）。
+            if p.diffusion and modelinfo.is_checkpoint(
+                    config.models_root() / "diffusion_models" / p.diffusion):
+                return replace(p, checkpoint=True, vae="", te=[])
+            # 非チェックポイントのセルは内蔵フラグを必ず落とす（基準 p が
+            # チェックポイントでも、このセルは分割ロードで整列する）。
+            p = replace(p, checkpoint=False)
 
         conf = confs.get(fam) if fam in ("anima", "krea2", "sdxl") else None
         if conf:
@@ -1649,6 +1919,7 @@ class MainWindow(QMainWindow):
                 self._select_preset_defaults(preset)
         finally:
             self._loading = prev_loading
+        self._sync_builtin_for_diffusion()  # 新 diffusion に内蔵チェックを追従
         if not self.cb_diffusion.count():
             self.append_log(
                 f"{preset} のモデルが見つかりません。"
@@ -1811,15 +2082,8 @@ class MainWindow(QMainWindow):
         self.sp_jpg_quality.setValue(int(s.get("jpg_quality", 92)))
         self.sp_webp_quality.setValue(int(s.get("webp_quality", 90)))
         self.chk_embed_meta.setChecked(bool(s.get("embed_metadata", True)))
-        # Applied LoRAs ("loras" JSON [[name, strength], ...]). Files that
-        # have since disappeared are kept (they may come back; generation
-        # would surface a clear backend error otherwise).
-        try:
-            raw = json.loads(str(s.get("loras", "[]")))
-            self._loras = [{"name": str(n), "strength": float(w)}
-                           for n, w in raw if str(n)]
-        except (ValueError, TypeError):
-            self._loras = []
+        # Applied LoRAs は永続化しない（毎回まっさらで起動する仕様）。
+        self._loras = []
         self._rebuild_lora_rows()
         # Per-preset Models/設定 memory (settings "preset_conf" JSON).
         try:
@@ -1874,9 +2138,6 @@ class MainWindow(QMainWindow):
                   "quant": e["quant"], "low_memory": e["low_memory"]}
                  for e in self._merges], ensure_ascii=False),
             "merge_seq": int(self._merge_seq),
-            "loras": json.dumps(
-                [[e["name"], float(e["strength"])] for e in self._loras],
-                ensure_ascii=False),
             "width": self.sp_width.value(),
             "height": self.sp_height.value(),
             "steps": self.sp_steps.value(),
@@ -1944,13 +2205,19 @@ class MainWindow(QMainWindow):
 
         entry = self._selected_merge_entry()
         self._last_merge_id = int(entry["id"]) if entry else None
+        # フルチェックポイントで内蔵 ON のときは VAE/TE を空にして内蔵を使う。
+        checkpoint = entry is None and self._diffusion_is_checkpoint()
+        use_builtin = checkpoint and self.chk_builtin.isChecked()
+        vae = "" if use_builtin else self.cb_vae.currentText().strip()
+        te_list = [] if use_builtin else [t for t in te if t]
         return GenParams(
             diffusion="" if entry else self.cb_diffusion.currentText().strip(),
+            checkpoint=checkpoint,
             merge_models=list(entry["models"]) if entry else [],
             merge_quant=entry["quant"] if entry else "",
             merge_low_memory=entry["low_memory"] if entry else False,
-            vae=self.cb_vae.currentText().strip(),
-            te=[t for t in te if t],
+            vae=vae,
+            te=te_list,
             clip_type=self.cb_clip_type.currentText(),
             loras=[(e["name"], float(e["strength"])) for e in self._loras],
             prompt=self.txt_prompt.toPlainText(),
@@ -2025,6 +2292,13 @@ class MainWindow(QMainWindow):
                 and event.modifiers() & Qt.ShiftModifier):
             self.on_generate()
             return True
+        # LoRA チップのホバーでトリガーワードのポップアップを開閉する。
+        name = getattr(obj, "_lora_name", None)
+        if name is not None:
+            if event.type() == QEvent.Enter:
+                self._show_lora_popup(name, getattr(obj, "_lora_chip", obj))
+            elif event.type() == QEvent.Leave:
+                self._lora_pop_timer.start()   # 猶予後に閉じる（保持判定つき）
         return super().eventFilter(obj, event)
 
     def on_generate(self) -> None:
@@ -2178,8 +2452,17 @@ class MainWindow(QMainWindow):
                 model_name += f" {p.merge_quant}"
         else:
             model_name = p.diffusion
+        # webui 互換: メタデータ上のプロンプトには適用中 LoRA を
+        # <lora:名前:強度> タグとして末尾に入れ込む（生成に使う実際の
+        # プロンプトには含まれない — 適用は LoraLoader ノードで行う）。
+        prompt_meta = p.prompt
+        if p.loras:
+            tags = " ".join(f"<lora:{Path(n).stem}:{w:g}>"
+                            for n, w in p.loras)
+            body = prompt_meta.rstrip()
+            prompt_meta = (body + ", " + tags) if body.strip() else tags
         meta = {
-            "prompt": p.prompt,
+            "prompt": prompt_meta,
             "negative": p.negative,
             "steps": p.steps,
             "sampler": p.sampler,
@@ -2197,6 +2480,17 @@ class MainWindow(QMainWindow):
         }
         if p.loras:
             meta["loras"] = ", ".join(f"{n}:{w:g}" for n, w in p.loras)
+            # webui の "Lora hashes" フィールド（AutoV2 = SHA256 先頭10桁）。
+            # ハッシュは LoRA ブラウザが計算・キャッシュ済みのものだけ使う
+            # （ここで数GBのハッシュ計算を始めない）。
+            cache = lora_meta.LoraCache(self.paths.user_data / "lora_cache")
+            hashes = []
+            for n, _w in p.loras:
+                e = cache.lookup(n, config.models_root() / "loras" / n)
+                if e and e.get("sha256"):
+                    hashes.append(f"{Path(n).stem}: {e['sha256'][:10]}")
+            if hashes:
+                meta["lora_hashes"] = ", ".join(hashes)
         params_text = metadata.build_parameters(meta)
         return params_text, {"app": "scom", **meta}
 

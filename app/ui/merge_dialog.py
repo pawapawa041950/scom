@@ -23,6 +23,7 @@ from PySide6.QtWidgets import (
 )
 
 from .widgets import WideComboBox
+from .window_state import bind_geometry
 
 # Returns "anima" | "krea2" | "shared" | "unknown" for a diffusion file name.
 FamilyFn = Callable[[str], str]
@@ -47,6 +48,7 @@ class MergeDialog(QDialog):
         super().__init__(parent)
         self.setWindowTitle("モデルマージ")
         self.setMinimumWidth(780)
+        bind_geometry(self, "merge")
         self._models = list(models)
         self._family = family_fn
         self._model_dir = model_dir

@@ -58,6 +58,9 @@ def write_extra_model_paths(paths: config.AppPaths) -> Path:
         f"  base_path: {models.as_posix()}\n"
         "  is_default: true\n"
         "  diffusion_models: diffusion_models/\n"
+        # フルチェックポイント（VAE/CLIP 内蔵）を CheckpointLoaderSimple から
+        # 読めるよう、同じ diffusion_models フォルダを checkpoints にも割り当てる。
+        "  checkpoints: diffusion_models/\n"
         "  vae: vae/\n"
         "  text_encoders: text_encoders/\n"
         "  loras: loras/\n"

@@ -65,6 +65,7 @@ DEFAULT_MODELS: list[ModelFile] = [
     # Turbo: 8-step distilled. nvfp4 is the smallest; bf16 the highest quality.
     _krea("diffusion_models", "krea2_turbo_nvfp4.safetensors", 7_673_668_288),
     _krea("diffusion_models", "krea2_turbo_fp8_scaled.safetensors", 13_141_730_784),
+    _krea("diffusion_models", "krea2_turbo_int8_convrot.safetensors", 13_492_686_496),
     _krea("diffusion_models", "krea2_turbo_mxfp8.safetensors", 13_532_318_080),
     _krea("diffusion_models", "krea2_turbo_bf16.safetensors", 26_283_332_608),
     # Raw/Base: full-step (~52) model, higher fidelity, slower.
@@ -73,6 +74,15 @@ DEFAULT_MODELS: list[ModelFile] = [
     # Krea-2 text encoder (Qwen3-VL 4B). Use CLIP type "krea2".
     _krea("text_encoders", "qwen3vl_4b_fp8_scaled.safetensors", 5_242_467_968),
     _krea("text_encoders", "qwen3vl_4b_bf16.safetensors", 8_875_719_384),
+
+    # --- SDXL (WAI-illustrious-SDXL preset) ----------------------------------
+    # フル SDXL チェックポイント（VAE/CLIP 内蔵）。CheckpointLoaderSimple で読み、
+    # 内蔵の VAE/CLIP を使うので VAE/TE は別途ダウンロードしない。civitai の
+    # 最新版 (v17.0)。size=0: civitai の申告サイズと実バイトがずれると検証で
+    # 失敗するため、Content-Length に任せる。
+    ModelFile("diffusion_models", "waiIllustriousSDXL_v170.safetensors",
+              "https://civitai.com/api/download/models/2883731",
+              0, required=False),
 ]
 
 

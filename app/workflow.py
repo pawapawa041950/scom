@@ -45,6 +45,10 @@ DEFAULT_NEGATIVE = (
 class GenParams:
     diffusion: str
     vae: str
+    # True when ``diffusion`` is a full checkpoint (bundling VAE+CLIP): it is
+    # loaded via CheckpointLoaderSimple and, when ``vae``/``te`` are empty, its
+    # built-in VAE / CLIP are used. False -> UNETLoader + separate VAE/CLIP.
+    checkpoint: bool = False
     # Optional model merge: [(filename, weight), ...]. When non-empty the
     # diffusion model comes from the ScomMergeModel custom node (weighted
     # average materialized in RAM; see app/comfy_custom_nodes.py) and
@@ -132,29 +136,47 @@ def build_merge_graph(merge_models: list[tuple[str, float]], quant: str = "",
 def build_graph(p: GenParams) -> dict:
     """Return a ComfyUI API-format prompt graph for the given parameters."""
     merging = len(p.merge_models) >= 1
+    ckpt = p.checkpoint and not merging   # full checkpoint w/ built-in VAE+CLIP
     if not merging and not p.diffusion:
         raise ValueError("diffusion model is required")
-    if not p.vae:
-        raise ValueError("vae model is required")
-    if not p.te:
-        raise ValueError("at least one text encoder (te) is required")
+    # A full checkpoint supplies VAE/CLIP itself, so they may be empty. A
+    # UNet-only diffusion (anima/krea2 等) still requires them.
+    if not ckpt:
+        if not p.vae:
+            raise ValueError("vae model is required")
+        if not p.te:
+            raise ValueError("at least one text encoder (te) is required")
 
     graph: dict[str, dict] = {}
 
+    # Node "4": the model source. CheckpointLoaderSimple outputs
+    # (MODEL=0, CLIP=1, VAE=2); UNETLoader / merge output MODEL=0 only.
+    clip_builtin = vae_builtin = None
     if merging:
         _validate_merge(p.merge_models, p.merge_quant)
         graph["4"] = _merge_node(p.merge_models, p.merge_quant,
                                  p.merge_low_memory)
+    elif ckpt:
+        graph["4"] = {
+            "class_type": "CheckpointLoaderSimple",
+            "inputs": {"ckpt_name": p.diffusion},
+        }
+        clip_builtin = ["4", 1]
+        vae_builtin = ["4", 2]
     else:
         graph["4"] = {
             "class_type": "UNETLoader",
             "inputs": {"unet_name": p.diffusion, "weight_dtype": p.weight_dtype},
         }
-    graph["5"] = {
-        "class_type": "VAELoader",
-        "inputs": {"vae_name": p.vae},
-    }
 
+    # VAE: explicit VAELoader when a file is given, else the checkpoint's built-in.
+    if p.vae:
+        graph["5"] = {"class_type": "VAELoader", "inputs": {"vae_name": p.vae}}
+        vae_src: list = ["5", 0]
+    else:
+        vae_src = vae_builtin
+
+    # CLIP: explicit (Dual)CLIPLoader when TEs are given, else the built-in.
     if len(p.te) >= 2:
         graph["6"] = {
             "class_type": "DualCLIPLoader",
@@ -164,16 +186,19 @@ def build_graph(p: GenParams) -> dict:
                 "type": p.clip_type,
             },
         }
-    else:
+        clip_src: list = ["6", 0]
+    elif len(p.te) == 1:
         graph["6"] = {
             "class_type": "CLIPLoader",
             "inputs": {"clip_name": p.te[0], "type": p.clip_type},
         }
+        clip_src = ["6", 0]
+    else:
+        clip_src = clip_builtin
 
     # LoRA chain: model/clip flow through LoraLoader nodes in applied order.
     # Node ids start at 20 to stay clear of the fixed 4-12 range.
     model_src: list = ["4", 0]
-    clip_src: list = ["6", 0]
     for i, (lora_name, strength) in enumerate(p.loras):
         if not lora_name:
             raise ValueError("LoRA のファイル名が空です")
@@ -224,7 +249,7 @@ def build_graph(p: GenParams) -> dict:
     }
     graph["11"] = {
         "class_type": "VAEDecode",
-        "inputs": {"samples": ["10", 0], "vae": ["5", 0]},
+        "inputs": {"samples": ["10", 0], "vae": vae_src},
     }
     # PreviewImage writes to ComfyUI's temp dir (throwaway). The app saves the
     # real, format/quality-controlled file to output/ from the returned bytes.

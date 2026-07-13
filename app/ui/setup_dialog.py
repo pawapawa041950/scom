@@ -18,6 +18,7 @@ from ..bootstrap.setup import FirstRunSetup, StepUpdate, FIXED_STEPS
 from . import ansi_log
 from .model_selector import ModelSelector
 from .widgets import ProgressRow
+from .window_state import bind_geometry
 
 
 class _SetupWorker(QObject):
@@ -54,6 +55,7 @@ class SetupDialog(QDialog):
         self.setWindowTitle("scom - 初回セットアップ")
         self.setModal(True)
         self.resize(720, 560)
+        bind_geometry(self, "setup")
         self._setup = setup
         self._paths = setup.paths
         self._rows: dict[str, ProgressRow] = {}

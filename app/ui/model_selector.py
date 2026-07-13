@@ -22,14 +22,20 @@ PRESET_ANIMA = [
     "qwen_image_vae.safetensors",
     "qwen_3_06b_base.safetensors",
 ]
-PRESET_KREA2_FP8 = [
-    "krea2_turbo_mxfp8.safetensors",
+PRESET_KREA2 = [
+    "krea2_turbo_int8_convrot.safetensors",
     "qwen_image_vae.safetensors",
     "qwen3vl_4b_fp8_scaled.safetensors",
 ]
+# WAI はフル SDXL チェックポイント（VAE/CLIP 内蔵）なので本体のみ。VAE/CLIP は
+# モデル内蔵を使うため別途ダウンロードしない。
+PRESET_SDXL = [
+    "waiIllustriousSDXL_v170.safetensors",
+]
 QUICK_PRESETS = [
-    ("anima 必須モデル", PRESET_ANIMA),
-    ("krea2 必須モデル fp8 (24GB VRAM目安)", PRESET_KREA2_FP8),
+    ("Anima 必須モデル", PRESET_ANIMA),
+    ("Krea2 必須モデル int8convrot", PRESET_KREA2),
+    ("SDXL WAI-illustrious-SDXL 必須モデル", PRESET_SDXL),
 ]
 
 
@@ -73,45 +79,61 @@ class ModelSelector(QWidget):
             self._quick.append((qcb, fileset))
         layout.addWidget(quick)
 
-        box = QGroupBox("Models")
-        self._box_layout = QVBoxLayout(box)
+        # 個別選択リストは廃止。選択の実体（self.checks）だけを作り、UI には
+        # 出さない。ダウンロード進捗はクイック選択で選んだファイルの行だけを
+        # reveal_rows() で下の進捗エリアに出す（with_progress の場合）。
         self._populate()
-        scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
-        scroll.setWidget(box)
-        layout.addWidget(scroll, stretch=1)
+        if with_progress:
+            box = QGroupBox("ダウンロード進捗")
+            self._progress_layout = QVBoxLayout(box)
+            self._progress_layout.addStretch(1)
+            scroll = QScrollArea()
+            scroll.setWidgetResizable(True)
+            scroll.setWidget(box)
+            layout.addWidget(scroll, stretch=1)
+        else:
+            layout.addStretch(1)
 
     def _is_present(self, m) -> bool:
         p = models_mod.target_path(self._paths, m)
         return p.exists() and (not m.size or p.stat().st_size == m.size)
 
     def _populate(self) -> None:
+        """Build the (hidden) selection state for every manifest file. Nothing
+        is shown individually anymore — the quick-select presets drive which
+        files are ticked, and download progress is shown per-file via
+        ``reveal_rows`` when a download starts."""
         for m in self.manifest:
             present = self._is_present(m)
             tag = "必須" if m.required else "任意"
             label = f"{m.filename}   [{m.kind}, {fmt_size(m.size)}, {tag}]"
-            # With progress, the checkbox and its bar share one line (ModelRow);
-            # otherwise it's just a checkbox.
             if self._with_progress:
-                # Status column shows "ダウンロード済み"; don't repeat it in the
-                # checkbox text (it would show twice when the window is wide).
+                # ModelRow (checkbox + status column) is the download progress
+                # row; it is added to the progress area only when selected.
                 row = ModelRow(label)
                 cb = row.check
                 if present:
                     cb.setEnabled(False)
                     row.set_skipped("ダウンロード済み")
                 self.rows[m.filename] = row
-                self._box_layout.addWidget(row)
             else:
-                # No status column here, so mark the checkbox text instead.
                 cb = QCheckBox(label)
                 if present:
                     cb.setEnabled(False)
-                    cb.setText(label + "  ✓ ダウンロード済み")
-                # nothing pre-selected; user opts in
             self.checks[m.filename] = cb
-            if not self._with_progress:
-                self._box_layout.addWidget(cb)
+
+    def reveal_rows(self, filenames: list) -> None:
+        """ダウンロード対象に選ばれたファイルの進捗行だけを進捗エリアに出す。"""
+        if not self._with_progress:
+            return
+        for fn in filenames:
+            row = self.rows.get(fn)
+            if row is None:
+                continue
+            if row.parent() is None:      # まだ追加していなければ末尾（stretch前）へ
+                self._progress_layout.insertWidget(
+                    self._progress_layout.count() - 1, row)
+            row.show()
 
     def _on_quick_toggled(self, files: list, checked: bool) -> None:
         """Union (OR) selection: checking a preset ticks its files; unchecking

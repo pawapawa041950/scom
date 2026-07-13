@@ -48,6 +48,9 @@ def build_parameters(meta: dict) -> str:
     ]
     if meta.get("loras"):
         fields.append(f"Lora: {meta.get('loras')}")
+    if meta.get("lora_hashes"):
+        # webui と同じクォート付き形式（civitai 等がリソース照合に使う）。
+        fields.append(f"Lora hashes: \"{meta.get('lora_hashes')}\"")
     # Marks the generating app (A1111/Civitai-style Version token).
     fields.append(f"Version: {APP_SIGNATURE}")
     lines.append(", ".join(str(x) for x in fields))

@@ -17,6 +17,7 @@ from PySide6.QtWidgets import (
 )
 
 from .widgets import WideComboBox
+from .window_state import bind_geometry
 from .. import xyz
 
 _AXIS_NAMES = "XYZ"
@@ -32,6 +33,7 @@ class XyzDialog(QDialog):
         super().__init__(parent)
         self.setWindowTitle("XYZ プロット")
         self.setMinimumWidth(720)
+        bind_geometry(self, "xyz")
         self._models = list(model_choices)
         self._rows: list[dict] = []
 

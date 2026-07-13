@@ -29,26 +29,9 @@ _USER_AGENT = "scom/1.0 (+https://github.com/)"
 _TIMEOUT = 15  # seconds
 _THUMB_WIDTH = 256
 
-# civitai の baseModel 文字列 → 本アプリの系統。qwen 系 LoRA は anima/krea2
-# のどちらでも使える可能性があるので両方にマッチさせる。
-_FAMILY_RULES: tuple[tuple[str, frozenset[str]], ...] = (
-    ("sdxl", frozenset({"sdxl"})),
-    ("pony", frozenset({"sdxl"})),
-    ("illustrious", frozenset({"sdxl"})),
-    ("noobai", frozenset({"sdxl"})),
-    ("qwen", frozenset({"anima", "krea2"})),
-    ("krea", frozenset({"krea2"})),
-    ("flux", frozenset({"krea2"})),
-)
-
-
-def families_from_base_model(base_model: str) -> frozenset[str]:
-    """App families a civitai baseModel string maps to (empty = unknown)."""
-    b = (base_model or "").lower()
-    for key, fams in _FAMILY_RULES:
-        if key in b:
-            return fams
-    return frozenset()
+# 注: LoRA の系統判定（anima/krea2/sdxl）は civitai の baseModel ではなく
+# safetensors ヘッダから行う（app/modelinfo.py の kind="loras"）。civitai の
+# 情報はサムネ・トリガーワード・リンクの表示にのみ使う。
 
 
 def sha256_file(path: Path, chunk: int = 4 * 1024 * 1024) -> str:
@@ -176,3 +159,71 @@ class LoraCache:
         tmp.write_bytes(data)
         tmp.replace(dest)
         return str(dest)
+
+
+class LoraPrompts:
+    """User-editable per-LoRA prompt snippets (positive/negative).
+
+    civitai のトリガーワードはポジティブしか無いので、ユーザーが自分で
+    編集・追記（ネガティブ含む）できるようにする。civitai キャッシュとは
+    別ファイルに保存し、ファイルの再ハッシュ・再取得で消えないようにする:
+
+      lora_cache/user_prompts.json  {relname: {"positive": str, "negative": str}}
+
+    ここは GUI スレッドからのみ触る（ワーカーとは無関係）。
+    """
+
+    def __init__(self, path: Path):
+        self.path = Path(path)
+        self._data: dict[str, dict] = {}
+        try:
+            with open(self.path, encoding="utf-8") as f:
+                d = json.load(f)
+            if isinstance(d, dict):
+                self._data = d
+        except (OSError, ValueError):
+            self._data = {}
+
+    def get(self, relname: str) -> Optional[dict]:
+        """Return {"positive", "negative"} if the user has edited this LoRA,
+        else None (meaning: fall back to civitai's trained words)."""
+        e = self._data.get(relname)
+        if not isinstance(e, dict):
+            return None
+        return {"positive": str(e.get("positive", "")),
+                "negative": str(e.get("negative", ""))}
+
+    def set(self, relname: str, positive: str, negative: str) -> None:
+        """Store the edit. Empty positive+negative removes the override so the
+        LoRA reverts to civitai's words."""
+        if not positive.strip() and not negative.strip():
+            self._data.pop(relname, None)
+        else:
+            self._data[relname] = {"positive": positive, "negative": negative}
+        self._save()
+
+    def _save(self) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = self.path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(self._data, ensure_ascii=False, indent=1),
+                       encoding="utf-8")
+        tmp.replace(self.path)
+
+
+def effective_trigger_words(relname: str, loras_dir: Path,
+                            cache_dir: Path) -> tuple[str, str]:
+    """(positive, negative) for a LoRA. User edits (LoraPrompts) take priority;
+    otherwise civitai's trained words (LoraCache) as positive, negative empty.
+    Files are read fresh so hover popups reflect the latest edits. Returns
+    ("", "") when nothing is known yet (never opened in the LoRA window)."""
+    cache_dir = Path(cache_dir)
+    override = LoraPrompts(cache_dir / "user_prompts.json").get(relname)
+    if override is not None:
+        return override["positive"], override["negative"]
+    entry = LoraCache(cache_dir).lookup(relname, Path(loras_dir) / relname)
+    if entry:
+        meta = entry.get("meta") or {}
+        if meta.get("found"):
+            words = meta.get("trained_words") or []
+            return ", ".join(str(w) for w in words), ""
+    return "", ""
