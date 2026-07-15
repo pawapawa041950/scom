@@ -41,6 +41,46 @@ CUDA_TABLE = [
 
 _TORCH_INDEX = "https://download.pytorch.org/whl/{tag}"
 
+# ----- SageAttention（量子化attentionによる推論高速化）----------------------
+# 公式は Linux のみのため、ComfyUI 界隈で標準的な woct0rdho のビルド済み
+# Windows ホイールを使う。"torch2.10.0andhigher" は torch>=2.10 で動作、
+# "cp310-abi3" は Python>=3.10 で動作する。CUDA はメジャー一致が必要なので
+# インストール済み torch のタグ (cu128/cu130) ごとに選ぶ。
+_SAGE_BASE = ("https://github.com/woct0rdho/SageAttention/releases/download/"
+              "v2.2.0-windows.post5/")
+SAGE_WHEELS = {
+    "cu130": _SAGE_BASE + "sageattention-2.2.0%2Bcu130torch2.10.0andhigher"
+                          ".post5-cp310-abi3-win_amd64.whl",
+    "cu128": _SAGE_BASE + "sageattention-2.2.0%2Bcu128torch2.10.0andhigher"
+                          ".post5-cp310-abi3-win_amd64.whl",
+}
+# SageAttention に必要な最小ドライバ = cu128 ホイールが動く 570.00。
+SAGE_MIN_DRIVER = 570.00
+# int8_convrot 量子化が高速に動く最小ドライバ = cu130 torch が入る 580.88
+# （comfy_kitchen の INT8 GEMM が CUDA 13 ランタイム必須。cu128 では
+# dequant+bf16 matmul にフォールバックし約2倍遅い。TORCH_SETUP_REV 参照）。
+INT8_FAST_MIN_DRIVER = 580.88
+
+
+def sage_wheel_for(torch_tag: str) -> Optional[str]:
+    """インストール済み torch タグに合う SageAttention ホイール URL（無ければ
+    None = 非対応環境）。"""
+    return SAGE_WHEELS.get(torch_tag)
+
+
+def sage_supported(gpu: GpuInfo, torch_tag: str) -> tuple[bool, str]:
+    """(導入可能か, 理由)。GPU 無し / ドライバ不足 / 対応ホイール無しを判定。"""
+    if not gpu.has_nvidia:
+        return False, "NVIDIA GPU が見つからないため SageAttention は使えません"
+    if gpu.driver_version and gpu.driver_version < SAGE_MIN_DRIVER:
+        return False, (f"NVIDIA ドライバ {gpu.driver_version:g} が古いため "
+                       f"SageAttention を導入できません（{SAGE_MIN_DRIVER:g} "
+                       "以上が必要）")
+    if sage_wheel_for(torch_tag) is None:
+        return False, (f"PyTorch {torch_tag} 向けの SageAttention ホイールが"
+                       "無いため導入できません（cu128 / cu130 のみ対応）")
+    return True, ""
+
 
 @dataclass
 class GpuInfo:

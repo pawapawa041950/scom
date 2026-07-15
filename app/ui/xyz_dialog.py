@@ -81,15 +81,27 @@ class XyzDialog(QDialog):
         root.addWidget(hint)
 
         opt_row = QHBoxLayout()
-        self.chk_legend = QCheckBox("凡例を描画")
-        self.chk_legend.setChecked(True)
-        self.chk_save_cells = QCheckBox("各セル画像も個別に保存")
+        self.chk_save_cells = QCheckBox("各画像を保存")
         self.chk_save_cells.setChecked(True)
         self.chk_save_cells.setToolTip(
-            "グリッド画像に加えて、セルごとの画像もメイン画面の Format 設定で"
-            "output に保存します（各セルの生成直後に保存）")
-        opt_row.addWidget(self.chk_legend)
+            "セルごとの画像をメイン画面の Format 設定で output に保存します"
+            "（各セルの生成直後に保存）")
+        # 比較画像（凡例付きグリッド）: 表示 OFF なら合成自体を行わないため、
+        # ファイル保存も表示が前提（表示 OFF で保存は不可）。
+        self.chk_show_grid = QCheckBox("最後に比較画像を表示")
+        self.chk_show_grid.setChecked(True)
+        self.chk_show_grid.setToolTip(
+            "全セル完了後、凡例付きの比較グリッド画像を合成して"
+            "メイン画面のプレビューに表示します")
+        self.chk_save_grid = QCheckBox("比較画像をファイルに保存")
+        self.chk_save_grid.setChecked(True)
+        self.chk_save_grid.setToolTip(
+            "合成した比較グリッド画像を output に PNG で保存します"
+            "（「最後に比較画像を表示」が ON のときのみ選択可能）")
+        self.chk_show_grid.toggled.connect(self._on_show_grid_toggled)
         opt_row.addWidget(self.chk_save_cells)
+        opt_row.addWidget(self.chk_show_grid)
+        opt_row.addWidget(self.chk_save_grid)
         opt_row.addSpacing(16)
         opt_row.addWidget(QLabel("セル余白"))
         self.sp_margin = QSpinBox()
@@ -143,6 +155,12 @@ class XyzDialog(QDialog):
             self._on_axis_changed(row)
         self._update_counts()
 
+    def _on_show_grid_toggled(self, checked: bool) -> None:
+        """表示 OFF のとき保存は選べない（合成しないので保存もできない）。"""
+        self.chk_save_grid.setEnabled(checked)
+        if not checked:
+            self.chk_save_grid.setChecked(False)
+
     # ----- state -------------------------------------------------------------
     @staticmethod
     def _axis_index(axis_id: str) -> int:
@@ -153,8 +171,9 @@ class XyzDialog(QDialog):
 
     def state(self) -> dict:
         """Persistable dialog state (restored via the constructor)."""
-        st = {"legend": self.chk_legend.isChecked(),
-              "save_cells": self.chk_save_cells.isChecked(),
+        st = {"save_cells": self.chk_save_cells.isChecked(),
+              "show_grid": self.chk_show_grid.isChecked(),
+              "save_grid": self.chk_save_grid.isChecked(),
               "margin": self.sp_margin.value()}
         for name, row in zip("xyz", self._rows):
             st[f"{name}_type"] = row["combo"].currentData()
@@ -167,8 +186,12 @@ class XyzDialog(QDialog):
                 row["combo"].setCurrentIndex(
                     self._axis_index(str(st.get(f"{name}_type", "none"))))
                 row["edit"].setText(str(st.get(f"{name}_values", "")))
-            self.chk_legend.setChecked(bool(st.get("legend", True)))
             self.chk_save_cells.setChecked(bool(st.get("save_cells", True)))
+            show = bool(st.get("show_grid", True))
+            self.chk_show_grid.setChecked(show)
+            # 保存は表示が前提（表示 OFF ならトグルハンドラが解除済み）。
+            self.chk_save_grid.setChecked(
+                show and bool(st.get("save_grid", True)))
             self.sp_margin.setValue(int(st.get("margin", 0)))
         except (TypeError, ValueError):
             pass  # 壊れた保存状態は既定値のまま
@@ -309,8 +332,10 @@ class XyzDialog(QDialog):
             return
         self.run_requested.emit({
             "axes": axes,
-            "legend": self.chk_legend.isChecked(),
+            "legend": True,   # 凡例は必須（常に描画）
             "save_cells": self.chk_save_cells.isChecked(),
+            "show_grid": self.chk_show_grid.isChecked(),
+            "save_grid": self.chk_save_grid.isChecked(),
             "margin": self.sp_margin.value(),
         })
 

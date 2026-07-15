@@ -131,7 +131,8 @@ class FirstRunSetup:
     # ----- run -------------------------------------------------------------
     def run(self, on_step: StepCb, on_log: LogCb,
             cancel: Optional[Callable[[], bool]] = None,
-            selected_models: Optional[list[str]] = None) -> None:
+            selected_models: Optional[list[str]] = None,
+            install_sage: bool = False) -> None:
         cancel = cancel or (lambda: False)
         config.ensure_model_dirs()
         self.paths.backend_root.mkdir(parents=True, exist_ok=True)
@@ -148,6 +149,8 @@ class FirstRunSetup:
             self._step_torch(emit, on_log, cancel)
             self._step_comfyui(emit, on_log, cancel)
             self._step_deps(emit, on_log, cancel)
+            if install_sage:
+                self._step_sage(emit, on_log, cancel)
             self._step_models(emit, on_log, cancel, selected_models)
         except SetupError:
             raise
@@ -274,6 +277,29 @@ class FirstRunSetup:
         out.write_text("\n".join(lines), encoding="utf-8")
         return out
 
+    def _step_sage(self, emit, log, cancel) -> None:
+        title = "SageAttention"
+        if sage_installed(self.paths):
+            emit("sage", title, "skipped", 1.0, "インストール済み")
+            self._enable_sage_setting(log)
+            return
+        emit("sage", title, "running", None, "インストール中…")
+        install_sage_attention(self.paths, log, cancel)
+        self._enable_sage_setting(log)
+        emit("sage", title, "done", 1.0, "インストール完了")
+
+    def _enable_sage_setting(self, log: LogCb) -> None:
+        """settings.toml に sage_attention=true を書き、初回起動から有効化する
+        （メインウィンドウはこのあと起動して設定を読む）。"""
+        from .. import settings as app_settings
+        data, err = app_settings.load(self.paths.settings_path)
+        if err is not None:
+            log(f"settings.toml が壊れているため SageAttention 設定を"
+                f"書き込めません: {err}")
+            return
+        data["sage_attention"] = True
+        app_settings.save(self.paths.settings_path, data)
+
     def _step_models(self, emit, log, cancel,
                      selected_models: Optional[list[str]]) -> None:
         manifest = models.load_manifest(self.paths)
@@ -305,3 +331,33 @@ def _fmt_bytes(done: int, total: int) -> str:
     def g(n: int) -> str:
         return f"{n / 1e9:.2f} GB" if n >= 1e9 else f"{n / 1e6:.0f} MB"
     return f"{g(done)} / {g(total)}" if total else g(done)
+
+
+# ----- SageAttention (optional speedup) --------------------------------------
+def sage_installed(paths: config.AppPaths) -> bool:
+    """バックエンド venv に sageattention が入っているか（ディレクトリ存在
+    チェックのみ = 起動パスで毎回呼べる軽さ）。"""
+    site = paths.venv_dir / "Lib" / "site-packages" / "sageattention"
+    return site.exists()
+
+
+def install_sage_attention(paths: config.AppPaths, log: LogCb,
+                           cancel: Optional[Callable[[], bool]] = None) -> None:
+    """triton-windows + SageAttention ホイールをバックエンド venv へ入れる。
+
+    ホイールはインストール済み torch の CUDA タグ (cu128/cu130) に合わせて
+    選ぶ。非対応環境（GPU無し・ドライバ不足・対応ホイール無し）は SetupError。
+    """
+    manifest = _Manifest(paths.manifest_path)
+    torch_tag = str(manifest.get("torch_tag") or "")
+    gpu = environment.detect_gpu()
+    ok, reason = environment.sage_supported(gpu, torch_tag)
+    if not ok:
+        raise SetupError(reason)
+    wheel = environment.sage_wheel_for(torch_tag)
+    log(f"SageAttention をインストール中（torch {torch_tag} 用）…")
+    # triton-windows は SageAttention の前提パッケージ（PyPI から取得）。
+    uv_manager.pip_install(
+        paths.uv_path, paths.backend_python, log,
+        packages=["triton-windows", wheel], cancel=cancel,
+    )

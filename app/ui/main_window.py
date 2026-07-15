@@ -86,6 +86,7 @@ class _GenWorker(QObject):
     progress = Signal(Progress)
     preview = Signal(bytes)
     cached = Signal(list)  # node ids served from the backend output cache
+    timing = Signal(float)  # 純粋な推論(サンプリング)時間 [秒]
     done = Signal(list)    # list[bytes]
     failed = Signal(str)
 
@@ -106,6 +107,7 @@ class _GenWorker(QObject):
                 on_preview=self.preview.emit,
                 cancel=lambda: self._cancel,
                 on_cached=self.cached.emit,
+                on_timing=self.timing.emit,
             )
             self.done.emit(images)
         except BackendError as e:
@@ -122,6 +124,7 @@ class _XyzWorker(QObject):
     """
     progress = Signal(Progress)
     preview = Signal(bytes)
+    timing = Signal(float)          # セルごとの純粋な推論時間 [秒]
     cell_done = Signal(int, int)    # finished count, total
     cell_image = Signal(int, bytes)  # grid index, png (直後の逐次保存用)
     cell_error = Signal(int, str)   # grid index, message
@@ -149,6 +152,7 @@ class _XyzWorker(QObject):
                         on_progress=self.progress.emit,
                         on_preview=self.preview.emit,
                         cancel=lambda: self._cancel,
+                        on_timing=self.timing.emit,
                     )
                 except BackendError as e:
                     if self._cancel or n == 0:
@@ -165,6 +169,50 @@ class _XyzWorker(QObject):
             self.failed.emit(str(e))
         except Exception as e:  # pragma: no cover - defensive
             self.failed.emit(f"unexpected error: {e}")
+
+
+class _XyzComposeWorker(QObject):
+    """XYZ の比較グリッド画像を UI スレッド外で合成・保存する。
+
+    セルの PNG デコード → グリッド描画（QPainter on QImage は非GUIスレッド
+    可）→ PNG エンコード → （指定があれば）メタデータ付き保存、のすべてが
+    大きなグリッドでは数秒かかり、UI スレッドで行うとフリーズして見える。
+    """
+    done = Signal(object)   # {"png": bytes, "w": int, "h": int, "log": [str]}
+
+    def __init__(self, cells: list, nx: int, ny: int, nz: int,
+                 labels: list, legend: bool, margin: int,
+                 save_path, params_text: str, extra: dict, embed: bool):
+        super().__init__()
+        self._cells = cells          # list[bytes | None] (grid order)
+        self._nx, self._ny, self._nz = nx, ny, nz
+        self._labels = labels
+        self._legend = legend
+        self._margin = margin
+        self._save_path = save_path  # Path | None (None = 保存しない)
+        self._params_text = params_text
+        self._extra = extra
+        self._embed = embed
+
+    def run(self) -> None:
+        log: list[str] = []
+        images = [QImage.fromData(b) if b else None for b in self._cells]
+        grid = xyz.compose_grid(
+            images, self._nx, self._ny, self._nz,
+            self._labels[0], self._labels[1], self._labels[2],
+            draw_legend=self._legend, margin=self._margin)
+        png = xyz.qimage_png_bytes(grid)
+        if self._save_path is not None:
+            try:
+                metadata.save_with_metadata(
+                    png, self._save_path, "png", 6, self._params_text,
+                    extra=self._extra, embed=self._embed)
+                note = "メタデータ付き" if self._embed else "メタデータなし"
+                log.append(f"{self._save_path} に保存しました（{note}）")
+            except Exception as e:  # noqa: BLE001
+                log.append(f"グリッド画像の保存に失敗: {e}")
+        self.done.emit({"png": png, "w": grid.width(), "h": grid.height(),
+                        "log": log})
 
 
 class MainWindow(QMainWindow):
@@ -216,6 +264,8 @@ class MainWindow(QMainWindow):
         self._xyz_thread: Optional[QThread] = None
         self._xyz_worker: Optional[_XyzWorker] = None
         self._xyz_ctx: Optional[dict] = None
+        # 比較グリッド合成スレッド（完了後に非同期で走る; 複数保持可）。
+        self._xyz_compose_jobs: list = []
         self._loading = True
         self._save_timer = QTimer(self)
         self._save_timer.setSingleShot(True)
@@ -287,6 +337,7 @@ class MainWindow(QMainWindow):
         self.setCentralWidget(splitter)
 
         self.status = self.statusBar()
+        self.status.addPermanentWidget(self.lbl_gen_time)  # プログレスバーの左
         self.status.addPermanentWidget(self.progress)
         self.status.showMessage("バックエンドを起動中…")
 
@@ -375,7 +426,7 @@ class MainWindow(QMainWindow):
         merge_btn.clicked.connect(self._open_merge_dialog)
         refresh = QPushButton("再スキャン")
         refresh.clicked.connect(self.refresh_models)
-        manage = QPushButton("モデル管理…")
+        manage = QPushButton("設定…")
         manage.clicked.connect(self.open_models_dialog)
         btn_row = QHBoxLayout()
         btn_row.addWidget(merge_btn, stretch=1)
@@ -485,9 +536,16 @@ class MainWindow(QMainWindow):
         self.cb_dtype = WideComboBox()
         self.cb_dtype.addItems(["default", "fp8_e4m3fn", "fp8_e5m2"])
 
+        # 縦横入れ替え。UI上は窮屈だが位置・サイズは後で微調整する。
+        self.btn_swap_size = QPushButton("⇄")
+        self.btn_swap_size.setFixedWidth(28)
+        self.btn_swap_size.setToolTip("Width と Height を入れ替え")
+        self.btn_swap_size.clicked.connect(self._swap_size)
+
         r = 0
         grid.addWidget(QLabel("Width"), r, 0); grid.addWidget(self.sp_width, r, 1)
         grid.addWidget(QLabel("Height"), r, 2); grid.addWidget(self.sp_height, r, 3)
+        grid.addWidget(self.btn_swap_size, r, 4)
         r += 1
         grid.addWidget(QLabel("Steps"), r, 0); grid.addWidget(self.sp_steps, r, 1)
         grid.addWidget(QLabel("CFG"), r, 2); grid.addWidget(self.sp_cfg, r, 3)
@@ -538,6 +596,11 @@ class MainWindow(QMainWindow):
         self.progress = QProgressBar()
         self.progress.setTextVisible(True)
         self.progress.setMaximumWidth(220)
+        # 直近の純粋な推論時間（プログレスバーの左隣に常駐表示）。
+        self.lbl_gen_time = QLabel("")
+        self.lbl_gen_time.setToolTip(
+            "直近の生成の推論時間（サンプリングのみ。モデル読み込み・"
+            "テキストエンコード・VAEデコード等は含みません）")
         return w
 
     # ----- image output settings (below the preview) ----------------------
@@ -626,9 +689,20 @@ class MainWindow(QMainWindow):
 
     def open_models_dialog(self) -> None:
         from .models_dialog import ModelsDialog
-        dlg = ModelsDialog(self.paths, self)
+        dlg = ModelsDialog(
+            self.paths, sage_enabled=bool(self.settings.get("sage_attention",
+                                                            False)),
+            parent=self)
+        dlg.sage_toggled.connect(self._on_sage_setting_toggled)
         dlg.exec()
         self.refresh_models()
+
+    def _on_sage_setting_toggled(self, enabled: bool) -> None:
+        self.settings["sage_attention"] = bool(enabled)
+        self._schedule_save()
+        self.append_log(
+            "SageAttention を{}にしました（アプリ再起動後に反映）".format(
+                "有効" if enabled else "無効"))
 
     def _on_dual_toggled(self, checked: bool) -> None:
         self.cb_te2.setEnabled(checked)
@@ -790,7 +864,7 @@ class MainWindow(QMainWindow):
             msgs.append(f"・CLIP type を 'krea2' にしてください（現在: {params.clip_type}）")
         if not any(self._te_family(t) == "krea2" for t in params.te):
             msgs.append("・Text encoder に Krea-2 用（Qwen3-VL）を選択してください"
-                        "（未取得ならモデル管理からダウンロード）")
+                        "（未取得なら「設定…」からダウンロード）")
         if not msgs:
             return None
         return ("選択中のモデルは Krea-2 です。次を直してください:\n\n"
@@ -1445,14 +1519,19 @@ class MainWindow(QMainWindow):
         dlg.cancel_requested.connect(self.on_cancel)
         # チェック状態は実行しなくても記憶する（次回開いたとき再現）。
         # コンストラクタでの復元後に接続するので、復元自体では発火しない。
-        dlg.chk_save_cells.toggled.connect(self._on_xyz_save_cells_toggled)
+        dlg.chk_save_cells.toggled.connect(
+            lambda c: self._persist_xyz_flag("save_cells", c))
+        dlg.chk_show_grid.toggled.connect(
+            lambda c: self._persist_xyz_flag("show_grid", c))
+        dlg.chk_save_grid.toggled.connect(
+            lambda c: self._persist_xyz_flag("save_grid", c))
         self._xyz_dlg = dlg
         if self._xyz_thread is not None and self._xyz_ctx is not None:
             dlg.set_running(True, int(self._xyz_ctx.get("total", 0)))
         dlg.show()
 
-    def _on_xyz_save_cells_toggled(self, checked: bool) -> None:
-        """個別保存チェックの状態だけを即座に永続化する（他の入力欄は
+    def _persist_xyz_flag(self, key: str, checked: bool) -> None:
+        """XYZ ウィンドウのチェック状態だけを即座に永続化する（他の入力欄は
         実行時にまとめて保存されるので、途中入力を上書きしないよう merge）。"""
         try:
             st = json.loads(str(self.settings.get("xyz", "{}")))
@@ -1460,7 +1539,7 @@ class MainWindow(QMainWindow):
                 st = {}
         except (ValueError, TypeError):
             st = {}
-        st["save_cells"] = bool(checked)
+        st[key] = bool(checked)
         self.settings["xyz"] = json.dumps(st, ensure_ascii=False)
         self._schedule_save()
 
@@ -1585,6 +1664,7 @@ class MainWindow(QMainWindow):
         self._xyz_thread.started.connect(self._xyz_worker.run)
         self._xyz_worker.progress.connect(self._on_progress)
         self._xyz_worker.preview.connect(self._on_preview_frame)
+        self._xyz_worker.timing.connect(self._on_gen_timing)
         self._xyz_worker.cell_done.connect(self._on_xyz_cell_done)
         self._xyz_worker.cell_image.connect(self._on_xyz_cell_image)
         self._xyz_worker.cell_error.connect(self._on_xyz_cell_error)
@@ -1678,7 +1758,7 @@ class MainWindow(QMainWindow):
             else:
                 raise ValueError(
                     f"モデル軸の {p.diffusion} は {fam} 系ですが、対応する "
-                    "text encoder が見つかりません。「モデル管理…」から"
+                    "text encoder が見つかりません。「設定…」から"
                     "ダウンロードしてください。")
         clip = p.clip_type if clip_ok else (
             "krea2" if fam == "krea2" else "stable_diffusion")
@@ -1764,58 +1844,70 @@ class MainWindow(QMainWindow):
         ctx = self._xyz_ctx or {}
         spec = ctx.get("spec", {})
         nx, ny, nz = ctx.get("nx", 1), ctx.get("ny", 1), ctx.get("nz", 1)
-        cells: list = [None] * (nx * ny * nz)
-        for idx, data in results.items():
-            cells[idx] = QImage.fromData(data) if data else None
-        labels = [a["labels"] for a in spec.get("axes", [])] or [[""]] * 3
-        grid = xyz.compose_grid(
-            cells, nx, ny, nz, labels[0], labels[1], labels[2],
-            draw_legend=bool(spec.get("legend", True)),
-            margin=int(spec.get("margin", 0)))
-        png = xyz.qimage_png_bytes(grid)
+        n_cells = nx * ny * nz
         ok = sum(1 for v in results.values() if v)
-        self.status.showMessage(f"XYZ プロット完了（{ok}/{len(cells)} セル）")
-        self.append_log(f"XYZ プロット完了: {ok}/{len(cells)} セル成功 "
-                        f"（グリッド {grid.width()}x{grid.height()}px）")
+        self.status.showMessage(f"XYZ プロット完了（{ok}/{n_cells} セル）")
+        self.append_log(f"XYZ プロット完了: {ok}/{n_cells} セル成功")
+        if ctx.get("cell_fmt"):
+            self.append_log(f"個別画像を {ctx.get('cells_saved', 0)} 枚"
+                            "保存しました（各セル生成直後に保存）")
         self._xyz_last_ok = ok > 0  # 連続モードは成功時のみ続行
-        self._last_images = [png]
-        self._show_image(png)
-        self._save_xyz_outputs(png, results)
         # モデル軸でマージモデルを使ったならピン状態 ●/○ を最新化。
         if any(p.merge_models for p in ctx.get("params", {}).values()):
             self._sync_merge_states()
         if self.chk_randomize.isChecked():
             self._set_seed(-1)
-
-    def _save_xyz_outputs(self, grid_png: bytes, results: dict) -> None:
-        """Save the composed grid（個別セルは生成直後に保存済み）."""
-        if not metadata.AVAILABLE:
-            self.append_log("警告: Pillow/piexif が無いため保存できません")
+        # 比較グリッドの合成/保存はワーカースレッドで行う（大きなグリッド
+        # では数秒かかり、UI スレッドで行うとフリーズして見えるため）。
+        # 表示 OFF なら合成自体をスキップ（保存も表示が前提）。
+        if not spec.get("show_grid", True):
             return
-        ctx = self._xyz_ctx or {}
-        spec = ctx.get("spec", {})
-        base = ctx.get("base")
-        from datetime import datetime
-        stamp = ctx.get("stamp") or datetime.now().strftime("%Y%m%d_%H%M%S")
-        # グリッド画像は本機能の成果物なので Format 設定に関わらず PNG で保存。
-        params_text, extra = self._build_metadata(base)
+        cells: list = [None] * n_cells
+        for idx, data in results.items():
+            cells[idx] = data or None
+        labels = [a["labels"] for a in spec.get("axes", [])] or [[""]] * 3
+        save_path = None
+        if spec.get("save_grid", True):
+            if metadata.AVAILABLE:
+                from datetime import datetime
+                stamp = (ctx.get("stamp")
+                         or datetime.now().strftime("%Y%m%d_%H%M%S"))
+                # グリッドは本機能の成果物なので Format 設定に関わらず PNG。
+                save_path = (self.paths.output_dir
+                             / f"xyz_{stamp}_{self._last_seed}.png")
+            else:
+                self.append_log("警告: Pillow/piexif が無いため保存できません")
+        # メタデータ文字列は UI の値を読むためここ（UIスレッド）で組み立てる。
+        params_text, extra = self._build_metadata(ctx.get("base"))
         for name, a in zip(("x", "y", "z"), spec.get("axes", [])):
             if a["id"] != "none":
                 extra[f"xyz_{name}_type"] = a["id"]
                 extra[f"xyz_{name}_values"] = ", ".join(a["labels"])
-        embed = bool(ctx.get("embed", True))
-        path = self.paths.output_dir / f"xyz_{stamp}_{self._last_seed}.png"
-        try:
-            metadata.save_with_metadata(
-                grid_png, path, "png", 6, params_text, extra=extra,
-                embed=embed)
-            note = "メタデータ付き" if embed else "メタデータなし"
-            self.append_log(f"{path} に保存しました（{note}）")
-        except Exception as e:  # noqa: BLE001
-            self.append_log(f"グリッド画像の保存に失敗: {e}")
-        if ctx.get("cell_fmt"):
-            self.append_log(f"個別画像を {ctx.get('cells_saved', 0)} 枚"
-                            "保存しました（各セル生成直後に保存）")
+        self._start_xyz_compose(
+            cells, nx, ny, nz, labels, int(spec.get("margin", 0)),
+            save_path, params_text, extra, bool(ctx.get("embed", True)))
+
+    def _start_xyz_compose(self, cells, nx, ny, nz, labels, margin,
+                           save_path, params_text, extra, embed) -> None:
+        thread = QThread(self)
+        worker = _XyzComposeWorker(cells, nx, ny, nz, labels, True, margin,
+                                   save_path, params_text, extra, embed)
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.done.connect(self._on_xyz_grid_ready)
+        worker.done.connect(thread.quit)
+        # 参照を保持（GC 防止）。連続モードで次の実行と重なっても互いに独立。
+        self._xyz_compose_jobs.append((thread, worker))
+        thread.finished.connect(
+            lambda t=thread, w=worker: self._xyz_compose_jobs.remove((t, w)))
+        thread.start()
+
+    def _on_xyz_grid_ready(self, res: dict) -> None:
+        self.append_log(f"比較画像を合成しました（{res['w']}x{res['h']}px）")
+        for line in res.get("log", []):
+            self.append_log(line)
+        self._last_images = [res["png"]]
+        self._show_image(res["png"])
 
     def _on_xyz_failed(self, msg: str) -> None:
         self.status.showMessage("XYZ プロット失敗")
@@ -1923,7 +2015,7 @@ class MainWindow(QMainWindow):
         if not self.cb_diffusion.count():
             self.append_log(
                 f"{preset} のモデルが見つかりません。"
-                "「モデル管理…」からダウンロードしてください。")
+                "「設定…」からダウンロードしてください。")
         self._schedule_save()
 
     # ----- per-preset Models/設定 memory -----------------------------------
@@ -2162,6 +2254,9 @@ class MainWindow(QMainWindow):
 
     # ----- backend start ---------------------------------------------------
     def start_backend(self) -> None:
+        # SageAttention の設定を起動フラグへ反映（未導入なら backend 側で無視）。
+        self.backend.use_sage_attention = bool(
+            self.settings.get("sage_attention", False))
         self._start_thread = QThread(self)
         worker = _StartWorker(self.backend)
         worker.moveToThread(self._start_thread)
@@ -2340,6 +2435,7 @@ class MainWindow(QMainWindow):
         self._gen_worker.progress.connect(self._on_progress)
         self._gen_worker.preview.connect(self._on_preview_frame)
         self._gen_worker.cached.connect(self._on_cached_nodes)
+        self._gen_worker.timing.connect(self._on_gen_timing)
         self._gen_worker.done.connect(self._on_gen_done)
         self._gen_worker.failed.connect(self._on_gen_failed)
         self._gen_worker.done.connect(self._gen_thread.quit)
@@ -2368,6 +2464,16 @@ class MainWindow(QMainWindow):
             self.progress.setMaximum(p.maximum)
             self.progress.setValue(p.value)
             self.progress.setFormat(f"{p.note} {p.value}/{p.maximum}")
+
+    def _on_gen_timing(self, secs: float) -> None:
+        """純粋な推論時間（サンプリングのみ）をログとステータスバーへ。"""
+        self.lbl_gen_time.setText(f"推論 {secs:.2f} 秒")
+        self.append_log(f"推論時間: {secs:.2f} 秒")
+
+    def _swap_size(self) -> None:
+        w, h = self.sp_width.value(), self.sp_height.value()
+        self.sp_width.setValue(h)
+        self.sp_height.setValue(w)
 
     def _on_preview_frame(self, data: bytes) -> None:
         # Live latent preview during sampling; does not replace the final image.

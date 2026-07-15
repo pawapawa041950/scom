@@ -91,6 +91,8 @@ class ComfyBackend:
         self.port = port
         self.host = "127.0.0.1"
         self.client_id = uuid.uuid4().hex
+        # 起動前にメインウィンドウが設定から反映する（次回起動時に有効）。
+        self.use_sage_attention = False
         self._proc: Optional[subprocess.Popen] = None
         self._log_thread: Optional[threading.Thread] = None
         self._log_tail: deque[str] = deque(maxlen=40)
@@ -131,6 +133,16 @@ class ComfyBackend:
             "--preview-method", "auto",  # stream latent previews over the ws
             "--disable-auto-launch",
         ]
+        if self.use_sage_attention:
+            # パッケージが実在するときだけフラグを付ける。無いのに付けると
+            # ComfyUI は起動時に exit(-1) するため（attention.py 参照）。
+            from .bootstrap.setup import sage_installed
+            if sage_installed(self.paths):
+                cmd.append("--use-sage-attention")
+                log("SageAttention を有効化して起動します")
+            else:
+                log("SageAttention が未インストールのため無効で起動します"
+                    "（「設定…」から導入できます）")
         (self.paths.user_data / "output").mkdir(parents=True, exist_ok=True)
         log(f"ComfyUI を起動中: {' '.join(cmd)}")
 
@@ -248,7 +260,8 @@ class ComfyBackend:
                  on_progress: Optional[Callable[[Progress], None]] = None,
                  on_preview: Optional[Callable[[bytes], None]] = None,
                  cancel: Optional[Callable[[], bool]] = None,
-                 on_cached: Optional[Callable[[list], None]] = None) -> list[bytes]:
+                 on_cached: Optional[Callable[[list], None]] = None,
+                 on_timing: Optional[Callable[[float], None]] = None) -> list[bytes]:
         """Run a graph to completion and return output PNG bytes.
 
         ``on_progress`` receives Progress updates; ``on_preview`` receives raw
@@ -256,7 +269,10 @@ class ComfyBackend:
         and, if it returns True, the run is interrupted. ``on_cached`` receives
         the node ids served from the backend's output cache (sent once at the
         start of execution) — the app uses it to tell whether a merged model
-        was still in RAM or had to be rebuilt.
+        was still in RAM or had to be rebuilt. ``on_timing`` receives, at
+        completion, the pure inference time in seconds — the wall time the
+        backend spent executing sampler (KSampler) nodes only, excluding model
+        loading / text encoding / VAE decode.
         """
         if not self.is_running():
             raise BackendError("バックエンドが起動していません")
@@ -264,6 +280,14 @@ class ComfyBackend:
         on_preview = on_preview or (lambda _b: None)
         cancel = cancel or (lambda: False)
         on_cached = on_cached or (lambda _n: None)
+
+        # 推論時間 = サンプラーノードが「実行中」だった時間の合計。
+        # executing イベントはノード開始時に飛ぶので、サンプラーに入った時刻
+        # から次のノードへ移った時刻までを積算する。
+        sampler_nodes = {nid for nid, node in graph.items()
+                         if node.get("class_type") == "KSampler"}
+        sample_secs = 0.0
+        sample_enter: Optional[float] = None
 
         ws = websocket.WebSocket()
         ws.connect(
@@ -300,7 +324,16 @@ class ComfyBackend:
                     if data.get("prompt_id") == prompt_id:
                         on_cached(list(data.get("nodes", [])))
                 elif etype == "executing":
-                    if data.get("node") is None and data.get("prompt_id") == prompt_id:
+                    if data.get("prompt_id") != prompt_id:
+                        continue
+                    node = data.get("node")
+                    now = time.monotonic()
+                    if sample_enter is not None and node not in sampler_nodes:
+                        sample_secs += now - sample_enter
+                        sample_enter = None
+                    elif sample_enter is None and node in sampler_nodes:
+                        sample_enter = now
+                    if node is None:
                         break  # finished
                 elif etype == "execution_error" and data.get("prompt_id") == prompt_id:
                     raise BackendError(
@@ -312,6 +345,8 @@ class ComfyBackend:
             except Exception:
                 pass
 
+        if on_timing is not None and sample_secs > 0:
+            on_timing(sample_secs)
         return self._history_images(prompt_id)
 
     def interrupt(self) -> None:

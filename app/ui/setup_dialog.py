@@ -10,10 +10,11 @@ from __future__ import annotations
 
 from PySide6.QtCore import QObject, QThread, Signal
 from PySide6.QtWidgets import (
-    QDialog, QHBoxLayout, QLabel, QPlainTextEdit,
+    QCheckBox, QDialog, QHBoxLayout, QLabel, QPlainTextEdit,
     QProgressBar, QPushButton, QStackedWidget, QVBoxLayout, QWidget,
 )
 
+from ..bootstrap import environment
 from ..bootstrap.setup import FirstRunSetup, StepUpdate, FIXED_STEPS
 from . import ansi_log
 from .model_selector import ModelSelector
@@ -27,10 +28,12 @@ class _SetupWorker(QObject):
     done = Signal()
     failed = Signal(str)
 
-    def __init__(self, setup: FirstRunSetup, selected: list[str]):
+    def __init__(self, setup: FirstRunSetup, selected: list[str],
+                 install_sage: bool = False):
         super().__init__()
         self.setup = setup
         self.selected = selected
+        self.install_sage = install_sage
         self._cancel = False
 
     def cancel(self) -> None:
@@ -43,6 +46,7 @@ class _SetupWorker(QObject):
                 on_log=self.log.emit,
                 cancel=lambda: self._cancel,
                 selected_models=self.selected,
+                install_sage=self.install_sage,
             )
             self.done.emit()
         except Exception as e:  # noqa: BLE001
@@ -84,6 +88,48 @@ class SetupDialog(QDialog):
         plan_lbl.setStyleSheet("color:#39c;")
         plan_lbl.setWordWrap(True)
         layout.addWidget(plan_lbl)
+
+        # ドライバ起因の性能警告（赤）。SageAttention と int8_convrot の高速化
+        # は、それぞれ一定以上の NVIDIA ドライバが前提になる。
+        gpu = environment.detect_gpu()
+        warns = []
+        if gpu.has_nvidia and gpu.driver_version:
+            if gpu.driver_version < environment.SAGE_MIN_DRIVER:
+                warns.append(
+                    f"・SageAttention には NVIDIA ドライバ "
+                    f"{environment.SAGE_MIN_DRIVER:g} 以上が必要です"
+                    f"（現在 {gpu.driver_version:g}）。導入できません。")
+            if gpu.driver_version < environment.INT8_FAST_MIN_DRIVER:
+                warns.append(
+                    f"・int8_convrot 量子化の高速化には ドライバ "
+                    f"{environment.INT8_FAST_MIN_DRIVER:g} 以上"
+                    f"（CUDA 13 対応）が必要です（現在 "
+                    f"{gpu.driver_version:g}）。この構成では INT8 GEMM が"
+                    "使えず約2倍遅くなります。")
+        if warns:
+            warn_lbl = QLabel(
+                "NVIDIA ドライバの更新を推奨します:\n" + "\n".join(warns))
+            warn_lbl.setStyleSheet("color:#e33; font-weight:bold;")
+            warn_lbl.setWordWrap(True)
+            layout.addWidget(warn_lbl)
+
+        # SageAttention の導入チェック（対応環境では既定 ON）。
+        sage_ok, sage_reason = environment.sage_supported(gpu, plan.tag)
+        self.chk_sage = QCheckBox(
+            "SageAttention を導入する（生成を高速化・出力が僅かに変化）")
+        self.chk_sage.setToolTip(
+            "量子化 attention による推論高速化（RTX 30xx 以降で特に有効）。\n"
+            "出力は標準 attention とわずかに変わります。後から「設定…」で"
+            "切り替えできます。")
+        if sage_ok:
+            self.chk_sage.setChecked(True)
+        else:
+            self.chk_sage.setChecked(False)
+            self.chk_sage.setEnabled(False)
+            if not warns and sage_reason:   # GPU無し等、上の警告と重複しない理由
+                self.chk_sage.setText(self.chk_sage.text()
+                                      + f"  — {sage_reason}")
+        layout.addWidget(self.chk_sage)
 
         hint = QLabel(
             "生成には base・VAE・text encoder が必須です。preview 系は任意です。\n"
@@ -158,9 +204,12 @@ class SetupDialog(QDialog):
     # ----- start / events --------------------------------------------------
     def _on_start(self) -> None:
         self._selected = self._selector.selected_filenames()
+        install_sage = self.chk_sage.isChecked()
         # Pre-create rows so the user sees the full plan up front.
         for sid, title in FIXED_STEPS:
             self._row(sid, title)
+        if install_sage:
+            self._row("sage", "SageAttention")
         for fn in self._selected:
             self._row("model:" + fn, fn)
         self._total_steps = len(self._rows)
@@ -168,7 +217,7 @@ class SetupDialog(QDialog):
 
         self.stack.setCurrentIndex(1)
         self._thread = QThread(self)
-        self._worker = _SetupWorker(self._setup, self._selected)
+        self._worker = _SetupWorker(self._setup, self._selected, install_sage)
         self._worker.moveToThread(self._thread)
         self._thread.started.connect(self._worker.run)
         self._worker.step.connect(self._on_step)

@@ -32,6 +32,9 @@ DEFAULTS: dict[str, Any] = {
     "merges": "[]",
     "merge_seq": 0,
     # NOTE: 適用中の LoRA は意図的に永続化しない（毎回まっさらで起動）。
+    # SageAttention（量子化attentionによる高速化）を使うか。ONでもパッケージ
+    # 未導入なら起動フラグは付けない（バックエンドが起動不能になるため）。
+    "sage_attention": False,
     # generation settings
     "width": 1024,
     "height": 1024,
