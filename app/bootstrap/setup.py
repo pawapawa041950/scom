@@ -24,20 +24,19 @@ from .downloader import download
 
 LogCb = Callable[[str], None]
 
-# Pin ComfyUI to a specific commit for reproducible installs. The short
+# Pin ComfyUI to a specific release tag for reproducible installs. The short
 # /archive/<ref>.zip form resolves tags, branches, and commit SHAs alike, so
 # SCOM_COMFYUI_REF can be overridden with any of them (e.g. "master").
-# 1377a2f (master 2026-07-10, post v0.27): int4 ConvRot (convrot_w4a4)
-# load + quantize support via comfy-kitchen 0.2.17.
-COMFYUI_REF = os.environ.get(
-    "SCOM_COMFYUI_REF", "1377a2f72925ed7a5518c1900ff71c6740217b0d")
+# v0.28.0 (2026-07-15, commit 700821e): 旧ピン 1377a2f（v0.27 直後の
+# 暫定 master、int4 ConvRot 対応目的）を含む正式リリース。
+COMFYUI_REF = os.environ.get("SCOM_COMFYUI_REF", "v0.28.0")
 COMFYUI_ZIP = f"https://github.com/comfyanonymous/ComfyUI/archive/{COMFYUI_REF}.zip"
 
 # Bump when a newer ComfyUI is required (e.g. for a new model architecture such
 # as Krea-2). Changing this re-fetches ComfyUI and reinstalls its deps on
 # machines that were provisioned with an older copy. Tied to the pinned ref so
 # the provisioned version is self-documenting.
-COMFYUI_MARKER = os.environ.get("SCOM_COMFYUI_MARKER", "1377a2f")
+COMFYUI_MARKER = os.environ.get("SCOM_COMFYUI_MARKER", "v0.28.0")
 
 # Fixed (non-model) steps, in order: (step_id, title).
 # Technical names (uv / PyTorch / ComfyUI) are kept in English by request.
