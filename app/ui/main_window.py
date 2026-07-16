@@ -536,16 +536,31 @@ class MainWindow(QMainWindow):
         self.cb_dtype = WideComboBox()
         self.cb_dtype.addItems(["default", "fp8_e4m3fn", "fp8_e5m2"])
 
-        # 縦横入れ替え。UI上は窮屈だが位置・サイズは後で微調整する。
+        # サイズ行は他の行と違い列をまたいだ一体レイアウトにする:
+        # 「サイズ [Width] ⇄ [Height]」。入れ替えボタンが両者の間に来て
+        # 直感的になり、専用の列を作らないので他の設定行の幅にも影響しない
+        # （スパン配置は各列の幅要求を変えない）。
+        self.sp_width.setToolTip("Width（横）")
+        self.sp_height.setToolTip("Height（縦）")
         self.btn_swap_size = QPushButton("⇄")
-        self.btn_swap_size.setFixedWidth(28)
+        self.btn_swap_size.setFlat(True)
+        self.btn_swap_size.setFixedSize(22, 22)
+        self.btn_swap_size.setStyleSheet(
+            "QPushButton { border: 1px solid #666; border-radius: 3px; }"
+            "QPushButton:hover { background: rgba(128,128,128,0.25); }")
         self.btn_swap_size.setToolTip("Width と Height を入れ替え")
         self.btn_swap_size.clicked.connect(self._swap_size)
+        size_cell = QHBoxLayout()
+        size_cell.setContentsMargins(0, 0, 0, 0)
+        size_cell.setSpacing(4)
+        size_cell.addWidget(QLabel("Width"))
+        size_cell.addWidget(self.sp_width, stretch=1)
+        size_cell.addWidget(self.btn_swap_size)
+        size_cell.addWidget(self.sp_height, stretch=1)
+        size_cell.addWidget(QLabel("Height"))
 
         r = 0
-        grid.addWidget(QLabel("Width"), r, 0); grid.addWidget(self.sp_width, r, 1)
-        grid.addWidget(QLabel("Height"), r, 2); grid.addWidget(self.sp_height, r, 3)
-        grid.addWidget(self.btn_swap_size, r, 4)
+        grid.addLayout(size_cell, r, 0, 1, 4)   # 行全体（列0〜3）をスパン
         r += 1
         grid.addWidget(QLabel("Steps"), r, 0); grid.addWidget(self.sp_steps, r, 1)
         grid.addWidget(QLabel("CFG"), r, 2); grid.addWidget(self.sp_cfg, r, 3)
