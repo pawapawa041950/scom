@@ -1323,14 +1323,20 @@ class MainWindow(QMainWindow):
 
     def _remove_token_regions(self, field,
                               regions: list[tuple[int, int]]) -> None:
-        """token 区間を削除する。区間に隣接する区切り ", " も1つ巻き込んで
-        取り除き、", ," や先頭/末尾の ", " が残らないようにする。位置ズレを
-        避けるため右端の区間から削除する。"""
+        """token 区間を削除する。挿入時に付けた直後の色なしスペースと、
+        隣接する区切り ", " も1つ巻き込んで取り除き、", ," や余分な空白が
+        残らないようにする。位置ズレを避けるため右端の区間から削除する。"""
         text = field.toPlainText()
         cursor = field.textCursor()
         for start, end in sorted(regions, reverse=True):
             s, e = start, end
-            if text[s - 2:s] == ", ":       # 直前の区切りを巻き込む
+            lead = text[s - 2:s] == ", "
+            # 挿入時の色なし後続スペースを巻き込む。ただし前側の区切りも
+            # 取る場合、スペースの先にユーザーの追記があるなら残す
+            # （両方消すと前後のテキストが癒着するため）。
+            if text[e:e + 1] == " " and (not lead or not text[e + 1:].strip()):
+                e += 1
+            if lead:                        # 直前の区切りを巻き込む
                 s -= 2
             elif text[e:e + 2] == ", ":     # 先頭要素なら直後の区切りを
                 e += 2
@@ -1340,7 +1346,12 @@ class MainWindow(QMainWindow):
         field.setCurrentCharFormat(self._plain_char_format())
 
     def _insert_token_words(self, field, token: str, text: str) -> None:
-        """欄末尾に、区別マーク付きでワードを追記する。"""
+        """欄末尾に、区別マーク付きでワードを追記する。
+
+        色付き区間の直後に入力すると Qt は左隣の書式（=色）を引き継ぐため、
+        区間の直後に色なしスペースを1つ置く。前側は色なしの ", " 区切りが
+        同じ役割を果たす。これで続けて追記しても色は付かない。
+        """
         words = [w.strip() for w in text.split(",") if w.strip()]
         if not words:
             return
@@ -1355,6 +1366,7 @@ class MainWindow(QMainWindow):
         if stripped:
             cursor.insertText(", ", self._plain_char_format())
         cursor.insertText(joined, self._token_char_format(token))
+        cursor.insertText(" ", self._plain_char_format())
         field.setTextCursor(cursor)
         # 続けて入力してもハイライトされないよう書式を通常へ戻す。
         field.setCurrentCharFormat(self._plain_char_format())
