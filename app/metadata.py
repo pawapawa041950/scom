@@ -46,6 +46,12 @@ def build_parameters(meta: dict) -> str:
         f"Batch size: {meta.get('batch')}",
         f"Weight dtype: {meta.get('dtype')}",
     ]
+    if meta.get("hires_upscale"):
+        # webui の Hires fix と同じフィールド名（各種ビューアが解釈する）。
+        fields.append(f"Denoising strength: {meta.get('denoising_strength')}")
+        fields.append(f"Hires upscale: {meta.get('hires_upscale')}")
+        fields.append(f"Hires steps: {meta.get('hires_steps')}")
+        fields.append(f"Hires upscaler: {meta.get('hires_method')}")
     if meta.get("loras"):
         fields.append(f"Lora: {meta.get('loras')}")
     if meta.get("lora_hashes"):

@@ -77,6 +77,13 @@ class GenParams:
     batch_size: int = 1
     weight_dtype: str = "default"  # default | fp8_e4m3fn | fp8_e5m2
     filename_prefix: str = "scom"
+    # Hires fix (latent): 1段目の latent を補間拡大し、同じモデル/プロンプトで
+    # 2段目の KSampler を denoise<1 で回して細部を描き直す。
+    hires_enabled: bool = False
+    hires_scale: float = 1.5
+    hires_denoise: float = 0.55
+    hires_steps: int = 0            # 0 = メインの steps と同じ
+    hires_method: str = "bislerp"   # LatentUpscaleBy の補間方法
 
 
 # Quantization choices for the merged model (node input "quantize").
@@ -247,9 +254,38 @@ def build_graph(p: GenParams) -> dict:
             "latent_image": ["9", 0],
         },
     }
+    samples_src: list = ["10", 0]
+    if p.hires_enabled and p.hires_scale > 1.0:
+        # Hires fix (latent): 補間拡大 → 2段目サンプリング。seed は1段目と
+        # 同じ（WebUI の hires fix と同じ流儀）。
+        graph["13"] = {
+            "class_type": "LatentUpscaleBy",
+            "inputs": {
+                "samples": ["10", 0],
+                "upscale_method": p.hires_method,
+                "scale_by": float(p.hires_scale),
+            },
+        }
+        graph["14"] = {
+            "class_type": "KSampler",
+            "inputs": {
+                "seed": p.seed,
+                "steps": int(p.hires_steps) if p.hires_steps > 0 else p.steps,
+                "cfg": p.cfg,
+                "sampler_name": p.sampler,
+                "scheduler": p.scheduler,
+                "denoise": float(p.hires_denoise),
+                "model": model_src,
+                "positive": ["7", 0],
+                "negative": ["8", 0],
+                "latent_image": ["13", 0],
+            },
+        }
+        samples_src = ["14", 0]
+
     graph["11"] = {
         "class_type": "VAEDecode",
-        "inputs": {"samples": ["10", 0], "vae": vae_src},
+        "inputs": {"samples": samples_src, "vae": vae_src},
     }
     # PreviewImage writes to ComfyUI's temp dir (throwaway). The app saves the
     # real, format/quality-controlled file to output/ from the returned bytes.

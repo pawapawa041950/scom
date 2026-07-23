@@ -35,6 +35,12 @@ DEFAULTS: dict[str, Any] = {
     # SageAttention（量子化attentionによる高速化）を使うか。ONでもパッケージ
     # 未導入なら起動フラグは付けない（バックエンドが起動不能になるため）。
     "sage_attention": False,
+    # Hires fix (latent): 2段目サンプリングによる高解像度化
+    "hires_enabled": False,
+    "hires_scale": 1.5,
+    "hires_denoise": 0.55,
+    "hires_steps": 0,          # 0 = メインの steps と同じ
+    "hires_method": "bislerp",
     # generation settings
     "width": 1024,
     "height": 1024,

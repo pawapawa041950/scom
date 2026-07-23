@@ -383,6 +383,7 @@ class MainWindow(QMainWindow):
         boxes.addWidget(self._build_model_box(), stretch=1)
         settings_col = QVBoxLayout()
         settings_col.addWidget(self._build_settings_box())
+        settings_col.addWidget(self._build_hires_box())
         settings_col.addStretch(1)
         boxes.addLayout(settings_col, stretch=1)
         v.addLayout(boxes)
@@ -574,6 +575,73 @@ class MainWindow(QMainWindow):
         grid.addWidget(QLabel("UNet dtype"), r, 0); grid.addWidget(self.cb_dtype, r, 1)
         grid.addWidget(self.chk_randomize, r, 2, 1, 2)
         return box
+
+    def _build_hires_box(self) -> QGroupBox:
+        """Hires fix (latent): チェック付きグループ。OFF なら中身ごと無効。
+        1段目の latent を補間拡大し、2段目の KSampler で細部を描き直す。"""
+        box = QGroupBox("Hires fix (latent)")
+        box.setCheckable(True)
+        box.setChecked(False)
+        box.setToolTip(
+            "生成した latent を拡大して同じプロンプトで再サンプリングし、"
+            "高解像度化します（生成時間は約2倍になります）")
+        self.grp_hires = box
+        grid = QGridLayout(box)
+
+        self.sp_hires_scale = QDoubleSpinBox()
+        self.sp_hires_scale.setRange(1.05, 4.0)
+        self.sp_hires_scale.setSingleStep(0.05)
+        self.sp_hires_scale.setDecimals(2)
+        self.sp_hires_scale.setValue(1.5)
+        self.sp_hires_scale.setToolTip("最終解像度 = 生成サイズ × この倍率")
+
+        self.sp_hires_denoise = QDoubleSpinBox()
+        self.sp_hires_denoise.setRange(0.0, 1.0)
+        self.sp_hires_denoise.setSingleStep(0.05)
+        self.sp_hires_denoise.setDecimals(2)
+        self.sp_hires_denoise.setValue(0.55)
+        self.sp_hires_denoise.setToolTip(
+            "2段目の描き直し量。latent 拡大では 0.4〜0.7 が目安"
+            "（低いとボケ、高いと構図が変わる）")
+
+        self.sp_hires_steps = QSpinBox()
+        self.sp_hires_steps.setRange(0, 200)
+        self.sp_hires_steps.setValue(0)
+        self.sp_hires_steps.setSpecialValueText("メインと同じ")
+        self.sp_hires_steps.setToolTip("2段目のステップ数（0 = メインと同じ）")
+
+        self.cb_hires_method = WideComboBox()
+        self.cb_hires_method.addItems(
+            ["bislerp", "nearest-exact", "bilinear", "bicubic"])
+        self.cb_hires_method.setToolTip("latent の補間方法")
+
+        grid.addWidget(QLabel("倍率"), 0, 0)
+        grid.addWidget(self.sp_hires_scale, 0, 1)
+        grid.addWidget(QLabel("Denoise"), 0, 2)
+        grid.addWidget(self.sp_hires_denoise, 0, 3)
+        grid.addWidget(QLabel("Steps"), 1, 0)
+        grid.addWidget(self.sp_hires_steps, 1, 1)
+        grid.addWidget(QLabel("補間"), 1, 2)
+        grid.addWidget(self.cb_hires_method, 1, 3)
+
+        # タイトルに現在の倍率での出力解像度を表示（サイズ/倍率の変更に追従）。
+        self.sp_hires_scale.valueChanged.connect(self._update_hires_title)
+        self.sp_width.valueChanged.connect(self._update_hires_title)
+        self.sp_height.valueChanged.connect(self._update_hires_title)
+        self._update_hires_title()
+        return box
+
+    def _hires_out_size(self) -> tuple[int, int]:
+        """現在の倍率での最終解像度。ComfyUI の LatentUpscaleBy は latent
+        単位（1/8px）で丸めるため、それと同じ計算で表示する。"""
+        scale = float(self.sp_hires_scale.value())
+        w = round(self.sp_width.value() / 8 * scale) * 8
+        h = round(self.sp_height.value() / 8 * scale) * 8
+        return int(w), int(h)
+
+    def _update_hires_title(self, *_a) -> None:
+        w, h = self._hires_out_size()
+        self.grp_hires.setTitle(f"Hires fix (latent)  →  {w}x{h}")
 
     def _build_action_box(self) -> QWidget:
         w = QWidget()
@@ -1602,6 +1670,11 @@ class MainWindow(QMainWindow):
         try:
             base = self._collect_params()
             base.batch_size = 1  # 1セル = 1枚
+            if base.hires_enabled:
+                # XYZ は比較用途なので Hires fix は適用しない（全セルが
+                # 2段生成になり時間が跳ね上がるため。必要なら将来対応）。
+                base.hires_enabled = False
+                self.append_log("XYZ では Hires fix を無効にして実行します")
             axes = [xyz.axis_by_id(a["id"]) for a in spec["axes"]]
             values = [a["values"] for a in spec["axes"]]
             has_model_axis = any(a.id == "model" for a in axes)
@@ -2068,6 +2141,11 @@ class MainWindow(QMainWindow):
             "seed": self.ed_seed.text().strip() or "-1",
             "randomize": self.chk_randomize.isChecked(),
             "dtype": self.cb_dtype.currentText(),
+            "hires_enabled": self.grp_hires.isChecked(),
+            "hires_scale": float(self.sp_hires_scale.value()),
+            "hires_denoise": float(self.sp_hires_denoise.value()),
+            "hires_steps": self.sp_hires_steps.value(),
+            "hires_method": self.cb_hires_method.currentText(),
         }
 
     def _apply_preset_conf(self, c: dict) -> None:
@@ -2098,6 +2176,13 @@ class MainWindow(QMainWindow):
             self.ed_seed.setText(str(c.get("seed", "-1")))
             self.chk_randomize.setChecked(bool(c.get("randomize", True)))
             self.cb_dtype.setCurrentText(str(c.get("dtype", "default")))
+            self.grp_hires.setChecked(bool(c.get("hires_enabled", False)))
+            self.sp_hires_scale.setValue(float(c.get("hires_scale", 1.5)))
+            self.sp_hires_denoise.setValue(
+                float(c.get("hires_denoise", 0.55)))
+            self.sp_hires_steps.setValue(int(c.get("hires_steps", 0)))
+            self.cb_hires_method.setCurrentText(
+                str(c.get("hires_method", "bislerp")))
         except (TypeError, ValueError):
             pass  # 壊れた保存値は途中まで適用（以後の保存で正される）
 
@@ -2194,6 +2279,13 @@ class MainWindow(QMainWindow):
         self.ed_seed.setText(str(s.get("seed", "-1")))
         self.chk_randomize.setChecked(bool(s.get("randomize", True)))
         self.cb_dtype.setCurrentText(str(s.get("dtype", "default")))
+        # Hires fix (latent)
+        self.grp_hires.setChecked(bool(s.get("hires_enabled", False)))
+        self.sp_hires_scale.setValue(float(s.get("hires_scale", 1.5)))
+        self.sp_hires_denoise.setValue(float(s.get("hires_denoise", 0.55)))
+        self.sp_hires_steps.setValue(int(s.get("hires_steps", 0)))
+        self.cb_hires_method.setCurrentText(
+            str(s.get("hires_method", "bislerp")))
         # image output
         self.cb_img_format.setCurrentText(str(s.get("image_format", "png")))
         self.stack_quality.setCurrentIndex(self.cb_img_format.currentIndex())
@@ -2216,12 +2308,16 @@ class MainWindow(QMainWindow):
         """Save whenever any persisted control changes."""
         for combo in (self.cb_diffusion, self.cb_vae, self.cb_te1, self.cb_te2,
                       self.cb_clip_type, self.cb_sampler, self.cb_scheduler,
-                      self.cb_dtype, self.cb_img_format):
+                      self.cb_dtype, self.cb_img_format, self.cb_hires_method):
             combo.currentTextChanged.connect(self._schedule_save)
         for spin in (self.sp_width, self.sp_height, self.sp_steps, self.sp_batch,
-                     self.sp_png_compress, self.sp_jpg_quality, self.sp_webp_quality):
+                     self.sp_png_compress, self.sp_jpg_quality, self.sp_webp_quality,
+                     self.sp_hires_steps):
             spin.valueChanged.connect(self._schedule_save)
         self.sp_cfg.valueChanged.connect(self._schedule_save)
+        self.sp_hires_scale.valueChanged.connect(self._schedule_save)
+        self.sp_hires_denoise.valueChanged.connect(self._schedule_save)
+        self.grp_hires.toggled.connect(self._schedule_save)
         self.chk_dual_te.toggled.connect(self._schedule_save)
         self.chk_randomize.toggled.connect(self._schedule_save)
         self.chk_embed_meta.toggled.connect(self._schedule_save)
@@ -2267,6 +2363,11 @@ class MainWindow(QMainWindow):
             "seed": self.ed_seed.text().strip() or "-1",
             "randomize": self.chk_randomize.isChecked(),
             "dtype": self.cb_dtype.currentText(),
+            "hires_enabled": self.grp_hires.isChecked(),
+            "hires_scale": float(self.sp_hires_scale.value()),
+            "hires_denoise": float(self.sp_hires_denoise.value()),
+            "hires_steps": self.sp_hires_steps.value(),
+            "hires_method": self.cb_hires_method.currentText(),
             "image_format": self.cb_img_format.currentText(),
             "embed_metadata": self.chk_embed_meta.isChecked(),
             "png_compress": self.sp_png_compress.value(),
@@ -2353,6 +2454,11 @@ class MainWindow(QMainWindow):
             seed=seed,
             batch_size=self.sp_batch.value(),
             weight_dtype=self.cb_dtype.currentText(),
+            hires_enabled=self.grp_hires.isChecked(),
+            hires_scale=float(self.sp_hires_scale.value()),
+            hires_denoise=float(self.sp_hires_denoise.value()),
+            hires_steps=self.sp_hires_steps.value(),
+            hires_method=self.cb_hires_method.currentText(),
         )
 
     # ----- prompt presets (prompts.csv) -------------------------------------
@@ -2611,6 +2717,14 @@ class MainWindow(QMainWindow):
             "batch": p.batch_size,
             "dtype": p.weight_dtype,
         }
+        if p.hires_enabled:
+            # webui 互換フィールド名（Hires upscale / Hires steps / Denoising
+            # strength）に latent 方式の情報を足す。
+            meta["hires_upscale"] = f"{p.hires_scale:g}"
+            meta["hires_steps"] = (int(p.hires_steps) if p.hires_steps > 0
+                                   else p.steps)
+            meta["denoising_strength"] = f"{p.hires_denoise:g}"
+            meta["hires_method"] = f"Latent ({p.hires_method})"
         if p.loras:
             meta["loras"] = ", ".join(f"{n}:{w:g}" for n, w in p.loras)
             # webui の "Lora hashes" フィールド（AutoV2 = SHA256 先頭10桁）。
