@@ -526,13 +526,16 @@ class MainWindow(QMainWindow):
         self.cb_scheduler.setCurrentText("simple")
 
         # Seeds can exceed 32-bit (QSpinBox limit), so use a text field.
+        # Seed は保存も生成後の書き戻しもしない。-1（起動時の初期値）なら
+        # 生成のたびに内部でランダム値を引く。実際に使った値はログと画像
+        # メタデータに残る。
         self.ed_seed = QLineEdit("-1")
         self.ed_seed.setValidator(
             QRegularExpressionValidator(QRegularExpression(r"-1|\d{1,19}"))
         )
-        self.ed_seed.setToolTip("-1 = 毎回ランダム")
-        self.chk_randomize = QCheckBox("生成ごとに seed をランダム化")
-        self.chk_randomize.setChecked(True)
+        self.ed_seed.setToolTip(
+            "-1 = 生成ごとにランダム（欄は書き換わりません。使われた値は"
+            "ログ・画像メタデータで確認できます）")
 
         self.cb_dtype = WideComboBox()
         self.cb_dtype.addItems(["default", "fp8_e4m3fn", "fp8_e5m2"])
@@ -573,7 +576,6 @@ class MainWindow(QMainWindow):
         grid.addWidget(QLabel("Batch"), r, 2); grid.addWidget(self.sp_batch, r, 3)
         r += 1
         grid.addWidget(QLabel("UNet dtype"), r, 0); grid.addWidget(self.cb_dtype, r, 1)
-        grid.addWidget(self.chk_randomize, r, 2, 1, 2)
         return box
 
     def _build_hires_box(self) -> QGroupBox:
@@ -1955,8 +1957,6 @@ class MainWindow(QMainWindow):
         # モデル軸でマージモデルを使ったならピン状態 ●/○ を最新化。
         if any(p.merge_models for p in ctx.get("params", {}).values()):
             self._sync_merge_states()
-        if self.chk_randomize.isChecked():
-            self._set_seed(-1)
         # 比較グリッドの合成/保存はワーカースレッドで行う（大きなグリッド
         # では数秒かかり、UI スレッドで行うとフリーズして見えるため）。
         # 表示 OFF なら合成自体をスキップ（保存も表示が前提）。
@@ -2139,7 +2139,6 @@ class MainWindow(QMainWindow):
             "sampler": self.cb_sampler.currentText(),
             "scheduler": self.cb_scheduler.currentText(),
             "seed": self.ed_seed.text().strip() or "-1",
-            "randomize": self.chk_randomize.isChecked(),
             "dtype": self.cb_dtype.currentText(),
             "hires_enabled": self.grp_hires.isChecked(),
             "hires_scale": float(self.sp_hires_scale.value()),
@@ -2174,7 +2173,6 @@ class MainWindow(QMainWindow):
             self.cb_sampler.setCurrentText(str(c.get("sampler", "er_sde")))
             self.cb_scheduler.setCurrentText(str(c.get("scheduler", "simple")))
             self.ed_seed.setText(str(c.get("seed", "-1")))
-            self.chk_randomize.setChecked(bool(c.get("randomize", True)))
             self.cb_dtype.setCurrentText(str(c.get("dtype", "default")))
             self.grp_hires.setChecked(bool(c.get("hires_enabled", False)))
             self.sp_hires_scale.setValue(float(c.get("hires_scale", 1.5)))
@@ -2277,7 +2275,6 @@ class MainWindow(QMainWindow):
         self.cb_sampler.setCurrentText(str(s.get("sampler", "er_sde")))
         self.cb_scheduler.setCurrentText(str(s.get("scheduler", "simple")))
         self.ed_seed.setText(str(s.get("seed", "-1")))
-        self.chk_randomize.setChecked(bool(s.get("randomize", True)))
         self.cb_dtype.setCurrentText(str(s.get("dtype", "default")))
         # Hires fix (latent)
         self.grp_hires.setChecked(bool(s.get("hires_enabled", False)))
@@ -2319,7 +2316,6 @@ class MainWindow(QMainWindow):
         self.sp_hires_denoise.valueChanged.connect(self._schedule_save)
         self.grp_hires.toggled.connect(self._schedule_save)
         self.chk_dual_te.toggled.connect(self._schedule_save)
-        self.chk_randomize.toggled.connect(self._schedule_save)
         self.chk_embed_meta.toggled.connect(self._schedule_save)
         self.ed_seed.textChanged.connect(self._schedule_save)
 
@@ -2361,7 +2357,6 @@ class MainWindow(QMainWindow):
             "sampler": self.cb_sampler.currentText(),
             "scheduler": self.cb_scheduler.currentText(),
             "seed": self.ed_seed.text().strip() or "-1",
-            "randomize": self.chk_randomize.isChecked(),
             "dtype": self.cb_dtype.currentText(),
             "hires_enabled": self.grp_hires.isChecked(),
             "hires_scale": float(self.sp_hires_scale.value()),
@@ -2413,18 +2408,16 @@ class MainWindow(QMainWindow):
         except ValueError:
             return -1
 
-    def _set_seed(self, v: int) -> None:
-        self.ed_seed.setText(str(v))
-
     def _collect_params(self) -> GenParams:
         te = [self.cb_te1.currentText().strip()]
         if self.chk_dual_te.isChecked() and self.cb_te2.currentText().strip():
             te.append(self.cb_te2.currentText().strip())
 
+        # -1 は生成のたびに内部でランダム値へ解決する（欄は書き換えない。
+        # 使った値はログ・画像メタデータに残る）。
         seed = self._seed_value()
         if seed < 0:
             seed = random.randint(0, MAX_SEED)
-            self._set_seed(seed)
 
         entry = self._selected_merge_entry()
         self._last_merge_id = int(entry["id"]) if entry else None
@@ -2627,8 +2620,6 @@ class MainWindow(QMainWindow):
         if images:
             self._show_image(images[0])
             self._save_outputs(images)
-        if self.chk_randomize.isChecked():
-            self._set_seed(-1)
 
     def _on_cached_nodes(self, nodes: list) -> None:
         # Node "4" is the merge node in every merge graph; seeing it in the

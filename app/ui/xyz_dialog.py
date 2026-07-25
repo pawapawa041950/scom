@@ -41,7 +41,8 @@ class XyzDialog(QDialog):
         note = QLabel(
             "各軸にパラメータと値リストを指定し、全組み合わせを生成して"
             "1枚のグリッド画像にまとめます（output に保存）。"
-            "Seed はメイン画面の値で固定、Batch は 1 として扱われます。")
+            "Seed はメイン画面の値で全セル共通（-1 なら実行ごとにランダム）、"
+            "Batch は 1 として扱われます。")
         note.setWordWrap(True)
         root.addWidget(note)
 
@@ -131,8 +132,7 @@ class XyzDialog(QDialog):
         self.chk_continuous = QCheckBox("連続")
         self.chk_continuous.setToolTip(
             "ONの間、完了するたびに同じ設定で次の XYZ 生成を自動で開始します"
-            "（メイン画面の「生成ごとに seed をランダム化」がONなら毎回"
-            "新しい seed になります）")
+            "（メイン画面の Seed が -1 なら毎回新しい seed になります）")
         self.btn_run = QPushButton("実行")
         self.btn_run.clicked.connect(self._on_run)
         self.btn_cancel = QPushButton("キャンセル")

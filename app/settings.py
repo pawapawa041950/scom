@@ -49,8 +49,9 @@ DEFAULTS: dict[str, Any] = {
     "batch": 1,
     "sampler": "er_sde",
     "scheduler": "simple",
+    # seed 欄の値（"-1" = 毎回ランダム）。生成後の書き戻しは無いので、
+    # 保存されるのはユーザーが欄に入力した値そのもの。
     "seed": "-1",
-    "randomize": True,
     "dtype": "default",
     # image output
     "image_format": "png",   # png | jpg | webp
