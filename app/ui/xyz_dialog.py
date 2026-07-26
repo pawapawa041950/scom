@@ -224,24 +224,46 @@ class XyzDialog(QDialog):
         各候補が QCheckBox（QWidgetAction 経由）なのでクリックしてもメニューは
         閉じず、続けて付け外しできる。チェック状態は値欄の現在値から復元され、
         付け外しのたびに値欄へ即時反映される（値数・生成枚数の表示も追随）。
+        値欄のテキストは**チェックした順**に並ぶ（ドロップダウンの並び順では
+        なく、欄の既存の並び + 新しくチェックしたものを末尾に追加）。
         """
         axis = self._axis_def(row)
         choices = self._axis_choices(axis)
         if not choices:
             return None
         menu = QMenu(self)
-        current = set(xyz.split_values(row["edit"].text()))
+        current = xyz.split_values(row["edit"].text())
         pairs: list[tuple[str, QCheckBox]] = []
+        # チェック順を保持する選択リスト。初期値は欄の現在の並び
+        # （候補に存在する値のみ・重複除去）。
+        selected: list[str] = []
+        for v in current:
+            if v in choices and v not in selected:
+                selected.append(v)
 
         def sync() -> None:
-            row["edit"].setText(xyz.join_values(
-                [c for c, cb in pairs if cb.isChecked()]))
+            row["edit"].setText(xyz.join_values(list(selected)))
+
+        def on_toggled(c: str, checked: bool) -> None:
+            if checked:
+                if c not in selected:
+                    selected.append(c)    # 新規チェックは末尾へ
+            elif c in selected:
+                selected.remove(c)
+            sync()
 
         def set_all(state: bool) -> None:
             for _c, cb in pairs:
                 cb.blockSignals(True)
                 cb.setChecked(state)
                 cb.blockSignals(False)
+            if state:
+                # 既にある分の順序は保ち、未選択分をリスト順で末尾に足す。
+                for c, _cb in pairs:
+                    if c not in selected:
+                        selected.append(c)
+            else:
+                selected.clear()
             sync()
 
         head = QWidget()
@@ -261,8 +283,9 @@ class XyzDialog(QDialog):
 
         for c in choices:
             cb = QCheckBox(c.replace("&", "&&"))  # & はアクセラレータ扱いを回避
-            cb.setChecked(c in current)
-            cb.toggled.connect(lambda *_a: sync())
+            cb.setChecked(c in selected)
+            cb.toggled.connect(
+                lambda checked, _c=c: on_toggled(_c, checked))
             wrap = QWidget()
             wl = QHBoxLayout(wrap)
             wl.setContentsMargins(8, 2, 8, 2)
