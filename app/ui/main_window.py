@@ -231,6 +231,10 @@ class MainWindow(QMainWindow):
         self._last_params: Optional[GenParams] = None
         self._last_graph: Optional[dict] = None
         self._last_gen_ok: bool = False
+        # スキップ（連続 ON 中のキャンセル）: 現在の生成だけ中断して
+        # ループは続行するためのフラグ。cleanup で消費される。
+        self._gen_skip: bool = False
+        self._xyz_skip: bool = False
 
         # Persisted settings. prompt/negative are read as initial values only.
         self.settings, settings_error = settings.load(self.paths.settings_path)
@@ -659,13 +663,16 @@ class MainWindow(QMainWindow):
         self.btn_xyz.setMaximumWidth(56)
         self.btn_xyz.clicked.connect(self._open_xyz_dialog)
         self.btn_continuous = QCheckBox("連続")
-        self.btn_continuous.setToolTip("ONの間、生成が終わるたびに自動で次を生成します")
+        self.btn_continuous.setToolTip(
+            "ONの間、生成が終わるたびに自動で次を生成します"
+            "（ON中のキャンセルボタンは「スキップ」= 現在の生成だけ中断）")
         self.btn_continuous.setMinimumHeight(40)
         self.btn_generate = QPushButton("生成")
         self.btn_generate.clicked.connect(self.on_generate)
         self.btn_cancel = QPushButton("キャンセル")
         self.btn_cancel.setEnabled(False)
         self.btn_cancel.clicked.connect(self.on_cancel)
+        self.btn_continuous.toggled.connect(self._update_cancel_button)
         # 生成 stays about twice キャンセル; Ignored size policy makes the
         # layout use the stretch ratios alone instead of the text size hints.
         for b in (self.btn_generate, self.btn_cancel):
@@ -1613,7 +1620,7 @@ class MainWindow(QMainWindow):
                    + self._all_models.get("diffusion_models", []))
         dlg = XyzDialog(choices, state, None)
         dlg.run_requested.connect(self._on_xyz_requested)
-        dlg.cancel_requested.connect(self.on_cancel)
+        dlg.cancel_requested.connect(self._on_xyz_cancel_requested)
         # チェック状態は実行しなくても記憶する（次回開いたとき再現）。
         # コンストラクタでの復元後に接続するので、復元自体では発火しない。
         dlg.chk_save_cells.toggled.connect(
@@ -2022,11 +2029,13 @@ class MainWindow(QMainWindow):
         self.btn_generate.setEnabled(True)
         self.btn_cancel.setEnabled(False)
         self._push_xyz_running(False)
-        # XYZ 連続モード: 成功して終わり、ウィンドウの連続がONなら同じ設定で
-        # 次の実行を開始する（seed はメイン画面のランダム化設定に従う）。
+        # XYZ 連続モード: 成功（またはスキップによる中断）で終わり、
+        # ウィンドウの連続がONなら同じ設定で次の実行を開始する。
+        skip = self._xyz_skip
+        self._xyz_skip = False
         spec = getattr(self, "_xyz_last_spec", None)
-        if not (getattr(self, "_xyz_last_ok", False) and spec is not None
-                and self._xyz_dlg is not None):
+        if not ((getattr(self, "_xyz_last_ok", False) or skip)
+                and spec is not None and self._xyz_dlg is not None):
             return
         try:
             chained = self._xyz_dlg.chk_continuous.isChecked()
@@ -2570,20 +2579,56 @@ class MainWindow(QMainWindow):
         self._gen_thread.start()
 
     def on_cancel(self) -> None:
-        # Cancelling also stops continuous mode so the loop clearly ends.
-        self.btn_continuous.setChecked(False)
+        """メイン画面のキャンセル/スキップボタン。
+
+        連続 ON のときは「スキップ」: 現在の生成だけ中断し、連続はそのまま
+        次の生成へ進む。OFF のときは従来どおりのキャンセル。XYZ 実行中に
+        押された場合は XYZ を完全に停止する（XYZ のスキップは XYZ ウィンドウ
+        のボタンで行う）。"""
         if self._gen_worker:
+            if self.btn_continuous.isChecked():
+                self._gen_skip = True
+                self.append_log("スキップ: 現在の生成を中断して次へ進みます")
+            else:
+                self.append_log("キャンセルを要求しました")
             self._gen_worker.cancel()
-            self.append_log("キャンセルを要求しました")
-        if self._xyz_dlg is not None:
-            # XYZ の連続モードもここで止める（キャンセル = ループ終了の合図）。
-            try:
-                self._xyz_dlg.chk_continuous.setChecked(False)
-            except RuntimeError:
-                self._xyz_dlg = None
         if self._xyz_worker:
+            # メイン側からのキャンセルは XYZ ループ終了の合図。
+            if self._xyz_dlg is not None:
+                try:
+                    self._xyz_dlg.chk_continuous.setChecked(False)
+                except RuntimeError:
+                    self._xyz_dlg = None
             self._xyz_worker.cancel()
             self.append_log("XYZ プロットのキャンセルを要求しました")
+
+    def _on_xyz_cancel_requested(self) -> None:
+        """XYZ ウィンドウのキャンセル/スキップボタン。
+
+        XYZ の連続 ON なら「スキップ」: 現在の実行だけ中断し、連続は維持
+        したまま次の実行へ進む。OFF なら従来どおりのキャンセル。"""
+        if not self._xyz_worker:
+            return
+        xyz_cont = False
+        if self._xyz_dlg is not None:
+            try:
+                xyz_cont = self._xyz_dlg.chk_continuous.isChecked()
+            except RuntimeError:
+                self._xyz_dlg = None
+        if xyz_cont:
+            self._xyz_skip = True
+            self.append_log("スキップ: 現在の XYZ 実行を中断して次の実行へ進みます")
+        else:
+            self.append_log("XYZ プロットのキャンセルを要求しました")
+        self._xyz_worker.cancel()
+
+    def _update_cancel_button(self, *_a) -> None:
+        """連続 ON のときはキャンセルボタンを「スキップ」表示にする。"""
+        cont = self.btn_continuous.isChecked()
+        self.btn_cancel.setText("スキップ" if cont else "キャンセル")
+        self.btn_cancel.setToolTip(
+            "現在の生成を中断して次の生成に進みます（連続は続行）" if cont
+            else "")
 
     def _on_progress(self, p: Progress) -> None:
         if p.maximum:
@@ -2744,8 +2789,11 @@ class MainWindow(QMainWindow):
         self._gen_worker = None
         self.btn_generate.setEnabled(True)
         self.btn_cancel.setEnabled(False)
-        # Continuous mode: as soon as a successful run finishes, start the next.
-        if self.btn_continuous.isChecked() and self._last_gen_ok:
+        # Continuous mode: as soon as a successful run finishes, start the
+        # next. スキップ（連続 ON 中の中断）も同様に次へ進む。
+        skip = self._gen_skip
+        self._gen_skip = False
+        if self.btn_continuous.isChecked() and (self._last_gen_ok or skip):
             QTimer.singleShot(0, self.on_generate)
 
     def _show_image(self, data: bytes) -> None:

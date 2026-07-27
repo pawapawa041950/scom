@@ -132,12 +132,14 @@ class XyzDialog(QDialog):
         self.chk_continuous = QCheckBox("連続")
         self.chk_continuous.setToolTip(
             "ONの間、完了するたびに同じ設定で次の XYZ 生成を自動で開始します"
-            "（メイン画面の Seed が -1 なら毎回新しい seed になります）")
+            "（メイン画面の Seed が -1 なら毎回新しい seed になります。"
+            "ON中のキャンセルボタンは「スキップ」= 現在の実行だけ中断）")
         self.btn_run = QPushButton("実行")
         self.btn_run.clicked.connect(self._on_run)
         self.btn_cancel = QPushButton("キャンセル")
         self.btn_cancel.setEnabled(False)
         self.btn_cancel.clicked.connect(lambda: self.cancel_requested.emit())
+        self.chk_continuous.toggled.connect(self._update_cancel_label)
         btn_close = QPushButton("閉じる")
         btn_close.clicked.connect(self.close)
         btns.addStretch(1)
@@ -160,6 +162,14 @@ class XyzDialog(QDialog):
         self.chk_save_grid.setEnabled(checked)
         if not checked:
             self.chk_save_grid.setChecked(False)
+
+    def _update_cancel_label(self, *_a) -> None:
+        """連続 ON のときはキャンセルボタンを「スキップ」表示にする。"""
+        cont = self.chk_continuous.isChecked()
+        self.btn_cancel.setText("スキップ" if cont else "キャンセル")
+        self.btn_cancel.setToolTip(
+            "現在の実行を中断して次の実行に進みます（連続は続行）" if cont
+            else "")
 
     # ----- state -------------------------------------------------------------
     @staticmethod
