@@ -1680,10 +1680,8 @@ class MainWindow(QMainWindow):
             base = self._collect_params()
             base.batch_size = 1  # 1セル = 1枚
             if base.hires_enabled:
-                # XYZ は比較用途なので Hires fix は適用しない（全セルが
-                # 2段生成になり時間が跳ね上がるため。必要なら将来対応）。
-                base.hires_enabled = False
-                self.append_log("XYZ では Hires fix を無効にして実行します")
+                self.append_log(
+                    "XYZ: Hires fix 有効（各セルが2段生成になります）")
             axes = [xyz.axis_by_id(a["id"]) for a in spec["axes"]]
             values = [a["values"] for a in spec["axes"]]
             has_model_axis = any(a.id == "model" for a in axes)
@@ -1903,7 +1901,12 @@ class MainWindow(QMainWindow):
                       ("steps", "steps", int), ("cfg", "cfg", float),
                       ("sampler", "sampler", str),
                       ("scheduler", "scheduler", str),
-                      ("weight_dtype", "dtype", str))
+                      ("weight_dtype", "dtype", str),
+                      ("hires_enabled", "hires_enabled", bool),
+                      ("hires_scale", "hires_scale", float),
+                      ("hires_denoise", "hires_denoise", float),
+                      ("hires_steps", "hires_steps", int),
+                      ("hires_method", "hires_method", str))
             for field, key, cast in fields:
                 if field not in locked and key in conf:
                     kw[field] = cast(conf[key])
