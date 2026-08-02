@@ -235,6 +235,8 @@ class MainWindow(QMainWindow):
         # ループは続行するためのフラグ。cleanup で消費される。
         self._gen_skip: bool = False
         self._xyz_skip: bool = False
+        # 生成中に積まれた待機タスク（押した時点の GenParams スナップショット）。
+        self._gen_queue: list[GenParams] = []
 
         # Persisted settings. prompt/negative are read as initial values only.
         self.settings, settings_error = settings.load(self.paths.settings_path)
@@ -2535,32 +2537,55 @@ class MainWindow(QMainWindow):
         return super().eventFilter(obj, event)
 
     def on_generate(self) -> None:
+        """生成ボタン / Shift+Enter。アイドルなら即開始、生成中なら現在の
+        UI設定のスナップショットをタスクとして積む（完了後に順次消費）。"""
         if not self.backend.is_running():
             QMessageBox.warning(self, "未準備", "バックエンドがまだ起動していません。")
             return
-        if self._gen_thread is not None or self._xyz_thread is not None:
+        if self._xyz_thread is not None:
+            return  # XYZ 実行中はタスク積み対象外（ボタンも無効）
+        if self._merge_running:
+            QMessageBox.information(
+                self, "マージ実行中", "マージの完了後に生成してください。")
             return
         if self._merge_selected() and self._selected_merge_entry() is None:
             QMessageBox.warning(self, "マージ未設定",
                                 "選択中のマージモデルが見つかりません。")
             self._open_merge_dialog()
             return
-        self._merge_was_cached = False
         try:
             params = self._collect_params()
             warn = self._config_warning(params)
             if warn:
                 QMessageBox.warning(self, "モデル設定を確認してください", warn)
                 return
-            graph = build_graph(params)
+            build_graph(params)   # 積む場合も入力不足はこの場で検出する
         except ValueError as e:
             QMessageBox.warning(self, "入力不足", str(e))
             return
+        if self._gen_thread is not None:
+            # 生成中: タスクに積む（押した時点の設定・seed を保持）。
+            self._gen_queue.append(params)
+            self.append_log(
+                f"生成をタスクに積みました（待機 {len(self._gen_queue)} 件, "
+                f"seed={params.seed}）")
+            self._update_generate_button()
+            return
+        self._start_generation(params)
 
+    def _start_generation(self, params: GenParams) -> None:
+        """1件の生成を開始する（params は確定済みのスナップショット）。"""
+        try:
+            graph = build_graph(params)
+        except ValueError as e:
+            # 積んだ後に前提が消えた場合（マージ削除等）のみ起こり得る。
+            QMessageBox.warning(self, "入力不足", str(e))
+            self._update_generate_button()
+            return
+        self._merge_was_cached = False
         self._last_seed = params.seed
         self._last_params = params
         self._last_graph = graph
-        self.btn_generate.setEnabled(False)
         self.btn_cancel.setEnabled(True)
         self.progress.setValue(0)
         self.status.showMessage("生成中…")
@@ -2580,6 +2605,19 @@ class MainWindow(QMainWindow):
         self._gen_worker.failed.connect(self._gen_thread.quit)
         self._gen_thread.finished.connect(self._cleanup_gen_thread)
         self._gen_thread.start()
+        self._update_generate_button()
+
+    def _update_generate_button(self, *_a) -> None:
+        """生成中はボタンを「生成をタスクに積む (待機数)」表示にする。"""
+        if self._gen_thread is not None:
+            self.btn_generate.setText(
+                f"生成をタスクに積む ({len(self._gen_queue)})")
+            self.btn_generate.setToolTip(
+                "現在の設定・プロンプトのスナップショットを待機タスクとして"
+                "積みます。現在の生成が終わると順番に実行されます")
+        else:
+            self.btn_generate.setText("生成")
+            self.btn_generate.setToolTip("")
 
     def on_cancel(self) -> None:
         """メイン画面のキャンセル/スキップボタン。
@@ -2792,12 +2830,28 @@ class MainWindow(QMainWindow):
         self._gen_worker = None
         self.btn_generate.setEnabled(True)
         self.btn_cancel.setEnabled(False)
-        # Continuous mode: as soon as a successful run finishes, start the
-        # next. スキップ（連続 ON 中の中断）も同様に次へ進む。
         skip = self._gen_skip
         self._gen_skip = False
-        if self.btn_continuous.isChecked() and (self._last_gen_ok or skip):
+        proceed = self._last_gen_ok or skip
+        if proceed and self._gen_queue:
+            # 待機タスクを最優先で消費（連続 ON でもタスクが先）。
+            params = self._gen_queue.pop(0)
+            self.append_log(
+                f"待機タスクを開始します（残り {len(self._gen_queue)} 件）")
+            self._update_generate_button()
+            QTimer.singleShot(0, lambda p=params: self._start_generation(p))
+            return
+        if proceed and self.btn_continuous.isChecked():
+            # Continuous mode: start the next with the current UI values.
+            self._update_generate_button()
             QTimer.singleShot(0, self.on_generate)
+            return
+        if self._gen_queue:
+            # キャンセル/エラーで停止したときは待機タスクも破棄する。
+            n = len(self._gen_queue)
+            self._gen_queue.clear()
+            self.append_log(f"停止したため待機中のタスク {n} 件を破棄しました")
+        self._update_generate_button()
 
     def _show_image(self, data: bytes) -> None:
         img = QImage.fromData(data)
