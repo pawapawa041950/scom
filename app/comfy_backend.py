@@ -10,6 +10,7 @@ Responsibilities:
 """
 from __future__ import annotations
 
+import http.client
 import json
 import socket
 import subprocess
@@ -77,6 +78,14 @@ class Progress:
     value: int = 0
     maximum: int = 0
     note: str = ""
+
+
+# 生成直後の一時的な接続断（WinError 10054 / タイムアウト）に対する GET の
+# 再試行設定。ComfyUI 本体は生きているのに一瞬だけ応答できなくなるため。
+_HTTP_ATTEMPTS = 5
+_HTTP_BACKOFF = 0.4  # seconds; doubles each attempt (0.4, 0.8, 1.6, 3.2, 4.0)
+_RETRY_ERRORS = (urllib.error.URLError, ConnectionError, TimeoutError, OSError,
+                 http.client.HTTPException)
 
 
 class BackendError(RuntimeError):
@@ -221,31 +230,88 @@ class ComfyBackend:
 
     # ----- generation ------------------------------------------------------
     def _post_prompt(self, graph: dict) -> str:
-        payload = json.dumps({"prompt": graph, "client_id": self.client_id}).encode()
-        req = urllib.request.Request(
-            self.base_url + "/prompt", data=payload,
-            headers={"Content-Type": "application/json"},
-        )
+        """Queue the graph and return its prompt id.
+
+        The id is generated here (ComfyUI accepts a client-supplied UUID) so a
+        connection dropped mid-POST can be retried safely: we first ask the
+        backend whether that id was already queued, and only re-send when it
+        was not. Without this a retry could run the same prompt twice.
+        """
+        prompt_id = str(uuid.uuid4())
+        payload = json.dumps({"prompt": graph, "client_id": self.client_id,
+                              "prompt_id": prompt_id}).encode()
+        last: Exception = BackendError("no attempt was made")
+        for n in range(_HTTP_ATTEMPTS):
+            req = urllib.request.Request(
+                self.base_url + "/prompt", data=payload,
+                headers={"Content-Type": "application/json"},
+            )
+            try:
+                with urllib.request.urlopen(req, timeout=60) as resp:
+                    data = json.loads(resp.read())
+                return str(data.get("prompt_id") or prompt_id)
+            except urllib.error.HTTPError as e:
+                detail = e.read().decode(errors="replace")
+                raise BackendError(f"prompt が拒否されました: {detail}") from e
+            except _RETRY_ERRORS as e:
+                last = e
+                if self._prompt_queued(prompt_id):
+                    return prompt_id     # 届いていた: 再送しない
+                time.sleep(min(_HTTP_BACKOFF * (2 ** n), 4.0))
+        raise BackendError(
+            f"バックエンドへの接続に失敗しました（{_HTTP_ATTEMPTS} 回再試行）: {last}"
+        ) from last
+
+    def _prompt_queued(self, prompt_id: str) -> bool:
+        """True when the backend already knows this prompt (queued or done)."""
         try:
-            with urllib.request.urlopen(req, timeout=30) as resp:
-                data = json.loads(resp.read())
-        except urllib.error.HTTPError as e:
-            detail = e.read().decode(errors="replace")
-            raise BackendError(f"prompt が拒否されました: {detail}") from e
-        return data["prompt_id"]
+            if json.loads(
+                self._get(self.base_url + f"/history/{prompt_id}", attempts=2)
+            ).get(prompt_id):
+                return True
+            queue = json.loads(self._get(self.base_url + "/queue", attempts=2))
+        except (BackendError, ValueError, urllib.error.HTTPError):
+            return False
+        for key in ("queue_running", "queue_pending"):
+            for item in queue.get(key, []):
+                if len(item) > 1 and item[1] == prompt_id:
+                    return True
+        return False
+
+    def _get(self, url: str, timeout: float = 60.0,
+             attempts: int = _HTTP_ATTEMPTS) -> bytes:
+        """GET with retries for the transient failures the backend shows right
+        after a prompt finishes.
+
+        ComfyUI does its post-execution work (GC / VRAM staging / output
+        registration) on the worker thread, which holds the GIL and starves the
+        aiohttp event loop. Requests issued in that window get the connection
+        reset (WinError 10054) or time out even though the server is healthy.
+        Retrying a few times rides it out; only GETs are retried (they are
+        idempotent — the prompt POST must never be replayed).
+        """
+        last: Exception = BackendError("no attempt was made")
+        for n in range(attempts):
+            try:
+                with urllib.request.urlopen(url, timeout=timeout) as resp:
+                    return resp.read()
+            except urllib.error.HTTPError:
+                raise                      # 404 等はリトライしても無駄
+            except _RETRY_ERRORS as e:
+                last = e
+                time.sleep(min(_HTTP_BACKOFF * (2 ** n), 4.0))
+        raise BackendError(
+            f"バックエンドへの接続に失敗しました（{attempts} 回再試行）: {last}"
+        ) from last
 
     def _fetch_image(self, filename: str, subfolder: str, ftype: str) -> bytes:
         qs = urllib.parse.urlencode(
             {"filename": filename, "subfolder": subfolder, "type": ftype}
         )
-        with urllib.request.urlopen(self.base_url + "/view?" + qs, timeout=30) as resp:
-            return resp.read()
+        return self._get(self.base_url + "/view?" + qs)
 
     def _history_images(self, prompt_id: str) -> list[bytes]:
-        with urllib.request.urlopen(
-            self.base_url + f"/history/{prompt_id}", timeout=30
-        ) as resp:
-            history = json.loads(resp.read())
+        history = json.loads(self._get(self.base_url + f"/history/{prompt_id}"))
         entry = history.get(prompt_id, {})
         images: list[bytes] = []
         for node_out in entry.get("outputs", {}).values():
@@ -288,6 +354,7 @@ class ComfyBackend:
                          if node.get("class_type") == "KSampler"}
         sample_secs = 0.0
         sample_enter: Optional[float] = None
+        ws_alive = True          # False = 接続断 -> HTTP ポーリングへ切替
 
         ws = websocket.WebSocket()
         ws.connect(
@@ -305,6 +372,12 @@ class ComfyBackend:
                     msg = ws.recv()
                 except websocket.WebSocketTimeoutException:
                     continue
+                except (websocket.WebSocketException, OSError):
+                    # 生成直後などにサーバのイベントループが詰まると接続を
+                    # 切られることがある（WinError 10054）。プロンプト自体は
+                    # 実行され続けるので、以降は HTTP ポーリングで完了を待つ。
+                    ws_alive = False
+                    break
                 if isinstance(msg, (bytes, bytearray)):
                     # Binary frame: [4B event][4B image format][image bytes].
                     # event 1 == PREVIEW_IMAGE.
@@ -345,9 +418,37 @@ class ComfyBackend:
             except Exception:
                 pass
 
-        if on_timing is not None and sample_secs > 0:
-            on_timing(sample_secs)
+        if not ws_alive:
+            # 進捗は取りこぼすが、完了は履歴で確認できる。
+            self._wait_prompt(prompt_id, cancel)
+        elif on_timing is not None and sample_secs > 0:
+            on_timing(sample_secs)   # 途中で切れた計測値は使わない
         return self._history_images(prompt_id)
+
+    def _wait_prompt(self, prompt_id: str, cancel: Callable[[], bool],
+                     timeout: float = 1800.0) -> None:
+        """Wait for ``prompt_id`` to finish by polling /history.
+
+        Used when the progress websocket drops mid-run: the backend keeps
+        executing the queued prompt, so the history endpoint is the source of
+        truth for completion.
+        """
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if cancel():
+                self.interrupt()
+                raise BackendError("生成をキャンセルしました")
+            entry = json.loads(
+                self._get(self.base_url + f"/history/{prompt_id}")
+            ).get(prompt_id)
+            if entry:
+                status = entry.get("status", {})
+                if status.get("status_str") == "error":
+                    raise BackendError(f"実行エラー: {status.get('messages')}")
+                if entry.get("outputs") or status.get("completed"):
+                    return
+            time.sleep(0.5)
+        raise BackendError("生成の完了を確認できませんでした")
 
     def interrupt(self) -> None:
         try:
