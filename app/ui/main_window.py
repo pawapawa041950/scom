@@ -2618,16 +2618,18 @@ class MainWindow(QMainWindow):
         else:
             self.btn_generate.setText("生成")
             self.btn_generate.setToolTip("")
+        # 待機数でキャンセル/スキップの表示が変わるので合わせて更新する。
+        self._update_cancel_button()
 
     def on_cancel(self) -> None:
         """メイン画面のキャンセル/スキップボタン。
 
-        連続 ON のときは「スキップ」: 現在の生成だけ中断し、連続はそのまま
-        次の生成へ進む。OFF のときは従来どおりのキャンセル。XYZ 実行中に
-        押された場合は XYZ を完全に停止する（XYZ のスキップは XYZ ウィンドウ
-        のボタンで行う）。"""
+        連続 ON のとき、またはタスクが積まれているときは「スキップ」:
+        現在の生成だけ中断し、待機タスク/連続はそのまま次へ進む。どちらでも
+        ないときだけ従来どおりのキャンセル。XYZ 実行中に押された場合は XYZ を
+        完全に停止する（XYZ のスキップは XYZ ウィンドウのボタンで行う）。"""
         if self._gen_worker:
-            if self.btn_continuous.isChecked():
+            if self.btn_continuous.isChecked() or self._gen_queue:
                 self._gen_skip = True
                 self.append_log("スキップ: 現在の生成を中断して次へ進みます")
             else:
@@ -2664,12 +2666,22 @@ class MainWindow(QMainWindow):
         self._xyz_worker.cancel()
 
     def _update_cancel_button(self, *_a) -> None:
-        """連続 ON のときはキャンセルボタンを「スキップ」表示にする。"""
-        cont = self.btn_continuous.isChecked()
-        self.btn_cancel.setText("スキップ" if cont else "キャンセル")
-        self.btn_cancel.setToolTip(
-            "現在の生成を中断して次の生成に進みます（連続は続行）" if cont
-            else "")
+        """連続 ON かタスクが積まれているときは「スキップ」表示にする。
+
+        どちらも「押しても待機タスクは残り、次へ進む」動作なのでラベルを
+        揃える。待機タスクが無く連続 OFF のときだけ本当のキャンセル。"""
+        queued = len(self._gen_queue)
+        skip = self.btn_continuous.isChecked() or queued > 0
+        self.btn_cancel.setText("スキップ" if skip else "キャンセル")
+        if not skip:
+            self.btn_cancel.setToolTip("")
+        elif queued:
+            self.btn_cancel.setToolTip(
+                "現在の生成を中断して次の待機タスクに進みます"
+                f"（待機 {queued} 件）")
+        else:
+            self.btn_cancel.setToolTip(
+                "現在の生成を中断して次の生成に進みます（連続は続行）")
 
     def _on_progress(self, p: Progress) -> None:
         if p.maximum:
