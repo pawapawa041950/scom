@@ -102,6 +102,7 @@ class ComfyBackend:
         self.client_id = uuid.uuid4().hex
         # 起動前にメインウィンドウが設定から反映する（次回起動時に有効）。
         self.use_sage_attention = False
+        self.use_ck_attention = False
         self._proc: Optional[subprocess.Popen] = None
         self._log_thread: Optional[threading.Thread] = None
         self._log_tail: deque[str] = deque(maxlen=40)
@@ -142,7 +143,13 @@ class ComfyBackend:
             "--preview-method", "auto",  # stream latent previews over the ws
             "--disable-auto-launch",
         ]
-        if self.use_sage_attention:
+        if self.use_ck_attention:
+            # 対応可否は設定を ON にした時点で確認済み（setup.ck_attention_available）。
+            # 未対応環境で付けると ComfyUI は exit(-1) するので、起動失敗時は
+            # 設定で OFF にすれば復旧できる。
+            cmd.append("--use-ck-attention")
+            log("Comfy Kitchen INT8 attention を有効化して起動します")
+        elif self.use_sage_attention:
             # パッケージが実在するときだけフラグを付ける。無いのに付けると
             # ComfyUI は起動時に exit(-1) するため（attention.py 参照）。
             from .bootstrap.setup import sage_installed

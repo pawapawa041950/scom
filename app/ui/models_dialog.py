@@ -13,7 +13,9 @@ from PySide6.QtWidgets import (
 
 from .. import config
 from ..bootstrap import environment, models as models_mod
-from ..bootstrap.setup import SetupError, install_sage_attention, sage_installed
+from ..bootstrap.setup import (
+    SetupError, ck_attention_available, install_sage_attention, sage_installed,
+)
 from .model_selector import ModelSelector
 from .window_state import bind_geometry
 
@@ -75,12 +77,27 @@ class _SageInstallWorker(QObject):
             self.failed.emit(str(e))
 
 
+class _CkCheckWorker(QObject):
+    """Comfy Kitchen INT8 attention の対応判定（バックエンド python を起動して
+    comfy_kitchen を import するため数秒かかる）。"""
+    result = Signal(bool, str)
+
+    def __init__(self, paths: config.AppPaths):
+        super().__init__()
+        self.paths = paths
+
+    def run(self) -> None:
+        ok, reason = ck_attention_available(self.paths)
+        self.result.emit(ok, reason)
+
+
 class ModelsDialog(QDialog):
     # SageAttention 設定の変更（persist はメインウィンドウが行う）。
     sage_toggled = Signal(bool)
+    ck_toggled = Signal(bool)
 
     def __init__(self, paths: config.AppPaths, sage_enabled: bool = False,
-                 parent=None):
+                 ck_enabled: bool = False, parent=None):
         super().__init__(parent)
         self.setWindowTitle("scom - 設定")
         self.resize(720, 560)
@@ -119,8 +136,22 @@ class ModelsDialog(QDialog):
         self.lbl_sage.setStyleSheet("color:#888;")
         opt_lay.addWidget(self.chk_sage)
         opt_lay.addWidget(self.lbl_sage)
+        # Comfy Kitchen INT8 attention（ComfyUI v0.35+）。SageAttention と排他。
+        self.chk_ck = QCheckBox(
+            "Comfy Kitchen INT8 attention を使用（生成を高速化・出力が僅かに変化）")
+        self.chk_ck.setToolTip(
+            "ComfyUI 同梱の comfy-kitchen による INT8 attention。追加インストール"
+            "不要で、SageAttention の代わりに使えます（同時には使えません）。\n"
+            "出力は標準 attention とわずかに変わります。反映にはアプリの再起動が"
+            "必要です。")
+        self.lbl_ck = QLabel("")
+        self.lbl_ck.setWordWrap(True)
+        self.lbl_ck.setStyleSheet("color:#888;")
+        opt_lay.addWidget(self.chk_ck)
+        opt_lay.addWidget(self.lbl_ck)
         layout.addWidget(opt_box)
         self._init_sage_checkbox(sage_enabled)
+        self._init_ck_checkbox(ck_enabled)
 
         btn_row = QHBoxLayout()
         btn_row.addStretch(1)
@@ -159,6 +190,8 @@ class ModelsDialog(QDialog):
         if not checked:
             self.lbl_sage.setText("無効にしました（アプリ再起動後に反映）")
             return
+        if self.chk_ck.isChecked():
+            self.chk_ck.setChecked(False)   # 排他（ck 側の toggled で設定も OFF）
         if sage_installed(self._paths):
             self.lbl_sage.setText("有効にしました（アプリ再起動後に反映）")
             return
@@ -198,6 +231,50 @@ class ModelsDialog(QDialog):
         self.sage_toggled.emit(False)   # 楽観反映を取り消す
         self.lbl_sage.setText("インストールに失敗しました")
         QMessageBox.warning(self, "SageAttention", f"インストールに失敗しました:\n{msg}")
+
+    # ----- Comfy Kitchen INT8 attention ------------------------------------
+    def _init_ck_checkbox(self, enabled: bool) -> None:
+        self.chk_ck.setChecked(bool(enabled))
+        self.lbl_ck.setText(
+            "有効（アプリ再起動後に反映）" if enabled
+            else "ON にすると対応可否を確認してから有効にします")
+        # 初期化後に接続 = 復元では発火しない。
+        self.chk_ck.toggled.connect(self._on_ck_toggled)
+
+    def _on_ck_toggled(self, checked: bool) -> None:
+        if not checked:
+            self.ck_toggled.emit(False)
+            self.lbl_ck.setText("無効にしました（アプリ再起動後に反映）")
+            return
+        if self.chk_sage.isChecked():
+            self.chk_sage.setChecked(False)  # 排他（sage 側の toggled で設定も OFF）
+        # 未対応環境で ON にすると ComfyUI が起動時に落ちるため、設定へ反映する
+        # 前にバックエンド python で判定する（親なしスレッド、_SAGE_JOBS 流用）。
+        self.chk_ck.setEnabled(False)
+        self.lbl_ck.setText("対応を確認中…")
+        thread = QThread()
+        worker = _CkCheckWorker(self._paths)
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.result.connect(self._on_ck_checked)
+        worker.result.connect(thread.quit)
+        _SAGE_JOBS.append((thread, worker))
+        thread.finished.connect(
+            lambda t=thread, w=worker: _SAGE_JOBS.remove((t, w)))
+        thread.start()
+
+    def _on_ck_checked(self, ok: bool, reason: str) -> None:
+        self.chk_ck.setEnabled(True)
+        if ok:
+            self.ck_toggled.emit(True)
+            self.lbl_ck.setStyleSheet("color:#888;")
+            self.lbl_ck.setText("有効にしました（アプリ再起動後に反映）")
+            return
+        self.chk_ck.blockSignals(True)
+        self.chk_ck.setChecked(False)
+        self.chk_ck.blockSignals(False)
+        self.lbl_ck.setText(reason)
+        self.lbl_ck.setStyleSheet("color:#c33;")
 
     # ----- download --------------------------------------------------------
     def _on_download(self) -> None:

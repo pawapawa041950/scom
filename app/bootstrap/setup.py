@@ -27,16 +27,17 @@ LogCb = Callable[[str], None]
 # Pin ComfyUI to a specific release tag for reproducible installs. The short
 # /archive/<ref>.zip form resolves tags, branches, and commit SHAs alike, so
 # SCOM_COMFYUI_REF can be overridden with any of them (e.g. "master").
-# v0.28.0 (2026-07-15, commit 700821e): 旧ピン 1377a2f（v0.27 直後の
-# 暫定 master、int4 ConvRot 対応目的）を含む正式リリース。
-COMFYUI_REF = os.environ.get("SCOM_COMFYUI_REF", "v0.28.0")
+# v0.35.1 (2026-09-10, commit 856a922): v0.28.0 からの主な差分は anima の
+# 融合カーネル化、comfy-kitchen 0.2.33（int8 最適化）、Comfy Kitchen INT8
+# attention（--use-ck-attention）、サンプラー cfgpp_ud10_ab の追加。
+COMFYUI_REF = os.environ.get("SCOM_COMFYUI_REF", "v0.35.1")
 COMFYUI_ZIP = f"https://github.com/comfyanonymous/ComfyUI/archive/{COMFYUI_REF}.zip"
 
 # Bump when a newer ComfyUI is required (e.g. for a new model architecture such
 # as Krea-2). Changing this re-fetches ComfyUI and reinstalls its deps on
 # machines that were provisioned with an older copy. Tied to the pinned ref so
 # the provisioned version is self-documenting.
-COMFYUI_MARKER = os.environ.get("SCOM_COMFYUI_MARKER", "v0.28.0")
+COMFYUI_MARKER = os.environ.get("SCOM_COMFYUI_MARKER", "v0.35.1")
 
 # Fixed (non-model) steps, in order: (step_id, title).
 # Technical names (uv / PyTorch / ComfyUI) are kept in English by request.
@@ -360,3 +361,34 @@ def install_sage_attention(paths: config.AppPaths, log: LogCb,
         paths.uv_path, paths.backend_python, log,
         packages=["triton-windows", wheel], cancel=cancel,
     )
+
+
+# ----- Comfy Kitchen INT8 attention (ComfyUI v0.35+) --------------------------
+def ck_attention_available(paths: config.AppPaths) -> tuple[bool, str]:
+    """バックエンド venv の comfy-kitchen が INT8 attention を使えるか。
+
+    ComfyUI は --use-ck-attention 指定時にカーネルが無いと exit(-1) するので、
+    設定を ON にする前にここで確かめる。判定はバックエンド python で
+    comfy_kitchen を import するため数秒かかる（UI スレッドで呼ばないこと）。
+    """
+    import subprocess
+    code = ("import comfy_kitchen as ck;"
+            "print('OK' if ck.int8_attention_is_available() else 'NO')")
+    try:
+        creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        res = subprocess.run(
+            [str(paths.backend_python), "-c", code],
+            capture_output=True, text=True, timeout=120,
+            creationflags=creationflags,
+        )
+    except (OSError, subprocess.TimeoutExpired) as e:
+        return False, f"判定に失敗しました: {e}"
+    out = (res.stdout or "").strip().splitlines()
+    if out and out[-1] == "OK":
+        return True, ""
+    if out and out[-1] == "NO":
+        return False, ("この GPU / comfy-kitchen では INT8 attention を"
+                       "使えません（RTX 30 以降が必要）")
+    tail = (res.stderr or "").strip().splitlines()[-1:] or ["不明なエラー"]
+    return False, ("comfy-kitchen の読み込みに失敗しました（ComfyUI を"
+                   f"更新してください）: {tail[0]}")

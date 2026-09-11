@@ -35,6 +35,9 @@ DEFAULTS: dict[str, Any] = {
     # SageAttention（量子化attentionによる高速化）を使うか。ONでもパッケージ
     # 未導入なら起動フラグは付けない（バックエンドが起動不能になるため）。
     "sage_attention": False,
+    # Comfy Kitchen INT8 attention（ComfyUI v0.35+ の --use-ck-attention）。
+    # SageAttention と排他（両方指定すると ComfyUI 側は ck を優先する）。
+    "ck_attention": False,
     # Hires fix (latent): 2段目サンプリングによる高解像度化
     "hires_enabled": False,
     "hires_scale": 1.5,

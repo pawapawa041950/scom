@@ -237,6 +237,10 @@ class MainWindow(QMainWindow):
         self._xyz_skip: bool = False
         # 生成中に積まれた待機タスク（押した時点の GenParams スナップショット）。
         self._gen_queue: list[GenParams] = []
+        # ComfyUI の起動状態: "starting" → "ready" | "failed"。
+        # backend.is_running() はプロセスを立ち上げた直後から True になり、
+        # 応答可能になったかは分からないので、生成系の入口はこちらで判定する。
+        self._backend_state: str = "starting"
 
         # Persisted settings. prompt/negative are read as initial values only.
         self.settings, settings_error = settings.load(self.paths.settings_path)
@@ -669,7 +673,8 @@ class MainWindow(QMainWindow):
             "ONの間、生成が終わるたびに自動で次を生成します"
             "（ON中のキャンセルボタンは「スキップ」= 現在の生成だけ中断）")
         self.btn_continuous.setMinimumHeight(40)
-        self.btn_generate = QPushButton("生成")
+        self.btn_generate = QPushButton("ComfyUI 準備中…")
+        self.btn_generate.setEnabled(False)   # ComfyUI の準備完了で有効化
         self.btn_generate.clicked.connect(self.on_generate)
         self.btn_cancel = QPushButton("キャンセル")
         self.btn_cancel.setEnabled(False)
@@ -786,8 +791,10 @@ class MainWindow(QMainWindow):
         dlg = ModelsDialog(
             self.paths, sage_enabled=bool(self.settings.get("sage_attention",
                                                             False)),
+            ck_enabled=bool(self.settings.get("ck_attention", False)),
             parent=self)
         dlg.sage_toggled.connect(self._on_sage_setting_toggled)
+        dlg.ck_toggled.connect(self._on_ck_setting_toggled)
         dlg.exec()
         self.refresh_models()
 
@@ -797,6 +804,13 @@ class MainWindow(QMainWindow):
         self.append_log(
             "SageAttention を{}にしました（アプリ再起動後に反映）".format(
                 "有効" if enabled else "無効"))
+
+    def _on_ck_setting_toggled(self, enabled: bool) -> None:
+        self.settings["ck_attention"] = bool(enabled)
+        self._schedule_save()
+        self.append_log(
+            "Comfy Kitchen INT8 attention を{}にしました（アプリ再起動後に反映）"
+            .format("有効" if enabled else "無効"))
 
     def _on_dual_toggled(self, checked: bool) -> None:
         self.cb_te2.setEnabled(checked)
@@ -1165,7 +1179,7 @@ class MainWindow(QMainWindow):
         self._push_merge_state()
 
     def _on_free_memory(self) -> None:
-        if not self.backend.is_running():
+        if not self._backend_ready():
             QMessageBox.warning(self, "未準備", "バックエンドが起動していません。")
             return
         try:
@@ -1196,7 +1210,7 @@ class MainWindow(QMainWindow):
     def _run_merge(self, graph: dict, saving: bool,
                    entry_id: Optional[int]) -> None:
         """Run a merge-only prompt (build in RAM / save to file) off-thread."""
-        if not self.backend.is_running():
+        if not self._backend_ready():
             QMessageBox.warning(
                 self, "未準備",
                 "バックエンドがまだ起動していません。起動完了後、"
@@ -1670,9 +1684,9 @@ class MainWindow(QMainWindow):
     def _on_xyz_requested(self, spec: dict, auto: bool = False) -> None:
         """Start an XYZ run. ``auto`` marks a continuous-mode chained run
         (skips the many-cells confirmation so the loop keeps going)."""
-        if not self.backend.is_running():
+        if not self._backend_ready():
             QMessageBox.warning(self._xyz_parent(), "未準備",
-                                "バックエンドがまだ起動していません。")
+                                "ComfyUI の準備がまだ完了していません。")
             return
         if self._gen_thread is not None or self._xyz_thread is not None:
             QMessageBox.information(self._xyz_parent(), "実行中",
@@ -2394,6 +2408,8 @@ class MainWindow(QMainWindow):
         # SageAttention の設定を起動フラグへ反映（未導入なら backend 側で無視）。
         self.backend.use_sage_attention = bool(
             self.settings.get("sage_attention", False))
+        self.backend.use_ck_attention = bool(
+            self.settings.get("ck_attention", False))
         self._start_thread = QThread(self)
         worker = _StartWorker(self.backend)
         worker.moveToThread(self._start_thread)
@@ -2406,11 +2422,21 @@ class MainWindow(QMainWindow):
         self._start_worker = worker  # keep ref
         self._start_thread.start()
 
+    def _backend_ready(self) -> bool:
+        """ComfyUI が起動し、リクエストを受け付けられる状態か。"""
+        return self._backend_state == "ready" and self.backend.is_running()
+
     def _on_backend_ready(self) -> None:
+        self._backend_state = "ready"
         self.status.showMessage(f"バックエンド準備完了: {self.backend.base_url}")
         self.append_log("バックエンド準備完了")
+        if self._gen_thread is None and self._xyz_thread is None:
+            self.btn_generate.setEnabled(True)
+        self._update_generate_button()
 
     def _on_backend_failed(self, msg: str) -> None:
+        self._backend_state = "failed"
+        self._update_generate_button()
         self.status.showMessage("バックエンドの起動に失敗")
         self.append_log("エラー: " + msg)
         QMessageBox.critical(self, "バックエンドエラー", msg)
@@ -2539,8 +2565,9 @@ class MainWindow(QMainWindow):
     def on_generate(self) -> None:
         """生成ボタン / Shift+Enter。アイドルなら即開始、生成中なら現在の
         UI設定のスナップショットをタスクとして積む（完了後に順次消費）。"""
-        if not self.backend.is_running():
-            QMessageBox.warning(self, "未準備", "バックエンドがまだ起動していません。")
+        if not self._backend_ready():
+            # ボタンは準備完了まで無効。Shift+Enter 経由の呼び出しもここで止める。
+            QMessageBox.warning(self, "未準備", "ComfyUI の準備がまだ完了していません。")
             return
         if self._xyz_thread is not None:
             return  # XYZ 実行中はタスク積み対象外（ボタンも無効）
@@ -2608,8 +2635,16 @@ class MainWindow(QMainWindow):
         self._update_generate_button()
 
     def _update_generate_button(self, *_a) -> None:
-        """生成中はボタンを「生成をタスクに積む (待機数)」表示にする。"""
-        if self._gen_thread is not None:
+        """生成中はボタンを「生成をタスクに積む (待機数)」表示にする。
+        ComfyUI の準備が済むまでは状態表示（ボタン自体は無効のまま）。"""
+        if self._backend_state != "ready":
+            failed = self._backend_state == "failed"
+            self.btn_generate.setText(
+                "ComfyUI 起動失敗" if failed else "ComfyUI 準備中…")
+            self.btn_generate.setToolTip(
+                "ComfyUI の起動に失敗したため生成できません（ログを確認してください）"
+                if failed else "ComfyUI の起動完了後に生成できるようになります")
+        elif self._gen_thread is not None:
             self.btn_generate.setText(
                 f"生成をタスクに積む ({len(self._gen_queue)})")
             self.btn_generate.setToolTip(

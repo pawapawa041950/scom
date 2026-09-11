@@ -18,6 +18,7 @@ SAMPLERS = [
     "er_sde", "euler", "euler_ancestral", "dpmpp_2m", "dpmpp_2m_sde",
     "dpmpp_3m_sde", "dpmpp_sde", "dpm_2", "dpm_2_ancestral", "lms", "heun",
     "ddim", "uni_pc",
+    "cfgpp_ud10_ab",  # ComfyUI v0.35 で追加（CFG++ Euler + 2段履歴）
 ]
 SCHEDULERS = [
     "normal", "karras", "exponential", "sgm_uniform", "simple",
