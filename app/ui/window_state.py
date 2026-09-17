@@ -36,6 +36,18 @@ def save_geometry(widget: QWidget, key: str) -> None:
     s.sync()
 
 
+def load_value(key: str, default: str = "") -> str:
+    """ウィンドウ付随の小さな UI 状態（ソート順など）を windows.ini から読む。"""
+    v = _settings().value(key)
+    return default if v is None else str(v)
+
+
+def save_value(key: str, value: str) -> None:
+    s = _settings()
+    s.setValue(key, value)
+    s.sync()
+
+
 class _GeometryBinder(QObject):
     """Restore geometry on the widget's first show (after its layout is built —
     restoring too early in __init__ doesn't stick), and save on close/finish."""

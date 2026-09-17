@@ -26,7 +26,7 @@ from PySide6.QtWidgets import (
     QSplitter, QVBoxLayout, QWidget,
 )
 
-from .window_state import bind_geometry
+from .window_state import bind_geometry, load_value, save_value
 from .. import config, lora, modelinfo
 
 # ヘッダ判定の系統 → 一覧/詳細ペインでの表示名
@@ -162,7 +162,11 @@ class _MetaWorker(QObject):
             sha = str(entry.get("sha256", ""))
             meta = entry.get("meta") or {}
             thumb = ""
-            if meta.get("found"):
+            if cache.thumb_file(sha).exists():
+                # ローカルに用意されたサムネ（civitai 未登録の LoRA でも
+                # 手動で thumbs/<sha>.jpg を置けば表示される）。
+                thumb = str(cache.thumb_file(sha))
+            elif meta.get("found"):
                 try:
                     thumb = cache.ensure_thumb(
                         sha, str(meta.get("preview_url", "")))
@@ -172,6 +176,33 @@ class _MetaWorker(QObject):
                                      "meta": dict(meta)})
         self.status.emit("")
         self.done.emit()
+
+
+class _ThumbList(QListWidget):
+    """サムネイルグリッド。ホイール1ノッチ = ちょうど1行ぶんスクロールする。
+
+    QListView(IconMode) は singleStep をグリッド高さに設定し直すため、既定の
+    「3行/ノッチ」(wheelScrollLines=3) になって速すぎる。singleStep は
+    レイアウトのたびに上書きされるので、ホイール自体をここで処理する。
+    高精細ホイール/タッチパッドの端数は持ち越して比例スクロールにする。"""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setVerticalScrollMode(QListWidget.ScrollPerPixel)
+        self._wheel_rest = 0.0
+
+    def wheelEvent(self, event) -> None:  # noqa: N802 (Qt signature)
+        dy = event.angleDelta().y()
+        if dy == 0 or event.modifiers():
+            super().wheelEvent(event)
+            return
+        row = self.gridSize().height() or 1
+        move = self._wheel_rest + dy / 120.0 * row
+        step = int(move)
+        self._wheel_rest = move - step
+        sb = self.verticalScrollBar()
+        sb.setValue(sb.value() - step)
+        event.accept()
 
 
 class LoraDialog(QDialog):
@@ -196,6 +227,7 @@ class LoraDialog(QDialog):
         # 系統はヘッダ（キー名+形状）から自前判定する。civitai の baseModel
         # は作者の自己申告なので参考表示のみ（フィルタには使わない）。
         self._fams: dict[str, str] = {}    # relname -> modelinfo family
+        self._stats: dict[str, tuple[float, int]] = {}  # relname -> (mtime, size)
         self._applied: dict[str, float] = {}
         # 詳細ペインのトリガーワード表示状態（衣装グループ分割 + ホバー）。
         self._pos_groups: list[str] = []
@@ -224,9 +256,23 @@ class LoraDialog(QDialog):
             "判定し、現在の表示モデルで使えるものだけを表示します"
             "（判定できないものは常に表示）")
         self.cb_filter.currentIndexChanged.connect(self._apply_filter)
+        # 並び順（選択は userdata/windows.ini に記憶）。
+        self.cb_sort = QComboBox()
+        for label, key in (("名前 ↑ 昇順", "name_asc"),
+                           ("名前 ↓ 降順", "name_desc"),
+                           ("更新日時 ↑ 古い順", "mtime_asc"),
+                           ("更新日時 ↓ 新しい順", "mtime_desc"),
+                           ("サイズ ↑ 小さい順", "size_asc"),
+                           ("サイズ ↓ 大きい順", "size_desc")):
+            self.cb_sort.addItem(label, key)
+        idx = self.cb_sort.findData(load_value("lora/sort", "name_asc"))
+        self.cb_sort.setCurrentIndex(max(0, idx))
+        self.cb_sort.currentIndexChanged.connect(self._on_sort_changed)
         btn_rescan = QPushButton("再スキャン")
         btn_rescan.clicked.connect(self.rescan)
         top.addWidget(self.ed_search, stretch=1)
+        top.addWidget(QLabel("並び順:"))
+        top.addWidget(self.cb_sort)
         top.addWidget(QLabel("ベースモデル:"))
         top.addWidget(self.cb_filter)
         top.addWidget(btn_rescan)
@@ -237,7 +283,7 @@ class LoraDialog(QDialog):
         root.addWidget(panes, stretch=1)
 
         # ----- left: thumbnail grid ---------------------------------------
-        self.lst = QListWidget()
+        self.lst = _ThumbList()
         self.lst.setViewMode(QListWidget.IconMode)
         self.lst.setIconSize(QSize(_ICON_SIZE, _ICON_SIZE))
         self.lst.setGridSize(_GRID_SIZE)
@@ -366,8 +412,15 @@ class LoraDialog(QDialog):
         names = config.scan_models("loras")
         self.lst.clear()
         self._items.clear()
-        # 既知メタは残す（ワーカーがキャッシュから同じ内容を再供給する）
+        self._stats.clear()
         for relname in names:
+            try:
+                st = (self._lora_dir / relname).stat()
+                self._stats[relname] = (st.st_mtime, st.st_size)
+            except OSError:
+                self._stats[relname] = (0.0, 0)
+        # 既知メタは残す（ワーカーがキャッシュから同じ内容を再供給する）
+        for relname in self._sorted(names):
             # 系統判定はヘッダ読みだけ（数KB・ハッシュ不要）なのでこの場で
             # 行う。結果は modelinfo 側で size+mtime キャッシュされる。
             self._fams[relname] = modelinfo.family(
@@ -421,6 +474,36 @@ class LoraDialog(QDialog):
         self._apply_filter()
         if item is self.lst.currentItem():
             self._show_detail(relname)
+
+    # ----- sorting -------------------------------------------------------------
+    def _sorted(self, names) -> list[str]:
+        """現在の並び順設定で relname を並べる（同値は名前昇順で安定化）。"""
+        field, _, direction = str(self.cb_sort.currentData()).partition("_")
+        ordered = sorted(names, key=str.lower)
+        if field == "mtime":
+            ordered.sort(key=lambda n: self._stats.get(n, (0.0, 0))[0])
+        elif field == "size":
+            ordered.sort(key=lambda n: self._stats.get(n, (0.0, 0))[1])
+        if direction == "desc":
+            ordered.reverse()
+        return ordered
+
+    def _on_sort_changed(self, *_a) -> None:
+        save_value("lora/sort", str(self.cb_sort.currentData()))
+        # アイテム（アイコン・適用マーク込み）はそのまま、順序だけ入れ替える。
+        current = self.lst.currentItem()
+        self.lst.setUpdatesEnabled(False)
+        try:
+            while self.lst.count():
+                self.lst.takeItem(0)
+            for relname in self._sorted(self._items):
+                self.lst.addItem(self._items[relname])
+        finally:
+            self.lst.setUpdatesEnabled(True)
+        self._apply_filter()   # takeItem/addItem で hidden が戻るため再適用
+        if current is not None:
+            self.lst.setCurrentItem(current)
+            self.lst.scrollToItem(current)
 
     # ----- filtering -----------------------------------------------------------
     def _visible(self, relname: str) -> bool:
