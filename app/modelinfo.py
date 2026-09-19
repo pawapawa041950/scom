@@ -35,7 +35,72 @@ UNKNOWN = "unknown"
 _HEADER_MAX = 100_000_000
 
 # path -> (size, mtime, family)
+# 起動をまたいで userdata/model_families.json に永続化する。LoRA が数百本
+# あるとヘッダ読み（ファイル先頭の数百KB〜数MB × 本数）だけで初回は
+# 数秒〜十数秒かかるため、判定済みの結果は二度と読み直さない。
 _cache: dict[str, tuple[int, float, str]] = {}
+_cache_loaded = False
+_CACHE_NAME = "model_families.json"
+
+
+def _cache_path() -> Optional[Path]:
+    try:
+        from . import config
+        return config.AppPaths().user_data / _CACHE_NAME
+    except Exception:  # noqa: BLE001 - キャッシュ無しでも動作は変わらない
+        return None
+
+
+def _load_cache() -> None:
+    global _cache_loaded
+    if _cache_loaded:
+        return
+    _cache_loaded = True
+    p = _cache_path()
+    if p is None:
+        return
+    try:
+        data = json.loads(p.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return
+    if not isinstance(data, dict):
+        return
+    for k, v in data.items():
+        if (isinstance(v, list) and len(v) == 3
+                and isinstance(v[2], str)):
+            try:
+                _cache[str(k)] = (int(v[0]), float(v[1]), v[2])
+            except (TypeError, ValueError):
+                continue
+
+
+def _save_cache() -> None:
+    p = _cache_path()
+    if p is None:
+        return
+    try:
+        p.parent.mkdir(parents=True, exist_ok=True)
+        tmp = p.with_suffix(".tmp")
+        tmp.write_text(json.dumps({k: list(v) for k, v in _cache.items()},
+                                  ensure_ascii=False),
+                       encoding="utf-8")
+        tmp.replace(p)
+    except OSError:
+        pass
+
+
+def cached_family(path: Path) -> Optional[str]:
+    """判定済み（size+mtime 一致）ならその系統、未判定なら None。ヘッダは
+    読まないので GUI スレッドから何百回呼んでも即座に返る。"""
+    _load_cache()
+    try:
+        st = path.stat()
+    except OSError:
+        return None
+    cached = _cache.get(str(path))
+    if cached and cached[0] == st.st_size and cached[1] == st.st_mtime:
+        return cached[2]
+    return None
 
 
 def _read_header(path: Path) -> Optional[dict]:
@@ -296,6 +361,7 @@ def family(kind: str, path: Path) -> str:
     Reads the safetensors header (cached by size+mtime); falls back to the
     filename when the file isn't safetensors or the header can't be parsed.
     """
+    _load_cache()
     try:
         st = path.stat()
     except OSError:
@@ -314,4 +380,5 @@ def family(kind: str, path: Path) -> str:
         fam = _filename_family(kind, path.name)
 
     _cache[key] = (st.st_size, st.st_mtime, fam)
+    _save_cache()
     return fam

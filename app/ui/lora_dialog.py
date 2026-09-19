@@ -18,7 +18,8 @@ from typing import Callable, Optional
 
 from PySide6.QtCore import Qt, QSize, QThread, QUrl, Signal, QObject
 from PySide6.QtGui import (
-    QBrush, QColor, QDesktopServices, QIcon, QPalette, QPixmap, QTextDocument,
+    QBrush, QColor, QDesktopServices, QIcon, QImage, QPalette, QPixmap,
+    QTextDocument,
 )
 from PySide6.QtWidgets import (
     QComboBox, QDialog, QDoubleSpinBox, QFrame, QHBoxLayout, QLabel, QLineEdit,
@@ -110,12 +111,15 @@ def _from_edit_text(text: str) -> str:
 class _MetaWorker(QObject):
     """LoRA ごとのハッシュ計算 + civitai 取得（1本のスレッドで順次実行）。"""
     info = Signal(str, dict)     # relname, {"sha", "thumb", "meta"}
+    family = Signal(str, str)    # relname, modelinfo family
     status = Signal(str)
     done = Signal()
 
-    def __init__(self, names: list[str], lora_dir: Path, cache_dir: Path):
+    def __init__(self, names: list[str], lora_dir: Path, cache_dir: Path,
+                 need_family: list[str] = ()):
         super().__init__()
         self._names = list(names)
+        self._need_family = list(need_family)
         self._dir = Path(lora_dir)
         self._cache_dir = Path(cache_dir)
         self._cancel = False
@@ -124,6 +128,18 @@ class _MetaWorker(QObject):
         self._cancel = True
 
     def run(self) -> None:
+        # 1) 系統判定（ヘッダ読みだけ。ウィンドウを先に出し、ここで埋める）。
+        #    結果は modelinfo が永続キャッシュするので、次回以降は GUI 側の
+        #    cached_family() で即座に決まりこのループは空になる。
+        for n, relname in enumerate(self._need_family):
+            if self._cancel:
+                break
+            if n % 20 == 0:
+                self.status.emit(
+                    f"系統判定中 ({n + 1}/{len(self._need_family)})")
+            fam = modelinfo.family("loras", self._dir / relname)
+            self.family.emit(relname, fam)
+        # 2) ハッシュ + civitai メタ + サムネ。
         cache = lora.LoraCache(self._cache_dir)
         offline = 0  # 連続ネットワーク失敗数; 2回で以後の問い合わせを諦める
         for n, relname in enumerate(self._names):
@@ -172,8 +188,11 @@ class _MetaWorker(QObject):
                         sha, str(meta.get("preview_url", "")))
                 except (OSError, ValueError):
                     thumb = ""
+            # ディスク読み + JPEG デコードはここ（ワーカー）で済ませ、GUI 側は
+            # QPixmap 化だけにする（初回起動時の cold read で固まらないように）。
+            image = QImage(thumb) if thumb else QImage()
             self.info.emit(relname, {"sha": sha, "thumb": thumb,
-                                     "meta": dict(meta)})
+                                     "image": image, "meta": dict(meta)})
         self.status.emit("")
         self.done.emit()
 
@@ -420,28 +439,37 @@ class LoraDialog(QDialog):
             except OSError:
                 self._stats[relname] = (0.0, 0)
         # 既知メタは残す（ワーカーがキャッシュから同じ内容を再供給する）
-        for relname in self._sorted(names):
-            # 系統判定はヘッダ読みだけ（数KB・ハッシュ不要）なのでこの場で
-            # 行う。結果は modelinfo 側で size+mtime キャッシュされる。
-            self._fams[relname] = modelinfo.family(
-                "loras", self._lora_dir / relname)
-            item = QListWidgetItem(self._placeholder, relname)
-            item.setData(Qt.UserRole, relname)
-            item.setToolTip(
-                f"{relname}\n系統: "
-                f"{_FAMILY_LABELS.get(self._fams[relname], '不明')}")
-            self.lst.addItem(item)
-            self._items[relname] = item
-        self._refresh_applied_marks()
-        self._apply_filter()
+        # 系統は永続キャッシュにあるものだけこの場で確定し、無いものは
+        # ワーカーがヘッダを読んで後から埋める（GUI スレッドで数百ファイルの
+        # ヘッダを読むとウィンドウが出るまで何秒も固まるため）。
+        need_family: list[str] = []
+        self.lst.setUpdatesEnabled(False)
+        try:
+            for relname in self._sorted(names):
+                fam = modelinfo.cached_family(self._lora_dir / relname)
+                if fam is None:
+                    fam = modelinfo.UNKNOWN
+                    need_family.append(relname)
+                self._fams[relname] = fam
+                item = QListWidgetItem(self._placeholder, relname)
+                item.setData(Qt.UserRole, relname)
+                self._set_item_tooltip(item, relname)
+                self.lst.addItem(item)
+                self._items[relname] = item
+            self._refresh_applied_marks()
+            self._apply_filter()
+        finally:
+            self.lst.setUpdatesEnabled(True)
         if not names:
             self.lbl_status.setText(
                 f"LoRA がありません: {self._lora_dir} に配置してください")
             return
-        self._worker = _MetaWorker(names, self._lora_dir, self._cache_dir)
+        self._worker = _MetaWorker(names, self._lora_dir, self._cache_dir,
+                                   need_family)
         self._thread = QThread(self)
         self._worker.moveToThread(self._thread)
         self._thread.started.connect(self._worker.run)
+        self._worker.family.connect(self._on_family)
         self._worker.info.connect(self._on_info)
         self._worker.status.connect(self.lbl_status.setText)
         self._worker.done.connect(self._thread.quit)
@@ -461,17 +489,35 @@ class LoraDialog(QDialog):
         self._thread = None
         self._worker = None
 
+    def _set_item_tooltip(self, item: QListWidgetItem, relname: str) -> None:
+        item.setToolTip(
+            f"{relname}\n系統: "
+            f"{_FAMILY_LABELS.get(self._fams.get(relname), '不明')}")
+
+    def _on_family(self, relname: str, fam: str) -> None:
+        self._fams[relname] = fam
+        item = self._items.get(relname)
+        if item is None:
+            return
+        self._set_item_tooltip(item, relname)
+        # 1件ぶんだけ再判定（全件 _apply_filter は件数の2乗で効いてくる）。
+        item.setHidden(not self._visible(relname))
+        if item is self.lst.currentItem():
+            self._show_detail(relname)
+
     def _on_info(self, relname: str, info: dict) -> None:
         self._meta[relname] = info
         item = self._items.get(relname)
         if item is None:
             return
-        thumb = str(info.get("thumb", ""))
-        if thumb:
-            pix = QPixmap(thumb)
+        image = info.get("image")
+        if isinstance(image, QImage) and not image.isNull():
+            item.setIcon(QIcon(QPixmap.fromImage(image)))
+        elif info.get("thumb"):
+            pix = QPixmap(str(info["thumb"]))
             if not pix.isNull():
                 item.setIcon(QIcon(pix))
-        self._apply_filter()
+        item.setHidden(not self._visible(relname))
         if item is self.lst.currentItem():
             self._show_detail(relname)
 
