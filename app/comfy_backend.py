@@ -63,7 +63,11 @@ def write_extra_model_paths(paths: config.AppPaths) -> Path:
         # 読めるよう、同じ diffusion_models フォルダを checkpoints にも割り当てる。
         "  checkpoints: diffusion_models/\n"
         "  vae: vae/\n"
-        "  text_encoders: text_encoders/\n"
+        # プロンプト整形用 LLM (models/llm) も CLIPLoader から読めるように
+        # text_encoders の追加パスにする（ComfyUI は改行区切りで複数パス可）。
+        "  text_encoders: |\n"
+        "    text_encoders/\n"
+        "    llm/\n"
         "  loras: loras/\n"
         f"  custom_nodes: {nodes_dir.as_posix()}\n"
     )
@@ -142,6 +146,12 @@ class ComfyBackend:
             "--output-directory", str(self.paths.user_data / "output"),
             "--preview-method", "auto",  # stream latent previews over the ws
             "--disable-auto-launch",
+            # ComfyUI v0.36+ は NVMe を検出すると重みをディスク直読み
+            # （fast_disk）で扱うが、Windows でこの経路は text encoder の
+            # 読み込み（bf16/fp8 -> fp16 変換時）で access violation を起こし
+            # プロセスごと落ちる（anima / krea2 の TE で再現、v0.37.0）。
+            # 従来どおり RAM 経由で読む。
+            "--disable-fast-disk",
         ]
         if self.use_ck_attention:
             # 対応可否は設定を ON にした時点で確認済み（setup.ck_attention_available）。
@@ -431,6 +441,25 @@ class ComfyBackend:
         elif on_timing is not None and sample_secs > 0:
             on_timing(sample_secs)   # 途中で切れた計測値は使わない
         return self._history_images(prompt_id)
+
+    def generate_text(self, graph: dict,
+                      cancel: Optional[Callable[[], bool]] = None,
+                      timeout: float = 900.0) -> str:
+        """文字列を出力するグラフ（TextGenerate -> PreviewAny 等）を実行し、
+        履歴の "text" 出力を連結して返す。進捗は不要なので websocket は
+        使わず /history のポーリングで完了を待つ。"""
+        if not self.is_running():
+            raise BackendError("バックエンドが起動していません")
+        cancel = cancel or (lambda: False)
+        prompt_id = self._post_prompt(graph)
+        self._wait_prompt(prompt_id, cancel, timeout=timeout)
+        history = json.loads(self._get(self.base_url + f"/history/{prompt_id}"))
+        entry = history.get(prompt_id, {})
+        texts: list[str] = []
+        for node_out in entry.get("outputs", {}).values():
+            for t in node_out.get("text", []) or []:
+                texts.append(str(t))
+        return "\n".join(texts)
 
     def _wait_prompt(self, prompt_id: str, cancel: Callable[[], bool],
                      timeout: float = 1800.0) -> None:

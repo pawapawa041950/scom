@@ -21,7 +21,8 @@ from PySide6.QtWidgets import (
     QSpinBox, QSplitter, QStackedWidget, QVBoxLayout, QWidget, QCheckBox,
 )
 
-from .. import config, settings, metadata, modelinfo, prompt_presets, xyz
+from .. import (config, settings, metadata, modelinfo, prompt_llm,
+                prompt_presets, xyz)
 from .. import lora as lora_meta
 from . import ansi_log
 from .widgets import FlowLayout, GrowingTextEdit, WideComboBox
@@ -59,6 +60,10 @@ NO_SAVE = "保存しない"
 # colored prefix; the item data is "__merge__:<id>".
 MERGE_PREFIX = "マージモデル："
 MERGE_TOKEN = "__merge__"
+# 系統ごとに必要な CLIPLoader の type（無い系統は stable_diffusion で可）。
+# krea2: Qwen3-VL 4B、qwen21: Qwen3-VL 8B（ComfyUI が 8B を検出すると
+# 自動で Qwen-Image 2.1 用のトークナイザ/テンプレートに切り替わる）。
+_FAMILY_CLIP_TYPE = {"krea2": "krea2", "qwen21": "qwen_image"}
 MERGE_COLOR = "#1a7f37"  # green tint for merge entries
 
 
@@ -89,20 +94,48 @@ class _GenWorker(QObject):
     timing = Signal(float)  # 純粋な推論(サンプリング)時間 [秒]
     done = Signal(list)    # list[bytes]
     failed = Signal(str)
+    status = Signal(str)   # 前処理（プロンプト整形）の状況
+    # LLM 整形: (元プロンプト, 整形後, キャッシュ命中か)
+    rewritten = Signal(str, str, bool)
+    # 整形後に組み直したグラフ（メタデータ保存用に本体へ戻す）
+    prepared = Signal(object, dict)
 
-    def __init__(self, backend: ComfyBackend, graph: dict):
+    def __init__(self, backend: ComfyBackend, graph: dict,
+                 params: Optional[GenParams] = None,
+                 user_data: Optional[Path] = None):
         super().__init__()
         self.backend = backend
         self.graph = graph
+        self.params = params      # None = graph をそのまま実行（マージ等）
+        self.user_data = user_data
         self._cancel = False
 
     def cancel(self) -> None:
         self._cancel = True
 
+    def _prepare(self) -> dict:
+        """LLM 整形が指定されていればプロンプトを書き換えてグラフを組み直す。"""
+        p = self.params
+        if p is None or not p.llm_file:
+            return self.graph
+        self.status.emit(f"プロンプトを LLM で整形中… ({p.llm_file})")
+        text, cached = prompt_llm.rewrite(
+            self.backend, p.llm_file, p.prompt, p.llm_style,
+            self.user_data or config.AppPaths().user_data,
+            cancel=lambda: self._cancel)
+        if text:
+            p.prompt_original = p.prompt
+            p.prompt = text
+        self.rewritten.emit(p.prompt_original, p.prompt, cached)
+        graph = build_graph(p)
+        self.prepared.emit(p, graph)
+        return graph
+
     def run(self) -> None:
         try:
+            graph = self._prepare()
             images = self.backend.generate(
-                self.graph,
+                graph,
                 on_progress=self.progress.emit,
                 on_preview=self.preview.emit,
                 cancel=lambda: self._cancel,
@@ -265,7 +298,7 @@ class MainWindow(QMainWindow):
         self._lora_pop_timer.setSingleShot(True)
         self._lora_pop_timer.setInterval(220)   # 離脱後この時間で閉じる
         self._lora_pop_timer.timeout.connect(self._hide_lora_popup)
-        # Per-preset (anima/krea2/sdxl) memory of the Models + 設定 values;
+        # Per-preset (anima/krea2/qwen21/sdxl) memory of the Models + 設定 values;
         # filled from settings in _apply_settings, kept fresh in _do_save.
         self._preset_conf: dict = {}
         self._active_preset: str = "anima"
@@ -365,6 +398,7 @@ class MainWindow(QMainWindow):
         self.cb_preset = WideComboBox()
         self.cb_preset.addItem("anima", "anima")
         self.cb_preset.addItem("krea2", "krea2")
+        self.cb_preset.addItem("qwen21", "qwen21")
         self.cb_preset.addItem("sdxl", "sdxl")
         self.cb_preset.setToolTip(
             "モデル・VAE・Text encoder をその系統に絞り込みます。"
@@ -467,6 +501,21 @@ class MainWindow(QMainWindow):
         self.txt_negative = GrowingTextEdit(min_lines=3)
         self.txt_negative.setPlaceholderText("negative prompt…")
         self.txt_negative.setPlainText(DEFAULT_NEGATIVE)
+        # プロンプトの LLM 整形（app/prompt_llm.py）。候補は models/llm 内の
+        # ファイル。選ぶと生成時にポジティブ欄を LLM が書き直す
+        # （欄の文はそのまま、整形後はログと画像メタデータに残る）。
+        llm_row = QHBoxLayout()
+        llm_row.addWidget(QLabel("LLMで整形:"))
+        self.cb_prompt_llm = WideComboBox()
+        self.cb_prompt_llm.setToolTip(
+            "生成時にポジティブプロンプトを LLM に書き直させます（日本語で"
+            "書いても英語のプロンプトに変換）。表示モデルに合わせて自然文 / "
+            "タグ列の書き方を切り替えます。整形後の文はログと画像メタデータに"
+            "記録され、プロンプト欄は書き換えません。\n"
+            "候補: models/llm に置いた LLM（Qwen-Image 2.1 の PE モデルは"
+            "「設定…」からダウンロードできます）")
+        llm_row.addWidget(self.cb_prompt_llm, stretch=1)
+        layout.addLayout(llm_row)
         layout.addWidget(QLabel("Positive"))
         layout.addWidget(self.txt_prompt)
         # LoRA（選択ボタン + 適用中チップ）。旧「LoRA」カテゴリをここへ移設。
@@ -772,6 +821,22 @@ class MainWindow(QMainWindow):
             f"loras={len(self._all_models['loras'])}"
         )
         self._apply_preset_filter()
+        self._refresh_llm_combo()
+
+    def _refresh_llm_combo(self) -> None:
+        """「LLMで整形」の候補を models/llm のファイルから作り直す。"""
+        current = self.cb_prompt_llm.currentData()
+        if current is None:
+            current = self.settings.get("prompt_llm", "")
+        files = prompt_llm.list_llm_files()
+        self.cb_prompt_llm.blockSignals(True)
+        self.cb_prompt_llm.clear()
+        self.cb_prompt_llm.addItem("使わない", "")
+        for f in files:
+            self.cb_prompt_llm.addItem(f, f)
+        idx = self.cb_prompt_llm.findData(current)
+        self.cb_prompt_llm.setCurrentIndex(max(0, idx))
+        self.cb_prompt_llm.blockSignals(False)
 
     @staticmethod
     def _fill_combo(combo: QComboBox, items: list[str], allow_empty: bool = False) -> None:
@@ -937,9 +1002,23 @@ class MainWindow(QMainWindow):
                 if v:
                     self.cb_vae.setCurrentText(v)
             return
-        # Coming back from an SDXL setup also needs re-aligning (dual TE and
-        # CLIP type 'sdxl' would break anima/krea2 generations).
-        from_sdxl = self.cb_clip_type.currentText() == "sdxl"
+        if fam == "qwen21":
+            # Qwen-Image 2.1: CLIP type 'qwen_image' + Qwen3-VL 8B + 専用 VAE
+            # （16 倍圧縮・64ch。anima/krea2 の Qwen-Image VAE とは非互換）。
+            self.chk_dual_te.setChecked(False)
+            idx = self.cb_clip_type.findText("qwen_image")
+            if idx >= 0:
+                self.cb_clip_type.setCurrentIndex(idx)
+            self._select_te_for_family("qwen21")
+            if self._vae_family(self.cb_vae.currentText()) != "qwen21":
+                v = self._first_vae(("qwen21",))
+                if v:
+                    self.cb_vae.setCurrentText(v)
+            return
+        # Coming back from an SDXL / qwen21 setup also needs re-aligning
+        # (dual TE, CLIP type 'sdxl' or the 8B encoder would break anima/
+        # krea2 generations).
+        from_sdxl = self.cb_clip_type.currentText() in ("sdxl", "qwen_image")
         if fam == "krea2" and (from_sdxl or not self.chk_dual_te.isChecked()):
             # Krea-2 requires CLIP type 'krea2' and a Qwen3-VL text encoder.
             self.chk_dual_te.setChecked(False)
@@ -955,10 +1034,31 @@ class MainWindow(QMainWindow):
             self._select_te_for_family("anima")
         else:
             return
-        if self._vae_family(self.cb_vae.currentText()) == "sdxl":
+        if self._vae_family(self.cb_vae.currentText()) not in ("shared", fam):
             v = self._first_vae(("shared", fam))
             if v:
                 self.cb_vae.setCurrentText(v)
+
+    def _qwen21_config_warning(self, params: GenParams) -> Optional[str]:
+        """Pre-flight check for Qwen-Image 2.1: CLIP type 'qwen_image' /
+        Qwen3-VL 8B text encoder / 専用 VAE（64ch）。"""
+        name = params.merge_models[0][0] if params.merge_models else params.diffusion
+        if self._diffusion_family(name) != "qwen21":
+            return None
+        msgs = []
+        if params.clip_type != "qwen_image":
+            msgs.append("・CLIP type を 'qwen_image' にしてください"
+                        f"（現在: {params.clip_type}）")
+        if not any(self._te_family(t) == "qwen21" for t in params.te):
+            msgs.append("・Text encoder に Qwen-Image 2.1 用（Qwen3-VL 8B）を"
+                        "選択してください（未取得なら「設定…」からダウンロード）")
+        if self._vae_family(params.vae) != "qwen21":
+            msgs.append("・VAE に Qwen-Image 2.1 用（qwen_image_2.1_vae）を"
+                        "選択してください（anima/krea2 の VAE とは非互換）")
+        if not msgs:
+            return None
+        return ("選択中のモデルは Qwen-Image 2.1 です。次を直してください:\n\n"
+                + "\n".join(msgs))
 
     def _krea2_config_warning(self, params: GenParams) -> Optional[str]:
         """Pre-flight check: translate the cryptic backend mismatch into a
@@ -1006,6 +1106,7 @@ class MainWindow(QMainWindow):
         if params.checkpoint and not params.vae and not params.te:
             return None
         return (self._krea2_config_warning(params)
+                or self._qwen21_config_warning(params)
                 or self._sdxl_config_warning(params))
 
     # ----- model merge (マージモデル) ---------------------------------------
@@ -1695,6 +1796,7 @@ class MainWindow(QMainWindow):
         try:
             base = self._collect_params()
             base.batch_size = 1  # 1セル = 1枚
+            base.llm_file = ""   # XYZ は LLM 整形の対象外（セルごとに回さない）
             if base.hires_enabled:
                 self.append_log(
                     "XYZ: Hires fix 有効（各セルが2段生成になります）")
@@ -1836,7 +1938,7 @@ class MainWindow(QMainWindow):
             # チェックポイントでも、このセルは分割ロードで整列する）。
             p = replace(p, checkpoint=False)
 
-        conf = confs.get(fam) if fam in ("anima", "krea2", "sdxl") else None
+        conf = confs.get(fam) if fam in ("anima", "krea2", "qwen21", "sdxl") else None
         if conf:
             p = self._apply_preset_conf_to_cell(p, conf, locked)
             note = ("preset", fam)
@@ -1864,12 +1966,17 @@ class MainWindow(QMainWindow):
             self._log_xyz_align(fam, f"{clip_l} + {clip_g}", "sdxl", vae)
             return replace(p, te=[clip_l, clip_g], clip_type="sdxl", vae=vae)
 
-        if fam not in ("anima", "krea2"):
+        if fam not in ("anima", "krea2", "qwen21"):
             return p
         te_ok = (len(p.te) == 1 and self._te_family(p.te[0]) == fam)
-        clip_ok = (p.clip_type != "sdxl"
-                   and (p.clip_type == "krea2") == (fam == "krea2"))
-        vae_ok = self._vae_family(p.vae) in (fam, "shared")
+        want_clip = _FAMILY_CLIP_TYPE.get(fam)
+        if want_clip:
+            clip_ok = p.clip_type == want_clip
+        else:  # anima: 他系統専用の type でなければ可
+            clip_ok = p.clip_type not in ("sdxl", "krea2", "qwen_image")
+        # qwen21 は専用 VAE のみ。anima/krea2 は共通の Qwen-Image VAE。
+        vae_fams = ("qwen21",) if fam == "qwen21" else (fam, "shared")
+        vae_ok = self._vae_family(p.vae) in vae_fams
         if te_ok and clip_ok and vae_ok:
             return p
         te = list(p.te)
@@ -1883,9 +1990,8 @@ class MainWindow(QMainWindow):
                     f"モデル軸の {p.diffusion} は {fam} 系ですが、対応する "
                     "text encoder が見つかりません。「設定…」から"
                     "ダウンロードしてください。")
-        clip = p.clip_type if clip_ok else (
-            "krea2" if fam == "krea2" else "stable_diffusion")
-        vae = p.vae if vae_ok else self._first_vae(("shared", fam))
+        clip = p.clip_type if clip_ok else (want_clip or "stable_diffusion")
+        vae = p.vae if vae_ok else self._first_vae(vae_fams)
         if vae is None:
             raise ValueError(f"{fam} 用の VAE が見つかりません。")
         self._log_xyz_align(fam, te[0], clip, vae)
@@ -2233,17 +2339,24 @@ class MainWindow(QMainWindow):
             if idx >= 0:
                 self.cb_clip_type.setCurrentIndex(idx)
             return
-        self.chk_dual_te.setChecked(False)  # anima/krea2 use a single CLIPLoader
-        prefer = ("base",) if preset == "anima" else ("turbo",)
+        self.chk_dual_te.setChecked(False)  # anima/krea2/qwen21: single CLIPLoader
+        prefer = {"anima": ("base",), "qwen21": ("int8",)}.get(preset, ("turbo",))
         self._select_preferred(self.cb_diffusion, prefer)
         if self.cb_vae.count():
             self.cb_vae.setCurrentIndex(0)
         if self.cb_te1.count():
             self.cb_te1.setCurrentIndex(0)
-        clip = "krea2" if preset == "krea2" else "stable_diffusion"
+        clip = _FAMILY_CLIP_TYPE.get(preset, "stable_diffusion")
         idx = self.cb_clip_type.findText(clip)
         if idx >= 0:
             self.cb_clip_type.setCurrentIndex(idx)
+        if preset == "qwen21":
+            # ComfyUI 公式テンプレの既定（euler / simple / 25 steps / cfg 1）。
+            # このプリセットを初めて開いたときだけ（保存値があれば復元）。
+            self.sp_steps.setValue(25)
+            self.sp_cfg.setValue(1.0)
+            self.cb_sampler.setCurrentText("euler")
+            self.cb_scheduler.setCurrentText("simple")
 
     def _select_preferred(self, combo: QComboBox, prefer: tuple[str, ...]) -> None:
         for i in range(combo.count()):
@@ -2260,7 +2373,7 @@ class MainWindow(QMainWindow):
         # Preset first: it filters the model dropdowns before we restore picks.
         # 旧バージョンの「すべて」("all") は保存されていたモデルの系統に移行。
         preset = str(s.get("preset", ""))
-        if preset not in ("anima", "krea2", "sdxl"):
+        if preset not in ("anima", "krea2", "qwen21", "sdxl"):
             saved_diffusion = str(s.get("diffusion", ""))
             if saved_diffusion.startswith(MERGE_TOKEN):
                 try:
@@ -2271,7 +2384,7 @@ class MainWindow(QMainWindow):
                 fam = self._merge_family(entry) if entry else "unknown"
             else:
                 fam = self._diffusion_family(saved_diffusion)
-            preset = fam if fam in ("anima", "krea2", "sdxl") else "anima"
+            preset = fam if fam in ("anima", "krea2", "qwen21", "sdxl") else "anima"
         self._set_preset(preset)
         # Merge selections are stored as their data token ("__merge__:<id>");
         # they are restorable because unbuilt entries auto-merge at generation.
@@ -2304,6 +2417,8 @@ class MainWindow(QMainWindow):
         self.cb_scheduler.setCurrentText(str(s.get("scheduler", "simple")))
         self.ed_seed.setText(str(s.get("seed", "-1")))
         self.cb_dtype.setCurrentText(str(s.get("dtype", "default")))
+        idx = self.cb_prompt_llm.findData(str(s.get("prompt_llm", "")))
+        self.cb_prompt_llm.setCurrentIndex(max(0, idx))
         # Hires fix (latent)
         self.grp_hires.setChecked(bool(s.get("hires_enabled", False)))
         self.sp_hires_scale.setValue(float(s.get("hires_scale", 1.5)))
@@ -2346,6 +2461,7 @@ class MainWindow(QMainWindow):
         self.chk_dual_te.toggled.connect(self._schedule_save)
         self.chk_embed_meta.toggled.connect(self._schedule_save)
         self.ed_seed.textChanged.connect(self._schedule_save)
+        self.cb_prompt_llm.currentIndexChanged.connect(self._schedule_save)
 
     def _schedule_save(self, *args) -> None:
         if self._loading:
@@ -2391,6 +2507,7 @@ class MainWindow(QMainWindow):
             "hires_denoise": float(self.sp_hires_denoise.value()),
             "hires_steps": self.sp_hires_steps.value(),
             "hires_method": self.cb_hires_method.currentText(),
+            "prompt_llm": str(self.cb_prompt_llm.currentData() or ""),
             "image_format": self.cb_img_format.currentText(),
             "embed_metadata": self.chk_embed_meta.isChecked(),
             "png_compress": self.sp_png_compress.value(),
@@ -2492,6 +2609,10 @@ class MainWindow(QMainWindow):
             hires_denoise=float(self.sp_hires_denoise.value()),
             hires_steps=self.sp_hires_steps.value(),
             hires_method=self.cb_hires_method.currentText(),
+            llm_file=str(self.cb_prompt_llm.currentData() or ""),
+            llm_style=prompt_llm.effective_style(
+                self._current_preset(),
+                str(self.cb_prompt_llm.currentData() or "")),
         )
 
     # ----- prompt presets (prompts.csv) -------------------------------------
@@ -2619,9 +2740,13 @@ class MainWindow(QMainWindow):
         self.append_log(f"生成 seed={params.seed} {params.width}x{params.height}")
 
         self._gen_thread = QThread(self)
-        self._gen_worker = _GenWorker(self.backend, graph)
+        self._gen_worker = _GenWorker(self.backend, graph, params=params,
+                                      user_data=self.paths.user_data)
         self._gen_worker.moveToThread(self._gen_thread)
         self._gen_thread.started.connect(self._gen_worker.run)
+        self._gen_worker.status.connect(self._on_gen_status)
+        self._gen_worker.rewritten.connect(self._on_prompt_rewritten)
+        self._gen_worker.prepared.connect(self._on_gen_prepared)
         self._gen_worker.progress.connect(self._on_progress)
         self._gen_worker.preview.connect(self._on_preview_frame)
         self._gen_worker.cached.connect(self._on_cached_nodes)
@@ -2717,6 +2842,20 @@ class MainWindow(QMainWindow):
         else:
             self.btn_cancel.setToolTip(
                 "現在の生成を中断して次の生成に進みます（連続は続行）")
+
+    def _on_gen_status(self, msg: str) -> None:
+        self.status.showMessage(msg)
+        self.append_log(msg)
+
+    def _on_prompt_rewritten(self, original: str, text: str,
+                             cached: bool) -> None:
+        note = "（キャッシュ）" if cached else ""
+        self.append_log(f"LLM 整形後のプロンプト{note}: {text}")
+
+    def _on_gen_prepared(self, params: GenParams, graph: dict) -> None:
+        # 整形後のプロンプトで組み直したグラフ（保存メタデータに使う）。
+        self._last_params = params
+        self._last_graph = graph
 
     def _on_progress(self, p: Progress) -> None:
         if p.maximum:
@@ -2862,6 +3001,9 @@ class MainWindow(QMainWindow):
                     hashes.append(f"{Path(n).stem}: {e['sha256'][:10]}")
             if hashes:
                 meta["lora_hashes"] = ", ".join(hashes)
+        if p.llm_file and p.prompt_original:
+            meta["prompt_llm"] = p.llm_file
+            meta["prompt_original"] = p.prompt_original
         params_text = metadata.build_parameters(meta)
         return params_text, {"app": "scom", **meta}
 

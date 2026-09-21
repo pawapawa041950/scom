@@ -20,6 +20,11 @@ HF_BASE = "https://huggingface.co/circlestone-labs/Anima/resolve/main/split_file
 # text_encoders/ (no split_files prefix). Multiple safetensors quantizations
 # are offered so users pick the size/quality that fits their VRAM.
 KREA_BASE = "https://huggingface.co/Comfy-Org/Krea-2/resolve/main"
+# Qwen-Image 2.1 (Comfy-Org): 生成モデル一式（DiT / Qwen3-VL 8B TE / 専用
+# VAE）と、プロンプト整形 LLM (PE)。ライセンスは Qwen Research License
+# （非商用）。ComfyUI v0.37.0 以上が必要。
+QWEN21_BASE = "https://huggingface.co/Comfy-Org/Qwen-Image-2.1/resolve/main"
+PE_BASE = QWEN21_BASE
 
 
 @dataclass
@@ -36,6 +41,11 @@ _FIELDS = ("kind", "filename", "url", "size", "required")
 
 def _krea(kind: str, filename: str, size: int) -> "ModelFile":
     return ModelFile(kind, filename, f"{KREA_BASE}/{kind}/{filename}",
+                     size, required=False)
+
+
+def _qwen21(kind: str, filename: str, size: int) -> "ModelFile":
+    return ModelFile(kind, filename, f"{QWEN21_BASE}/{kind}/{filename}",
                      size, required=False)
 
 
@@ -74,6 +84,49 @@ DEFAULT_MODELS: list[ModelFile] = [
     # Krea-2 text encoder (Qwen3-VL 4B). Use CLIP type "krea2".
     _krea("text_encoders", "qwen3vl_4b_fp8_scaled.safetensors", 5_242_467_968),
     _krea("text_encoders", "qwen3vl_4b_bf16.safetensors", 8_875_719_384),
+
+    # --- Qwen-Image 2.1 (all optional) --------------------------------------
+    # 7B の単一ストリーム DiT（2K ネイティブ・RGBA 出力）。int8 convrot は
+    # 公式配布の量子化版（推奨）。
+    _qwen21("diffusion_models", "qwen_image_2.1_int8_convrot.safetensors",
+            7_256_783_064),
+    _qwen21("diffusion_models", "qwen_image_2.1_bf16.safetensors",
+            14_230_280_616),
+    # Text encoder: Qwen3-VL 8B（CLIP type "qwen_image"。ComfyUI は 8B を
+    # 検出すると自動で 2.1 用テンプレートに切り替える）。
+    _qwen21("text_encoders", "qwen3vl_8b_int8_convrot.safetensors",
+            9_350_798_360),
+    _qwen21("text_encoders", "qwen3vl_8b_w4a8.safetensors", 6_312_105_364),
+    _qwen21("text_encoders", "qwen3vl_8b_bf16.safetensors", 17_534_334_616),
+    # 専用 VAE（64ch・16 倍圧縮・RGBA）。anima/krea2 の VAE とは非互換。
+    _qwen21("vae", "qwen_image_2.1_vae_bf16.safetensors", 675_509_688),
+
+    # --- プロンプト整形 LLM (Qwen-Image 2.1 Prompt Enhancer, T2I) ----------------
+    # Qwen3.5-VL 9B の微調整モデル（int8 convrot, Comfy-Org 再パッケージ）。
+    # 置き場は models/llm（app/prompt_llm.py）。隣の system_prompt.txt は本家
+    # リポジトリの公式指示文で、scom は <名前>.system_prompt.txt があれば
+    # それをシステムプロンプトに使う。ライセンスは Qwen Research License
+    # （非商用）。
+    ModelFile("llm",
+              "qwen3.5_9b_qwen_image_2.1_pe_t2i.int8_convrot.safetensors",
+              f"{PE_BASE}/text_encoders/"
+              "qwen3.5_9b_qwen_image_2.1_pe_t2i.int8_convrot.safetensors",
+              9_471_072_252, required=False),
+    ModelFile("llm",
+              "qwen3.5_9b_qwen_image_2.1_pe_t2i.int8_convrot.system_prompt.txt",
+              "https://huggingface.co/Qwen/Qwen-Image-2.1-PE-T2I/resolve/main/"
+              "system_prompt.txt",
+              0, required=False),
+    # 汎用 LLM (Comfy-Org/Qwen3.5, bf16)。PE と違いシステムプロンプトに従う
+    # ので、anima / SDXL 向けの「タグ列に変換」（scom 同梱の指示文）に使う。
+    ModelFile("llm", "qwen3.5_4b_bf16.safetensors",
+              "https://huggingface.co/Comfy-Org/Qwen3.5/resolve/main/"
+              "text_encoders/qwen3.5_4b_bf16.safetensors",
+              9_319_828_320, required=False),
+    ModelFile("llm", "qwen3.5_2b_bf16.safetensors",
+              "https://huggingface.co/Comfy-Org/Qwen3.5/resolve/main/"
+              "text_encoders/qwen3.5_2b_bf16.safetensors",
+              4_548_221_488, required=False),
 
     # --- SDXL (WAI-illustrious-SDXL preset) ----------------------------------
     # フル SDXL チェックポイント（VAE/CLIP 内蔵）。CheckpointLoaderSimple で読み、

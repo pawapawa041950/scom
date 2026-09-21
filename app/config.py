@@ -23,7 +23,10 @@ MODEL_EXTENSIONS = (".safetensors", ".sft", ".ckpt", ".pt", ".gguf", ".bin")
 # Model component subdirectories under ``models/``. Names match both the
 # ComfyUI model categories (used in extra_model_paths.yaml) and the upstream
 # Hugging Face ``split_files`` layout, so the mapping is 1:1.
-MODEL_DIRS = ("diffusion_models", "vae", "text_encoders", "loras")
+# "llm" はプロンプト整形用の LLM 置き場（app/prompt_llm.py）。ComfyUI には
+# text_encoders の追加パスとして見せる（CLIPLoader で読むため）が、scom の
+# Text encoder 候補には出さない。
+MODEL_DIRS = ("diffusion_models", "vae", "text_encoders", "loras", "llm")
 
 
 def base_dir() -> Path:

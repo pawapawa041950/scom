@@ -108,9 +108,10 @@ _INT4_QUANT_GROUP = 64  # scale group of the packed int4 (convrot_w4a4) layout
 # The default int4 mode is a mix: the second/output matmul of each attention
 # and MLP (down/output projections) measured the highest int4 weight error on
 # anima (0.16-0.29 vs 0.15 elsewhere) and stays int8. Names cover anima
-# (output_proj/layer2) and krea2 (wo/down); q/k/v/up/gate go int4.
-# "int4_convrot_full" skips this exemption (smallest file; big models only).
-_INT4_KEEP_INT8 = ("output_proj", "o_proj", "layer2", "wo", "down")
+# (output_proj/layer2), krea2 (wo/down) and Qwen-Image 2.1 (img_mlp.out);
+# q/k/v/up/gate go int4. "int4_convrot_full" skips this exemption (smallest
+# file; big models only).
+_INT4_KEEP_INT8 = ("output_proj", "o_proj", "layer2", "wo", "down", "out")
 
 
 def _int4_output_side(layer):
@@ -130,7 +131,9 @@ def _quant_eligible(mode, key, bare, quantizable, ndim, in_features):
         return False
     if mode in ("int8_convrot", "int4_convrot", "int4_convrot_full"):
         # Conservative policy matching public ConvRot checkpoints: only the
-        # main DiT blocks (krea2: blocks.*, anima: net.blocks.*); the
+        # main DiT blocks (krea2: blocks.*, anima: net.blocks.*, Qwen-Image
+        # 2.1: transformer_blocks.* -- Comfy-Org's int8 file quantizes exactly
+        # to_q/k/v/to_out.0/gate_up/out of every block, as this policy); the
         # sensitive embed/final/txt layers stay high precision. The Hadamard
         # rotation also needs in_features divisible by the group size (256,
         # a multiple of the int4 scale group 64).

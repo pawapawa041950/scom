@@ -29,7 +29,7 @@ _USER_AGENT = "scom/1.0 (+https://github.com/)"
 _TIMEOUT = 15  # seconds
 _THUMB_WIDTH = 256
 
-# 注: LoRA の系統判定（anima/krea2/sdxl）は civitai の baseModel ではなく
+# 注: LoRA の系統判定（anima/krea2/qwen21/sdxl）は civitai の baseModel ではなく
 # safetensors ヘッダから行う（app/modelinfo.py の kind="loras"）。civitai の
 # 情報はサムネ・トリガーワード・リンクの表示にのみ使う。
 

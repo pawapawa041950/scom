@@ -16,7 +16,7 @@ except ModuleNotFoundError:  # Python 3.10
 
 DEFAULTS: dict[str, Any] = {
     # models
-    "preset": "",      # anima | krea2 | sdxl (空/旧 "all" は起動時に移行)
+    "preset": "",      # anima | krea2 | qwen21 | sdxl (空/旧 "all" は起動時に移行)
     # 表示モデルごとの Models + 設定カテゴリの記憶 (JSON {preset: {...}})
     "preset_conf": "{}",
     "diffusion": "",
@@ -38,6 +38,9 @@ DEFAULTS: dict[str, Any] = {
     # Comfy Kitchen INT8 attention（ComfyUI v0.35+ の --use-ck-attention）。
     # SageAttention と排他（両方指定すると ComfyUI 側は ck を優先する）。
     "ck_attention": False,
+    # プロンプトを LLM で整形する: models/llm 内のファイル名
+    # （"" = 使わない）。app/prompt_llm.py 参照。
+    "prompt_llm": "",
     # Hires fix (latent): 2段目サンプリングによる高解像度化
     "hires_enabled": False,
     "hires_scale": 1.5,

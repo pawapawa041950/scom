@@ -57,6 +57,13 @@ def build_parameters(meta: dict) -> str:
     if meta.get("lora_hashes"):
         # webui と同じクォート付き形式（civitai 等がリソース照合に使う）。
         fields.append(f"Lora hashes: \"{meta.get('lora_hashes')}\"")
+    if meta.get("prompt_llm"):
+        # LLM 整形: 使ったモデルと人間が書いた元のプロンプト（カンマや改行を
+        # 含むので JSON 文字列としてクォートする）。
+        fields.append(f"Prompt LLM: {meta.get('prompt_llm')}")
+        fields.append("Original prompt: "
+                      + json.dumps(str(meta.get("prompt_original", "")),
+                                   ensure_ascii=False))
     # Marks the generating app (A1111/Civitai-style Version token).
     fields.append(f"Version: {APP_SIGNATURE}")
     lines.append(", ".join(str(x) for x in fields))
@@ -69,6 +76,19 @@ def _exif_bytes(params_text: str) -> bytes:
         "0th": {piexif.ImageIFD.Software: APP_SIGNATURE.encode("ascii")},
         "Exif": {piexif.ExifIFD.UserComment: uc},
     })
+
+
+def _flatten_alpha(img: Image.Image) -> Image.Image:
+    """JPEG 用: アルファ付き画像（Qwen-Image 2.1 は RGBA 出力）は白地に
+    合成してから RGB にする。単に convert("RGB") すると透明部分の下の色
+    （黒やゴミ）がそのまま出てしまう。PNG/WebP はアルファのまま保存。"""
+    if img.mode in ("RGBA", "LA") or (
+            img.mode == "P" and "transparency" in img.info):
+        rgba = img.convert("RGBA")
+        bg = Image.new("RGB", rgba.size, (255, 255, 255))
+        bg.paste(rgba, mask=rgba.getchannel("A"))
+        return bg
+    return img.convert("RGB")
 
 
 def save_with_metadata(png_bytes: bytes, path: Path, fmt: str, quality: int,
@@ -95,7 +115,7 @@ def save_with_metadata(png_bytes: bytes, path: Path, fmt: str, quality: int,
         img.save(str(path), "PNG", compress_level=int(quality), pnginfo=info)
     elif fmt == "jpg":
         kw = {"exif": _exif_bytes(params_text)} if embed else {}
-        img.convert("RGB").save(str(path), "JPEG", quality=int(quality), **kw)
+        _flatten_alpha(img).save(str(path), "JPEG", quality=int(quality), **kw)
     elif fmt == "webp":
         kw = {"exif": _exif_bytes(params_text)} if embed else {}
         img.save(

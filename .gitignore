@@ -28,6 +28,7 @@ vendor/
 models/diffusion_models/*
 models/vae/*
 models/text_encoders/*
+models/llm/*
 !models/**/.gitkeep
 *.safetensors
 *.ckpt

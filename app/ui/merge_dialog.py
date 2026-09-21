@@ -25,7 +25,8 @@ from PySide6.QtWidgets import (
 from .widgets import WideComboBox
 from .window_state import bind_geometry
 
-# Returns "anima" | "krea2" | "shared" | "unknown" for a diffusion file name.
+# Returns "anima" | "krea2" | "qwen21" | "sdxl" | "unknown" for a diffusion
+# file name.
 FamilyFn = Callable[[str], str]
 
 NOTE_TEXT = (
@@ -405,7 +406,7 @@ class MergeDialog(QDialog):
         # Architecture check: warn when known families disagree (rows are
         # deliberately unfiltered, so mixing anima/krea2 files is possible).
         fams = {self._family(n) for n, _w in entries}
-        self.lbl_warn.setVisible(len(fams & {"anima", "krea2"}) > 1)
+        self.lbl_warn.setVisible(len(fams & {"anima", "krea2", "qwen21"}) > 1)
 
         size = 0
         for n, _w in entries:

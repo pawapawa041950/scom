@@ -4,7 +4,7 @@ Windowsにおいて1ウィンドウだけでお手軽に画像生成すること
 必須ファイルのダウンロードや環境構築もアプリ上から行えます。  
 
 内部ではComfyUIを利用しています。  
-モデルはAnima、Krea2、StableDiffusion XLに対応しています。  
+モデルはAnima、Krea2、Qwen-Image 2.1、StableDiffusion XLに対応しています。  
 
 ![](img/ss.jpg)
 

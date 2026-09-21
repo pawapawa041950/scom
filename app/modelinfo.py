@@ -1,4 +1,5 @@
-"""Identify a model file's family (anima / krea2) from its safetensors header.
+"""Identify a model file's family (anima / krea2 / qwen21 / sdxl) from its
+safetensors header.
 
 Files stay where ComfyUI already keeps them (``models/<kind>/``). To decide
 which preset a file belongs to we read only the *safetensors header* — the
@@ -7,11 +8,14 @@ weights. This makes detection independent of the filename, so a model the user
 downloaded under any name is still sorted correctly.
 
 Signatures (confirmed against the real published files):
-  * text encoder: a vision tower (``visual``/``vision`` keys) or hidden dim
-    2560 -> krea2 (Qwen3-VL 4B); hidden dim 1024 -> anima (Qwen3 0.6B).
+  * text encoder: a vision tower (``visual``/``vision`` keys) -> Qwen3-VL:
+    merger/hidden dim 2560 -> krea2 (4B), 4096 -> qwen21 (8B);
+    hidden dim 1024 -> anima (Qwen3 0.6B).
   * diffusion:    top-level keys ``txtfusion``/``tmlp``/``tproj`` -> krea2
-    (~12B DiT); top-level ``net`` -> anima. Param count is the fallback.
-  * vae:          the Qwen-Image VAE is shared by both families.
+    (~12B DiT); ``txt_in.text_norm`` -> qwen21 (Qwen-Image 2.1, 7B);
+    top-level ``net`` -> anima. Param count is the fallback.
+  * vae:          the Qwen-Image VAE is shared by anima/krea2; Qwen-Image 2.1
+    has its own 64ch/16x RGBA VAE (Wan2.2 layout, temporal kernel 1).
 
 Results are cached per (path, size, mtime) so repeated preset switches don't
 re-read headers.
@@ -25,6 +29,7 @@ from typing import Optional
 
 ANIMA = "anima"
 KREA2 = "krea2"
+QWEN21 = "qwen21"   # Qwen-Image 2.1（7B DiT / Qwen3-VL 8B TE / 専用 64ch VAE）
 SDXL = "sdxl"
 SHARED = "shared"   # anima/krea2 共通（Qwen-Image VAE）。sdxl には含まれない。
 OTHER = "other"     # アーキテクチャは特定できたが、どのプリセットでも使えない
@@ -192,10 +197,21 @@ def _classify_lora(h: dict, keys: list[str]) -> str:
 
     if "transformer_blocks" in norm_all:
         # Qwen-Image (20B) / Flux(diffusers名): joint-attention の
-        # add_*_proj や img_mod/img_mlp。anima とは名前も次元も別物。
+        # add_*_proj や img_mod/txt_mod。anima とは名前も次元も別物。
         if any(m in norm_all for m in ("add_q_proj", "add_k_proj",
-                                       "img_mod", "img_mlp", "txt_mod")):
+                                       "img_mod", "txt_mod")):
             return OTHER
+        # Qwen-Image 2.1: 単一ストリームで attn.to_q + img_mlp（gate_up /
+        # proj / out）だけを持つ。hidden 4096（20B は 3072）で確認する。
+        if "img_mlp" in norm_all or "attn_to_q" in norm_all:
+            d = (_lora_in_features(h, keys, "attn_to_q")
+                 or _lora_in_features(h, keys, "img_mlp_gate_up")
+                 or _lora_in_features(h, keys, "img_mlp_proj"))
+            if d == 4096:
+                return QWEN21
+            if d is not None:
+                return OTHER
+            return UNKNOWN
         # krea2 (diffusers名) 固有の gate 付き attention/FF。
         if "to_gate" in norm_all or "ff_gate" in norm_all:
             return KREA2
@@ -205,6 +221,16 @@ def _classify_lora(h: dict, keys: list[str]) -> str:
         return OTHER  # Flux / HunyuanVideo 系（kohya 名）
 
     return UNKNOWN
+
+
+# Qwen3.5 系（線形 attention 層を持つ）= 文章生成用 LLM（Qwen-Image 2.1 の
+# プロンプト整形モデル PE もこれ）。置き場は models/llm だが、間違えて
+# text_encoders に置かれても TE 候補には出さない。
+_QWEN35_KEY = "model.language_model.layers.0.linear_attn.A_log"
+
+
+def _is_text_llm_header(keys) -> bool:
+    return _QWEN35_KEY in keys
 
 
 def _classify_header(kind: str, h: dict) -> str:
@@ -219,11 +245,34 @@ def _classify_header(kind: str, h: dict) -> str:
         # kl-f8 (SD/SDXL) VAE: quant_conv / decoder.conv_in が特徴。
         if "post_quant_conv.weight" in h or "decoder.conv_in.weight" in h:
             return SDXL
+        # Qwen-Image 2.1 VAE: Wan2.2 配置（upsamples 二段）で出力ヘッドが
+        # 時間カーネル 1 の RGBA（ComfyUI sd.py と同じ判定）。16 倍圧縮・
+        # 64ch なので anima/krea2 の Qwen-Image VAE とは互換が無い。
+        head = (h.get("decoder.head.2.weight") or {}).get("shape") or []
+        if ("decoder.upsamples.0.upsamples.0.residual.2.weight" in h
+                and len(head) == 5 and head[2] == 1):
+            return QWEN21
         return SHARED  # Qwen-Image VAE (anima/krea2 共通) ほか
 
     if kind == "text_encoders":
+        if _is_text_llm_header(keys):
+            return OTHER   # プロンプト整形用 LLM（TE の候補には出さない）
         if any("visual" in k or "vision" in k for k in keys):
-            return KREA2
+            # Qwen3-VL: 4B (2560) = krea2、8B (4096) = Qwen-Image 2.1。
+            # ComfyUI と同じく merger の出力次元で見る（無ければ embed）。
+            dim = None
+            for k in keys:
+                if k.endswith("visual.merger.linear_fc2.weight"):
+                    shape = h[k].get("shape") or []
+                    dim = shape[0] if len(shape) == 2 else None
+                    break
+            if dim is None:
+                for k in keys:
+                    if k.endswith("embed_tokens.weight"):
+                        shape = h[k].get("shape") or []
+                        dim = shape[1] if len(shape) == 2 else None
+                        break
+            return QWEN21 if dim == 4096 else KREA2
         # CLIP (SDXL の clip_l/clip_g)。transformers 形式は text_model.*、
         # チェックポイントから取り出した clip_g は open_clip 形式
         # (transformer.resblocks.*)。
@@ -252,6 +301,10 @@ def _classify_header(kind: str, h: dict) -> str:
         prefixes = {k.split(".")[0] for k in keys}
         if {"txtfusion", "tmlp", "tproj"} & prefixes:
             return KREA2
+        # Qwen-Image 2.1（7B, 単一ストリーム）: txt_in.text_norm が固有
+        # （20B の Qwen-Image は txt_norm がトップレベル）。
+        if "txt_in.text_norm.weight" in h:
+            return QWEN21
         if "net" in prefixes:
             return ANIMA
         # SD/SDXL U-Net（単体ファイル / フルチェックポイントの両形式）。
@@ -274,16 +327,24 @@ def _classify_header(kind: str, h: dict) -> str:
 def _filename_family(kind: str, name: str) -> str:
     """Last-resort guess from the filename (non-safetensors / unreadable file)."""
     n = name.lower()
+    q21 = any(s in n for s in ("qwen_image_2.1", "qwen_image_2_1",
+                               "qwen-image-2.1", "qwen_image2.1"))
     if kind == "vae":
         if "sdxl" in n or "sd_xl" in n:
             return SDXL
+        if q21:
+            return QWEN21
         return SHARED if "qwen_image" in n else UNKNOWN
     if "sdxl" in n or "sd_xl" in n:
         return SDXL
+    if q21:
+        return QWEN21
     if kind == "text_encoders" and ("clip_l" in n or "clip_g" in n):
         return SDXL
     if "krea2" in n or "krea-2" in n:
         return KREA2
+    if kind == "text_encoders" and "qwen3vl_8b" in n:
+        return QWEN21
     if kind == "text_encoders" and "qwen3vl" in n:
         return KREA2
     if "anima" in n:
@@ -356,7 +417,8 @@ def is_checkpoint(path: Path) -> bool:
 
 
 def family(kind: str, path: Path) -> str:
-    """Return 'anima' | 'krea2' | 'shared' | 'unknown' for the model file.
+    """Return 'anima' | 'krea2' | 'qwen21' | 'sdxl' | 'shared' | 'other' |
+    'unknown' for the model file.
 
     Reads the safetensors header (cached by size+mtime); falls back to the
     filename when the file isn't safetensors or the header can't be parsed.

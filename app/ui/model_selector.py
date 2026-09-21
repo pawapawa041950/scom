@@ -29,15 +29,31 @@ PRESET_KREA2 = [
     "qwen_image_vae.safetensors",
     "qwen3vl_4b_fp8_scaled.safetensors",
 ]
+# Qwen-Image 2.1: DiT int8 + Qwen3-VL 8B int8 + 専用 VAE（合計約 17.3 GB）。
+PRESET_QWEN21 = [
+    "qwen_image_2.1_int8_convrot.safetensors",
+    "qwen_image_2.1_vae_bf16.safetensors",
+    "qwen3vl_8b_int8_convrot.safetensors",
+]
 # WAI はフル SDXL チェックポイント（VAE/CLIP 内蔵）なので本体のみ。VAE/CLIP は
 # モデル内蔵を使うため別途ダウンロードしない。
 PRESET_SDXL = [
     "waiIllustriousSDXL_v170.safetensors",
 ]
+# プロンプト整形 LLM（任意）。本体 + 公式システムプロンプト。
+PRESET_PROMPT_LLM = [
+    "qwen3.5_9b_qwen_image_2.1_pe_t2i.int8_convrot.safetensors",
+    "qwen3.5_9b_qwen_image_2.1_pe_t2i.int8_convrot.system_prompt.txt",
+]
+# 汎用 LLM（タグ列変換向け。PE はシステムプロンプトに従わないため別途）。
+PRESET_GENERAL_LLM = ["qwen3.5_4b_bf16.safetensors"]
 QUICK_PRESETS = [
     ("Anima 必須モデル", PRESET_ANIMA),
     ("Krea2 必須モデル int8convrot", PRESET_KREA2),
+    ("Qwen-Image 2.1 必須モデル int8convrot", PRESET_QWEN21),
     ("SDXL WAI-illustrious-SDXL 必須モデル", PRESET_SDXL),
+    ("プロンプト整形 LLM: Qwen-Image 2.1 PE（自然文向け, 任意）", PRESET_PROMPT_LLM),
+    ("プロンプト整形 LLM: Qwen3.5 4B（タグ列向け, 任意）", PRESET_GENERAL_LLM),
 ]
 
 

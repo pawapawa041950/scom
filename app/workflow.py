@@ -85,6 +85,12 @@ class GenParams:
     hires_denoise: float = 0.55
     hires_steps: int = 0            # 0 = メインの steps と同じ
     hires_method: str = "bislerp"   # LatentUpscaleBy の補間方法
+    # プロンプトを LLM で整形する（app/prompt_llm.py）。llm_file は
+    # models/llm 内のファイル名（"" = 使わない）。整形は生成ワーカー
+    # が行い、prompt を書き換えて元の文を prompt_original に退避する。
+    llm_file: str = ""
+    llm_style: str = "natural"      # natural | tags
+    prompt_original: str = ""
 
 
 # Quantization choices for the merged model (node input "quantize").

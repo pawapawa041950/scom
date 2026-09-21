@@ -34,6 +34,7 @@ from .. import config, lora, modelinfo
 _FAMILY_LABELS = {
     modelinfo.ANIMA: "anima",
     modelinfo.KREA2: "krea2",
+    modelinfo.QWEN21: "qwen21",
     modelinfo.SDXL: "sdxl",
     modelinfo.OTHER: "対応外",
     modelinfo.UNKNOWN: "不明",
