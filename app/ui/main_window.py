@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import random
+import re
 from pathlib import Path
 from typing import Optional
 
@@ -40,6 +41,11 @@ MAX_SEED = 2**63 - 1
 # 元のプロンプトと区別する。token を持つ区間はユーザーが編集しても書式が
 # 残るので、編集後のワードごとまとめて削除できる。
 _LORA_TOKEN_PROP = QTextFormat.UserProperty + 17
+# プロンプトに貼られた WebUI 形式の LoRA 指定 <lora:名前:強度>（強度は省略可、
+# 名前は拡張子なし・サブフォルダ有無を問わない）。貼られた時点で LoRA 設定に
+# 取り込み、文字列は欄から取り除く（_absorb_lora_tags）。
+_LORA_TAG_RE = re.compile(
+    r"<lora:([^:<>]+?)\s*(?::\s*([-+]?\d*\.?\d+))?\s*>", re.IGNORECASE)
 # 挿入部分の色（LoRA ウィンドウのトリガーワード表示に合わせた明るい配色）。
 # 暗色テーマだと本文の文字色が明るいので、明背景に合わせて文字色も濃色に。
 _LORA_INSERT_BG = QColor("#e7edf5")   # 明るい背景
@@ -291,6 +297,8 @@ class MainWindow(QMainWindow):
         self._merge_running = False  # a merge-only run is in flight
         # Applied LoRAs: [{"name": str, "strength": float}, ...] in chain order.
         self._loras: list[dict] = []
+        self._absorbing_lora_tags = False      # _absorb_lora_tags の再入防止
+        self._lora_tag_warned: set[str] = set()  # 見つからなかった <lora:名前>
         self._lora_dlg = None  # non-modal LoraDialog (at most one)
         # LoRA カードのホバーで出すトリガーワードのポップアップ（遅延生成）。
         self._lora_popup = None
@@ -562,6 +570,11 @@ class MainWindow(QMainWindow):
         # ユーザーが挿入済みハイライトを手で消したときも LoRA 窓の表示を追従。
         self.txt_prompt.textChanged.connect(self._push_lora_inserted)
         self.txt_negative.textChanged.connect(self._push_lora_inserted)
+        # <lora:名前:強度> が貼られたら LoRA を適用して文字列を取り除く。
+        self.txt_prompt.textChanged.connect(
+            lambda: self._absorb_lora_tags(self.txt_prompt))
+        self.txt_negative.textChanged.connect(
+            lambda: self._absorb_lora_tags(self.txt_negative))
         return box
 
     def _build_settings_box(self) -> QGroupBox:
@@ -1582,6 +1595,55 @@ class MainWindow(QMainWindow):
                     it += 1
                 block = block.next()
         return tokens
+
+    def _resolve_lora_name(self, name: str) -> Optional[str]:
+        """<lora:名前> の名前を models/loras の相対パスに解決する。拡張子や
+        サブフォルダの有無、大文字小文字、区切り文字の向きは問わない。"""
+        want = name.strip().replace("/", "\\").lower()
+        if not want:
+            return None
+        for rel in self._all_models.get("loras", []):
+            p = Path(rel)
+            if want in (rel.lower(), str(p.with_suffix("")).lower(),
+                        p.name.lower(), p.stem.lower()):
+                return rel
+        return None
+
+    def _absorb_lora_tags(self, field) -> None:
+        """欄内の <lora:名前:強度> を LoRA 設定に取り込み、文字列を取り除く
+        （WebUI の記法をそのまま貼れるように）。該当ファイルが無いものは
+        そのまま残し、一度だけログに出す。"""
+        if getattr(self, "_loading", False) or self._absorbing_lora_tags:
+            return
+        text = field.toPlainText()
+        if "<lora:" not in text.lower():
+            return
+        regions: list[tuple[int, int]] = []
+        for m in _LORA_TAG_RE.finditer(text):
+            name = m.group(1).strip()
+            rel = self._resolve_lora_name(name)
+            if rel is None:
+                if name not in self._lora_tag_warned:
+                    self._lora_tag_warned.add(name)
+                    self.append_log(
+                        f"<lora:{name}> に該当する LoRA が models/loras に"
+                        "見つかりません（文字列はそのまま残します）")
+                continue
+            try:
+                strength = float(m.group(2)) if m.group(2) else 1.0
+            except ValueError:
+                strength = 1.0
+            self.append_log(
+                f"プロンプトの <lora:{name}> を LoRA 設定に取り込みます")
+            self._on_lora_apply(rel, strength)
+            regions.append((m.start(), m.end()))
+        if not regions:
+            return
+        self._absorbing_lora_tags = True
+        try:
+            self._remove_token_regions(field, regions)
+        finally:
+            self._absorbing_lora_tags = False
 
     def _push_lora_inserted(self) -> None:
         """挿入済み token を LoRA ウィンドウ・カードのポップアップへ通知
