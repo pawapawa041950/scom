@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import http.client
 import json
+import os
 import socket
 import subprocess
 import sys
@@ -43,6 +44,132 @@ def _free_port(preferred: int = 8199) -> int:
             except OSError:
                 continue
     raise RuntimeError("could not allocate a localhost port")
+
+
+# ----- 残留バックエンド対策 ---------------------------------------------------
+# scom が異常終了（強制終了・クラッシュ・シャットダウン）すると ComfyUI の
+# 子プロセスが取り残され、モデルを RAM/VRAM に抱えたまま、ポートと
+# ComfyUI の SQLite DB（comfyui.db.lock）を掴み続ける。次回起動は別ポートに
+# 逃げるので動きはするが、「Database is locked」が出て遅くなる。
+#   1. Windows のジョブオブジェクト（KILL_ON_JOB_CLOSE）で scom が死ねば
+#      バックエンドの木ごと OS に消させる。
+#   2. 起動時に前回の PID ファイルを見て、持ち主の scom が居なければ掃除する
+#      （1. が効かなかった場合や旧版の取り残し用）。
+#   3. ComfyUI の DB はメモリ上にする（scom はアセット DB を使わない）ので、
+#      多重起動しても DB ロックで待たされることが無い。
+_PID_FILE = "comfyui.pid.json"
+_PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+_STILL_ACTIVE = 259
+
+
+def _pid_alive(pid: int) -> bool:
+    """Windows: その PID のプロセスがまだ動いているか（終了済み/不在は False）。"""
+    if pid <= 0:
+        return False
+    if sys.platform != "win32":
+        try:
+            os.kill(pid, 0)
+            return True
+        except OSError:
+            return False
+    import ctypes
+    k32 = ctypes.windll.kernel32
+    h = k32.OpenProcess(_PROCESS_QUERY_LIMITED_INFORMATION, False, int(pid))
+    if not h:
+        return False
+    try:
+        code = ctypes.c_ulong()
+        if not k32.GetExitCodeProcess(h, ctypes.byref(code)):
+            return False
+        return code.value == _STILL_ACTIVE
+    finally:
+        k32.CloseHandle(h)
+
+
+def _kill_tree(pid: int) -> None:
+    if sys.platform == "win32":
+        subprocess.run(["taskkill", "/PID", str(pid), "/T", "/F"],
+                       capture_output=True,
+                       creationflags=subprocess.CREATE_NO_WINDOW)
+    else:
+        try:
+            os.kill(pid, 9)
+        except OSError:
+            pass
+
+
+def _listener_pid(port: int) -> Optional[int]:
+    """127.0.0.1:port で LISTEN しているプロセスの PID（netstat 経由）。"""
+    if sys.platform != "win32":
+        return None
+    try:
+        out = subprocess.run(["netstat", "-ano", "-p", "tcp"],
+                             capture_output=True, text=True, timeout=10,
+                             creationflags=subprocess.CREATE_NO_WINDOW).stdout
+    except (OSError, subprocess.SubprocessError):
+        return None
+    needle = f":{port}"
+    for line in out.splitlines():
+        cols = line.split()
+        if (len(cols) >= 5 and cols[0].upper() == "TCP"
+                and cols[1].endswith(needle) and cols[3] == "LISTENING"):
+            try:
+                return int(cols[4])
+            except ValueError:
+                return None
+    return None
+
+
+def _attach_kill_on_close_job(proc: subprocess.Popen):
+    """子プロセスをジョブに入れ、ジョブハンドルが閉じたら（= scom が
+    どんな死に方をしても）木ごと強制終了させる。戻り値はハンドル（保持
+    し続けること）。失敗時は None（既存ジョブの制約下など）。"""
+    if sys.platform != "win32" or os.environ.get("SCOM_NO_JOB"):
+        return None
+    import ctypes
+    from ctypes import wintypes
+
+    class IO_COUNTERS(ctypes.Structure):
+        _fields_ = [(n, ctypes.c_ulonglong) for n in (
+            "ReadOperationCount", "WriteOperationCount", "OtherOperationCount",
+            "ReadTransferCount", "WriteTransferCount", "OtherTransferCount")]
+
+    class BASIC_LIMIT(ctypes.Structure):
+        _fields_ = [("PerProcessUserTimeLimit", ctypes.c_int64),
+                    ("PerJobUserTimeLimit", ctypes.c_int64),
+                    ("LimitFlags", wintypes.DWORD),
+                    ("MinimumWorkingSetSize", ctypes.c_size_t),
+                    ("MaximumWorkingSetSize", ctypes.c_size_t),
+                    ("ActiveProcessLimit", wintypes.DWORD),
+                    ("Affinity", ctypes.c_size_t),
+                    ("PriorityClass", wintypes.DWORD),
+                    ("SchedulingClass", wintypes.DWORD)]
+
+    class EXTENDED_LIMIT(ctypes.Structure):
+        _fields_ = [("BasicLimitInformation", BASIC_LIMIT),
+                    ("IoInfo", IO_COUNTERS),
+                    ("ProcessMemoryLimit", ctypes.c_size_t),
+                    ("JobMemoryLimit", ctypes.c_size_t),
+                    ("PeakProcessMemoryUsed", ctypes.c_size_t),
+                    ("PeakJobMemoryUsed", ctypes.c_size_t)]
+
+    k32 = ctypes.windll.kernel32
+    k32.CreateJobObjectW.restype = wintypes.HANDLE
+    k32.SetInformationJobObject.argtypes = [wintypes.HANDLE, ctypes.c_int,
+                                            ctypes.c_void_p, wintypes.DWORD]
+    k32.AssignProcessToJobObject.argtypes = [wintypes.HANDLE, wintypes.HANDLE]
+    job = k32.CreateJobObjectW(None, None)
+    if not job:
+        return None
+    info = EXTENDED_LIMIT()
+    info.BasicLimitInformation.LimitFlags = 0x2000  # KILL_ON_JOB_CLOSE
+    ok = (k32.SetInformationJobObject(job, 9, ctypes.byref(info),
+                                      ctypes.sizeof(info))   # ExtendedLimitInformation
+          and k32.AssignProcessToJobObject(job, wintypes.HANDLE(proc._handle)))
+    if not ok:
+        k32.CloseHandle(job)
+        return None
+    return job
 
 
 def write_extra_model_paths(paths: config.AppPaths) -> Path:
@@ -108,6 +235,7 @@ class ComfyBackend:
         self.use_sage_attention = False
         self.use_ck_attention = False
         self._proc: Optional[subprocess.Popen] = None
+        self._job = None   # Windows ジョブオブジェクト（_attach_kill_on_close_job）
         self._log_thread: Optional[threading.Thread] = None
         self._log_tail: deque[str] = deque(maxlen=40)
 
@@ -118,6 +246,56 @@ class ComfyBackend:
 
     def is_running(self) -> bool:
         return self._proc is not None and self._proc.poll() is None
+
+    # ----- 残留バックエンドの掃除 ------------------------------------------
+    @property
+    def _pid_file(self) -> Path:
+        return self.paths.backend_root / _PID_FILE
+
+    def _write_pid_file(self) -> None:
+        try:
+            self._pid_file.write_text(json.dumps({
+                "owner_pid": os.getpid(), "pid": self._proc.pid,
+                "port": self.port}), encoding="utf-8")
+        except OSError:
+            pass
+
+    def _reap_stale_backend(self, log: Callable[[str], None]) -> None:
+        """前回の scom が後始末できずに残した ComfyUI を終了させる。
+
+        PID ファイルの持ち主（scom）がまだ生きていれば別インスタンスなので
+        触らない。死んでいれば、記録したポートで応答している ComfyUI と
+        記録した PID の木を止める。"""
+        try:
+            info = json.loads(self._pid_file.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return
+        try:
+            owner, pid, port = (int(info.get("owner_pid", 0)),
+                                int(info.get("pid", 0)), int(info.get("port", 0)))
+        except (TypeError, ValueError):
+            self._pid_file.unlink(missing_ok=True)
+            return
+        if owner == os.getpid() or (owner and _pid_alive(owner)):
+            return  # 自分、または起動中の別インスタンスのもの
+        victims = []
+        if port:
+            try:
+                with urllib.request.urlopen(
+                        f"http://{self.host}:{port}/system_stats", timeout=2):
+                    lp = _listener_pid(port)
+                    if lp:
+                        victims.append(lp)
+            except (urllib.error.URLError, OSError):
+                pass
+        if pid and _pid_alive(pid) and pid not in victims:
+            victims.append(pid)
+        for v in victims:
+            _kill_tree(v)
+        if victims:
+            log(f"前回の残留 ComfyUI プロセスを終了しました (PID {victims})")
+            time.sleep(0.5)  # ポート解放を待つ
+        self._pid_file.unlink(missing_ok=True)
 
     def start(self, log: Optional[Callable[[str], None]] = None,
               timeout: float = 120.0) -> None:
@@ -135,6 +313,7 @@ class ComfyBackend:
 
         config.ensure_model_dirs()
         extra_paths = write_extra_model_paths(self.paths)
+        self._reap_stale_backend(log)
         self.port = _free_port(self.port)
 
         cmd = [
@@ -152,6 +331,10 @@ class ComfyBackend:
             # プロセスごと落ちる（anima / krea2 の TE で再現、v0.37.0）。
             # 従来どおり RAM 経由で読む。
             "--disable-fast-disk",
+            # ComfyUI のアセット DB は使わない。メモリ上にすると comfyui.db の
+            # ファイルロックが無くなり、残留/多重起動時の「Database is
+            # locked」とその待ちが起きない。
+            "--database-url", "sqlite:///:memory:",
         ]
         if self.use_ck_attention:
             # 対応可否は設定を ON にした時点で確認済み（setup.ck_attention_available）。
@@ -185,6 +368,10 @@ class ComfyBackend:
             bufsize=1,
             creationflags=creationflags,
         )
+        # scom が死んだら OS にバックエンドを道連れにさせる + 次回起動時の
+        # 掃除用に PID を記録する。
+        self._job = _attach_kill_on_close_job(self._proc)
+        self._write_pid_file()
         # Drain stdout on a daemon thread so a quiet subprocess never blocks the
         # readiness poll below.
         self._start_log_reader(log)
@@ -244,6 +431,14 @@ class ComfyBackend:
             except subprocess.TimeoutExpired:
                 self._proc.kill()
         self._proc = None
+        if self._job is not None and sys.platform == "win32":
+            import ctypes
+            ctypes.windll.kernel32.CloseHandle(self._job)  # 残党も道連れ
+            self._job = None
+        try:
+            self._pid_file.unlink(missing_ok=True)
+        except OSError:
+            pass
 
     # ----- generation ------------------------------------------------------
     def _post_prompt(self, graph: dict) -> str:
