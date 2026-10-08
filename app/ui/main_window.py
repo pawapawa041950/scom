@@ -29,7 +29,8 @@ from . import ansi_log
 from .widgets import FlowLayout, GrowingTextEdit, WideComboBox
 from ..comfy_backend import ComfyBackend, BackendError, Progress
 from ..workflow import (
-    GenParams, build_graph, build_merge_graph, merge_pin_key, merge_recipe,
+    GenParams, build_extract_lora_graph, build_graph, build_merge_graph,
+    merge_pin_key, merge_recipe,
     SAMPLERS, SCHEDULERS, CLIP_TYPES_SINGLE, CLIP_TYPES_DUAL, DEFAULT_NEGATIVE,
 )
 
@@ -1138,6 +1139,8 @@ class MainWindow(QMainWindow):
                     "low_memory": bool(e.get("low_memory", False)),
                     "loras": [(str(n), float(s))
                               for n, s in e.get("loras", []) or []],
+                    "diffs": [(str(a), str(b), float(s))
+                              for a, b, s in e.get("diffs", []) or []],
                 })
             if out:
                 return out
@@ -1157,7 +1160,7 @@ class MainWindow(QMainWindow):
         return [{"id": 1, "name": "マージモデル1", "models": old,
                  "quant": quant,
                  "low_memory": bool(self.settings.get("merge_low_memory", False)),
-                 "loras": []}]
+                 "loras": [], "diffs": []}]
 
     def _lora_family(self, relname: str) -> str:
         if not relname:
@@ -1217,9 +1220,11 @@ class MainWindow(QMainWindow):
             self._all_models.get("diffusion_models", []),
             self._diffusion_family,
             config.models_root() / "diffusion_models",
-            self._all_models.get("loras", []), self._lora_family, None)
+            self._all_models.get("loras", []), self._lora_family,
+            config.models_root() / "loras", None)
         dlg.merge_requested.connect(self._on_merge_requested)
         dlg.save_requested.connect(self._on_save_requested)
+        dlg.extract_requested.connect(self._on_extract_requested)
         dlg.delete_requested.connect(self._on_merge_delete)
         dlg.rename_requested.connect(self._on_merge_rename)
         dlg.free_memory_requested.connect(self._on_free_memory)
@@ -1229,21 +1234,23 @@ class MainWindow(QMainWindow):
             dlg.set_merge_running(True)
         dlg.show()
 
-    def _on_merge_requested(self, entries, loras, quant: str,
+    def _on_merge_requested(self, entries, loras, diffs, quant: str,
                             low_memory: bool) -> None:
         """マージ button: register a new entry and build it in backend RAM."""
         models = [(str(n), float(w)) for n, w in entries]
         loras = [(str(n), float(s)) for n, s in loras]
+        diffs = [(str(a), str(b), float(s)) for a, b, s in diffs]
         try:
             graph = build_merge_graph(models, quant, low_memory,
-                                      merge_loras=loras)
+                                      merge_loras=loras, merge_diffs=diffs)
         except ValueError as e:
             QMessageBox.warning(self, "入力不足", str(e))
             return
         self._merge_seq += 1
         entry = {"id": self._merge_seq, "name": f"マージモデル{self._merge_seq}",
                  "models": models, "quant": str(quant),
-                 "low_memory": bool(low_memory), "loras": loras}
+                 "low_memory": bool(low_memory), "loras": loras,
+                 "diffs": diffs}
         self._merges.append(entry)
         self._schedule_save()
         self._apply_preset_filter()  # the new entry appears in the dropdown
@@ -1252,17 +1259,31 @@ class MainWindow(QMainWindow):
             self._merge_dlg.select_entry(entry["id"])
         self._run_merge(graph, saving=False, entry_id=entry["id"])
 
-    def _on_save_requested(self, entries, loras, quant: str,
+    def _on_save_requested(self, entries, loras, diffs, quant: str,
                            low_memory: bool, filename: str) -> None:
         models = [(str(n), float(w)) for n, w in entries]
         loras = [(str(n), float(s)) for n, s in loras]
+        diffs = [(str(a), str(b), float(s)) for a, b, s in diffs]
         try:
             graph = build_merge_graph(models, quant, low_memory,
-                                      save_to=filename, merge_loras=loras)
+                                      save_to=filename, merge_loras=loras,
+                                      merge_diffs=diffs)
         except ValueError as e:
             QMessageBox.warning(self, "入力不足", str(e))
             return
         self._run_merge(graph, saving=True, entry_id=None)
+
+    def _on_extract_requested(self, model_a: str, model_b: str, rank: int,
+                              filename: str) -> None:
+        """「差分から LoRA を作成」: model_a − model_b を低ランク近似して
+        models/loras に保存する（バックエンドの ScomExtractLora）。"""
+        try:
+            graph = build_extract_lora_graph(model_a, model_b, int(rank),
+                                             filename)
+        except ValueError as e:
+            QMessageBox.warning(self, "入力不足", str(e))
+            return
+        self._run_merge(graph, saving=True, entry_id=None, kind="extract")
 
     def _on_merge_delete(self, entry_id: int) -> None:
         entry = self._merge_entry_by_id(entry_id)
@@ -1274,7 +1295,8 @@ class MainWindow(QMainWindow):
         if entry is not None and self.backend.is_running():
             try:
                 self.backend.release_merge(
-                    merge_recipe(entry["models"], entry.get("loras", [])),
+                    merge_recipe(entry["models"], entry.get("loras", []),
+                                 entry.get("diffs", [])),
                     entry["quant"], entry["low_memory"])
             except OSError as e:
                 self.append_log(f"メモリ解放に失敗: {e}")
@@ -1332,13 +1354,14 @@ class MainWindow(QMainWindow):
         self._merge_built_ids = {
             int(e["id"]) for e in self._merges
             if merge_pin_key(e["models"], e["quant"], e["low_memory"],
-                             e.get("loras", []))
+                             e.get("loras", []), e.get("diffs", []))
             in pinned}
         self._push_merge_state()
 
     def _run_merge(self, graph: dict, saving: bool,
-                   entry_id: Optional[int]) -> None:
-        """Run a merge-only prompt (build in RAM / save to file) off-thread."""
+                   entry_id: Optional[int], kind: str = "merge") -> None:
+        """Run a merge-only prompt (build in RAM / save to file / extract a
+        LoRA: ``kind`` = "merge" | "extract") off-thread."""
         if not self._backend_ready():
             QMessageBox.warning(
                 self, "未準備",
@@ -1354,8 +1377,11 @@ class MainWindow(QMainWindow):
         self.btn_generate.setEnabled(False)
         self.btn_cancel.setEnabled(True)
         self.progress.setValue(0)
-        note = ("マージモデルを保存中…" if saving
-                else "マージモデルをメインメモリ上に構築中…")
+        if kind == "extract":
+            note = "2 モデルの差分から LoRA を抽出中…"
+        else:
+            note = ("マージモデルを保存中…" if saving
+                    else "マージモデルをメインメモリ上に構築中…")
         self.status.showMessage(note)
         self.append_log(note)
 
@@ -1369,7 +1395,7 @@ class MainWindow(QMainWindow):
         # bound methods get queued to the GUI thread. A lambda here executed
         # _on_merge_done -> dialog widget updates off the GUI thread
         # ("Cannot set parent ... different thread" warnings).
-        self._merge_run_ctx = (saving, entry_id)
+        self._merge_run_ctx = (saving, entry_id, kind)
         self._merge_running = True
         self._gen_worker.progress.connect(self._on_merge_progress)
         self._gen_worker.done.connect(self._on_merge_worker_done)
@@ -1387,7 +1413,16 @@ class MainWindow(QMainWindow):
                 self._merge_dlg = None
 
     def _on_merge_worker_done(self, _images: list) -> None:
-        saving, entry_id = getattr(self, "_merge_run_ctx", (False, None))
+        saving, entry_id, kind = getattr(self, "_merge_run_ctx",
+                                         (False, None, "merge"))
+        if kind == "extract":
+            self.status.showMessage("差分 LoRA を保存しました")
+            self.append_log(
+                "2 モデルの差分から LoRA を抽出し、models/loras に保存しました"
+                "（LoRA ウィンドウを開き直すと一覧に出ます。捉えた差分の割合は"
+                "バックエンドのログ「scom extract」を参照）")
+            self.refresh_models()  # the new LoRA appears in the LoRA window
+            return
         self._on_merge_done(saving, entry_id)
 
     # NOTE: どちらも bound method で接続すること（_run_merge の NOTE 参照）。
@@ -2004,7 +2039,9 @@ class MainWindow(QMainWindow):
                         merge_quant=str(entry["quant"]),
                         merge_low_memory=bool(entry["low_memory"]),
                         merge_loras=[(str(n), float(s))
-                                     for n, s in entry.get("loras", [])])
+                                     for n, s in entry.get("loras", [])],
+                        merge_diffs=[(str(a), str(b), float(s))
+                                     for a, b, s in entry.get("diffs", [])])
             fam = self._merge_family(entry)
         else:
             fam = self._diffusion_family(p.diffusion)
@@ -2570,7 +2607,8 @@ class MainWindow(QMainWindow):
                 [{"id": e["id"], "name": e["name"],
                   "models": [[n, w] for n, w in e["models"]],
                   "quant": e["quant"], "low_memory": e["low_memory"],
-                  "loras": [[n, s] for n, s in e.get("loras", [])]}
+                  "loras": [[n, s] for n, s in e.get("loras", [])],
+                  "diffs": [[a, b, s] for a, b, s in e.get("diffs", [])]}
                  for e in self._merges], ensure_ascii=False),
             "merge_seq": int(self._merge_seq),
             "width": self.sp_width.value(),
@@ -2670,6 +2708,7 @@ class MainWindow(QMainWindow):
             merge_quant=entry["quant"] if entry else "",
             merge_low_memory=entry["low_memory"] if entry else False,
             merge_loras=list(entry.get("loras", [])) if entry else [],
+            merge_diffs=list(entry.get("diffs", [])) if entry else [],
             vae=vae,
             te=te_list,
             clip_type=self.cb_clip_type.currentText(),
@@ -3031,6 +3070,10 @@ class MainWindow(QMainWindow):
             # Record the merge recipe so the image stays reproducible.
             model_name = ("merge(" + ", ".join(
                 f"{n}:{w:g}" for n, w in p.merge_models) + ")")
+            if p.merge_diffs:
+                # 足し込んだモデル差分 strength × (A − B)。
+                model_name += (" +diff(" + ", ".join(
+                    f"{a}-{b}:{s:g}" for a, b, s in p.merge_diffs) + ")")
             if p.merge_loras:
                 # 焼き込んだ LoRA（生成時に掛ける LoRA とは別物）。
                 model_name += (" +lora(" + ", ".join(

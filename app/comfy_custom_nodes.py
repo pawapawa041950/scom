@@ -234,12 +234,43 @@ def _parse_recipe(recipe):
     if isinstance(data, dict):
         entries = data.get("models", [])
         loras = data.get("loras", []) or []
+        diffs = data.get("diffs", []) or []
     else:
-        entries, loras = data, []
+        entries, loras, diffs = data, [], []
     if not isinstance(entries, list) or len(entries) < 1:
         raise ValueError("マージには1個以上のモデルが必要です")
     loras = [(str(n), float(s)) for n, s in loras]
-    return entries, loras
+    # diffs: [[model_a, model_b, strength], ...] -> + strength * (A - B)
+    diffs = [(str(a), str(b), float(s)) for a, b, s in diffs]
+    return entries, loras, diffs
+
+
+def _load_diff_patchers(diffs, keys, first_name):
+    """Open the (A, B) model pairs of the diff rows; same architecture as the
+    merge sources is required (identical canonical key set)."""
+    out = []
+    for a, b, s in diffs:
+        if a == b:
+            raise ValueError("差分の 2 モデルが同じです: {}".format(a))
+        pa, pb = _load_patcher(a), _load_patcher(b)
+        for name, p in ((a, pa), (b, pb)):
+            if _canonical_keys(p) != keys:
+                raise _arch_error(first_name, name)
+        out.append((pa, pb, s))
+    return out
+
+
+def _apply_diffs(diff_patchers, key, weight):
+    """weight += strength * (A - B) for every diff row (fp32, in place)."""
+    for pa, pb, s in diff_patchers:
+        wa = _dequant(pa, key)
+        if not wa.dtype.is_floating_point:
+            continue
+        wb = _dequant(pb, key)
+        if wa.shape != wb.shape or wa.shape != weight.shape:
+            raise ValueError("差分モデルの形状が一致しません: {}".format(key))
+        weight.add_(wa.to(torch.float32) - wb.to(torch.float32), alpha=s)
+    return weight
 
 
 def _load_lora_patches(patcher, loras):
@@ -419,7 +450,7 @@ class ScomMergeModel:
     CATEGORY = "scom"
 
     def merge(self, recipe, quantize="", low_memory=False, save_to=""):
-        entries, loras = _parse_recipe(recipe)
+        entries, loras, diffs = _parse_recipe(recipe)
         weights = [float(w) for _n, w in entries]
         if any(w <= 0 for w in weights):
             raise ValueError("マージ比率は正の数値で指定してください")
@@ -439,10 +470,10 @@ class ScomMergeModel:
 
         if low_memory:
             out_sd, quant_layers = self._merge_sequential(
-                entries, weights, quantize, loras)
+                entries, weights, quantize, loras, diffs)
         else:
             out_sd, quant_layers = self._merge_batch(
-                entries, weights, quantize, loras)
+                entries, weights, quantize, loras, diffs)
 
         if save_to:
             self._save(out_sd, quant_layers, save_to)
@@ -462,13 +493,14 @@ class ScomMergeModel:
         return (model,)
 
     @staticmethod
-    def _merge_batch(entries, weights, quantize, loras=()):
+    def _merge_batch(entries, weights, quantize, loras=(), diffs=()):
         """All sources open at once; each tensor combined in fp32, one pass."""
         total = sum(weights)
         patchers = [_load_patcher(name) for name, _w in entries]
 
         keys = _canonical_keys(patchers[0])
         lora_patches = _load_lora_patches(patchers[0], loras)
+        diff_patchers = _load_diff_patchers(diffs, keys, entries[0][0])
         for (name, _w), p in zip(entries[1:], patchers[1:]):
             if _canonical_keys(p) != keys:
                 raise _arch_error(entries[0][0], name)
@@ -494,7 +526,9 @@ class ScomMergeModel:
             acc = first.to(torch.float32) * (weights[0] / total)
             for p, w in zip(patchers[1:], weights[1:]):
                 acc.add_(_dequant(p, k).to(torch.float32), alpha=w / total)
-            # LoRA は平均した結果に対して畳み込む（生成時の適用と同じ強度）。
+            # 差分（A−B）と LoRA は平均した結果に対して足し込む
+            # （生成時の LoRA 適用と同じ強度）。
+            acc = _apply_diffs(diff_patchers, k, acc)
             acc = _apply_lora(lora_patches, k, acc)
 
             in_features = acc.shape[-1] if acc.ndim == 2 else 0
@@ -507,11 +541,11 @@ class ScomMergeModel:
                 out_sd[bare] = acc.to(torch.bfloat16)
             pbar.update(1)
 
-        del patchers  # release the mmap-backed source models
+        del patchers, diff_patchers  # release the mmap-backed source models
         return out_sd, quant_layers
 
     @staticmethod
-    def _merge_sequential(entries, weights, quantize, loras=()):
+    def _merge_sequential(entries, weights, quantize, loras=(), diffs=()):
         """One source open at a time, folded into a bf16 accumulator.
 
         Incremental weighted mean: folding model k with ratio w_k / S_k (S_k =
@@ -559,14 +593,19 @@ class ScomMergeModel:
             del patcher
             gc.collect()  # promptly drop this source's modules / mmap pages
 
+        # 差分行のモデル対は最後にまとめて開く（ピーク = 累積器 + 差分の
+        # 2 モデル分。省メモリモードでも差分は 2 つ同時に必要なため）。
+        diff_patchers = _load_diff_patchers(diffs, keys, entries[0][0])
         out_sd = {}
         quant_layers = {}
         for k in sorted(keys):
             bare = k[len(_PREFIX):]
             t = acc.pop(k)  # pop: free the bf16 copy once converted
-            if k in lora_patches and t.dtype.is_floating_point:
-                t = _apply_lora(lora_patches, k, t.to(torch.float32)).to(
-                    torch.bfloat16)
+            if t.dtype.is_floating_point and (diff_patchers
+                                              or k in lora_patches):
+                t = t.to(torch.float32)
+                t = _apply_diffs(diff_patchers, k, t)
+                t = _apply_lora(lora_patches, k, t).to(torch.bfloat16)
             in_features = t.shape[-1] if t.ndim == 2 else 0
             if (t.dtype.is_floating_point
                     and _quant_eligible(quantize, k, bare, quantizable,
@@ -599,8 +638,118 @@ class ScomMergeModel:
         comfy.utils.save_torch_file(out_sd, path, metadata=metadata)
 
 
-NODE_CLASS_MAPPINGS = {"ScomMergeModel": ScomMergeModel}
-NODE_DISPLAY_NAME_MAPPINGS = {"ScomMergeModel": "Merge Models (scom)"}
+class ScomExtractLora:
+    """Extract a LoRA from the difference of two models (model_a - model_b).
+
+    For every Linear weight the difference is approximated by a rank-r SVD
+    (torch.svd_lowrank on the GPU) and stored kohya-style (lora_unet_* keys,
+    alpha = rank, so strength 1.0 reproduces "model_b + LoRA ~= model_a").
+    Norms / biases / non-matrix tensors are not part of a LoRA and are
+    dropped; the captured share of the difference energy is logged.
+    """
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {"required": {
+            "model_a": ("STRING", {"default": ""}),
+            "model_b": ("STRING", {"default": ""}),
+            "rank": ("INT", {"default": 64, "min": 1, "max": 1024}),
+            "save_to": ("STRING", {"default": ""}),  # file name in models/loras
+        }}
+
+    RETURN_TYPES = ()
+    FUNCTION = "extract"
+    OUTPUT_NODE = True
+    CATEGORY = "scom"
+
+    def extract(self, model_a, model_b, rank=64, save_to=""):
+        name = os.path.basename(save_to).strip()
+        if not name:
+            raise ValueError("保存ファイル名が不正です")
+        if not name.endswith(".safetensors"):
+            name += ".safetensors"
+        if model_a == model_b:
+            raise ValueError("同じモデル同士の差分は空です")
+        rank = max(1, int(rank))
+        pa, pb = _load_patcher(model_a), _load_patcher(model_b)
+        keys = _canonical_keys(pa)
+        if _canonical_keys(pb) != keys:
+            raise _arch_error(model_a, model_b)
+        device = comfy.model_management.get_torch_device()
+        targets = sorted(k for k in keys
+                         if k.endswith(".weight") and _is_linear(pa, k))
+        out = {}
+        energy_total = energy_kept = 0.0
+        n_layers = 0
+        worst = (1.0, "")
+        pbar = comfy.utils.ProgressBar(len(targets))
+        for k in targets:
+            comfy.model_management.throw_exception_if_processing_interrupted()
+            pbar.update(1)
+            wa = _dequant(pa, k)
+            if not wa.dtype.is_floating_point or wa.ndim != 2:
+                continue
+            wb = _dequant(pb, k)
+            if wb.shape != wa.shape:
+                raise ValueError("形状が一致しません: {}".format(k))
+            delta = (wa.to(device=device, dtype=torch.float32)
+                     - wb.to(device=device, dtype=torch.float32))
+            total = float(delta.pow(2).sum())
+            if total <= 1e-12:
+                continue  # identical layer: nothing to extract
+            r = min(rank, min(delta.shape))
+            if r >= min(delta.shape):
+                # small layer: exact SVD (the LoRA is then lossless here)
+                U, S, Vh = torch.linalg.svd(delta, full_matrices=False)
+                V = Vh.T
+            else:
+                q = min(r + 16, min(delta.shape))
+                U, S, V = torch.svd_lowrank(delta, q=q, niter=4)
+            U, S, V = U[:, :r], S[:r], V[:, :r]
+            kept = min(float(S.pow(2).sum()), total)
+            energy_total += total
+            energy_kept += kept
+            n_layers += 1
+            ratio = kept / total
+            if ratio < worst[0]:
+                worst = (ratio, k)
+            sq = S.sqrt()
+            up = (U * sq).contiguous().to(torch.float16).cpu()      # [out, r]
+            down = (V * sq).T.contiguous().to(torch.float16).cpu()  # [r, in]
+            base = "lora_unet_" + k[len(_PREFIX):-len(".weight")].replace(".", "_")
+            out[base + ".lora_up.weight"] = up
+            out[base + ".lora_down.weight"] = down
+            out[base + ".alpha"] = torch.tensor(float(r), dtype=torch.float16)
+            del delta, U, S, V
+        del pa, pb
+        if not out:
+            raise ValueError("2 つのモデルに差分がありません（同一の重みです）")
+        captured = energy_kept / energy_total if energy_total else 1.0
+        out_dir = folder_paths.get_folder_paths("loras")[0]
+        os.makedirs(out_dir, exist_ok=True)
+        path = os.path.join(out_dir, name)
+        meta = {
+            "format": "pt",
+            "ss_network_module": "networks.lora",
+            "ss_network_dim": str(rank),
+            "ss_network_alpha": str(rank),
+            "scom_extract": json.dumps({
+                "model_a": model_a, "model_b": model_b, "rank": rank,
+                "layers": n_layers, "captured": round(captured, 4)}),
+        }
+        comfy.utils.save_torch_file(out, path, metadata=meta)
+        logging.info(
+            "scom extract: saved {} ({} layers, rank {}, captured {:.1%} of "
+            "the difference, worst layer {:.1%} at {})".format(
+                path, n_layers, rank, captured, worst[0], worst[1]))
+        return {"ui": {"text": ["captured={:.4f} layers={} worst={:.4f}".format(
+            captured, n_layers, worst[0])]}}
+
+
+NODE_CLASS_MAPPINGS = {"ScomMergeModel": ScomMergeModel,
+                       "ScomExtractLora": ScomExtractLora}
+NODE_DISPLAY_NAME_MAPPINGS = {"ScomMergeModel": "Merge Models (scom)",
+                              "ScomExtractLora": "Extract LoRA from diff (scom)"}
 '''
 
 

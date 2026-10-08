@@ -65,6 +65,9 @@ class GenParams:
     # strength), ...]. Applied to the averaged result (same effect as applying
     # them at generation, minus any text-encoder part), then quantized.
     merge_loras: list[tuple[str, float]] = field(default_factory=list)
+    # Model differences folded in like a full-rank LoRA: [(model_a, model_b,
+    # strength), ...] adds strength * (A - B) to the merged weights.
+    merge_diffs: list[tuple[str, str, float]] = field(default_factory=list)
     te: list[str] = field(default_factory=list)  # 1 -> CLIPLoader, 2 -> DualCLIPLoader
     clip_type: str = "stable_diffusion"
     # Applied LoRAs: [(filename under models/loras, strength), ...], chained
@@ -104,7 +107,8 @@ MERGE_QUANT_MODES = ("", "fp8", "int8_convrot", "int4_convrot",
 
 def _validate_merge(merge_models: list[tuple[str, float]],
                     quant: str = "",
-                    merge_loras: list[tuple[str, float]] = ()) -> None:
+                    merge_loras: list[tuple[str, float]] = (),
+                    merge_diffs: list[tuple[str, str, float]] = ()) -> None:
     # A single model is allowed: the "merge" is then just (optionally
     # quantized) materialization of that model into backend RAM.
     if len(merge_models) < 1:
@@ -119,37 +123,52 @@ def _validate_merge(merge_models: list[tuple[str, float]],
             raise ValueError("焼き込む LoRA のファイル名が空です")
         if s == 0:
             raise ValueError(f"LoRA の強度が 0 です: {name}")
+    for a, b, s in merge_diffs:
+        if not a or not b:
+            raise ValueError("差分の行にモデルが 2 個指定されていません")
+        if a == b:
+            raise ValueError(f"差分の 2 モデルが同じです: {a}")
+        if s == 0:
+            raise ValueError(f"差分の強度が 0 です: {a} − {b}")
     if quant not in MERGE_QUANT_MODES:
         raise ValueError(f"不明な量子化形式です: {quant}")
 
 
 def merge_recipe(merge_models: list[tuple[str, float]],
-                 merge_loras: list[tuple[str, float]] = ()) -> str:
+                 merge_loras: list[tuple[str, float]] = (),
+                 merge_diffs: list[tuple[str, str, float]] = ()) -> str:
     """The merge node's recipe input. A stable string matters: both ComfyUI's
     output cache and the node's own pin cache key on it, so an identical
-    config reuses the merged model already sitting in RAM. Without LoRAs the
-    historical bare-list form is kept (same keys as before)."""
+    config reuses the merged model already sitting in RAM. Without LoRAs /
+    diffs the historical bare-list form is kept (same keys as before)."""
     models = [[n, float(w)] for n, w in merge_models]
-    if not merge_loras:
+    if not merge_loras and not merge_diffs:
         return json.dumps(models)
-    return json.dumps({"models": models,
-                       "loras": [[n, float(s)] for n, s in merge_loras]})
+    out = {"models": models}
+    if merge_loras:
+        out["loras"] = [[n, float(s)] for n, s in merge_loras]
+    if merge_diffs:
+        out["diffs"] = [[a, b, float(s)] for a, b, s in merge_diffs]
+    return json.dumps(out)
 
 
 def merge_pin_key(merge_models: list[tuple[str, float]], quant: str,
                   low_memory: bool,
-                  merge_loras: list[tuple[str, float]] = ()) -> str:
+                  merge_loras: list[tuple[str, float]] = (),
+                  merge_diffs: list[tuple[str, str, float]] = ()) -> str:
     """Key of the backend pin cache entry (must mirror the node's _pin_key)."""
-    return json.dumps([merge_recipe(merge_models, merge_loras), quant,
-                       bool(low_memory)])
+    return json.dumps([merge_recipe(merge_models, merge_loras, merge_diffs),
+                       quant, bool(low_memory)])
 
 
 def _merge_node(merge_models: list[tuple[str, float]], quant: str,
                 low_memory: bool, save_to: str = "",
-                merge_loras: list[tuple[str, float]] = ()) -> dict:
+                merge_loras: list[tuple[str, float]] = (),
+                merge_diffs: list[tuple[str, str, float]] = ()) -> dict:
     return {
         "class_type": "ScomMergeModel",
-        "inputs": {"recipe": merge_recipe(merge_models, merge_loras),
+        "inputs": {"recipe": merge_recipe(merge_models, merge_loras,
+                                          merge_diffs),
                    "quantize": quant, "low_memory": bool(low_memory),
                    "save_to": save_to},
     }
@@ -157,17 +176,34 @@ def _merge_node(merge_models: list[tuple[str, float]], quant: str,
 
 def build_merge_graph(merge_models: list[tuple[str, float]], quant: str = "",
                       low_memory: bool = False, save_to: str = "",
-                      merge_loras: list[tuple[str, float]] = ()) -> dict:
+                      merge_loras: list[tuple[str, float]] = (),
+                      merge_diffs: list[tuple[str, str, float]] = ()) -> dict:
     """Merge-only prompt: build (or refresh) the merged model in backend RAM.
 
     With ``save_to`` the merged model is also written to the diffusion_models
     folder as a safetensors file. The node id matches build_graph's diffusion
     node, so a following generation with the same config is a cache hit.
-    ``merge_loras`` are folded into the result (see GenParams.merge_loras).
+    ``merge_loras`` / ``merge_diffs`` are folded into the result (see
+    GenParams).
     """
-    _validate_merge(merge_models, quant, merge_loras)
+    _validate_merge(merge_models, quant, merge_loras, merge_diffs)
     return {"4": _merge_node(merge_models, quant, low_memory, save_to,
-                             merge_loras)}
+                             merge_loras, merge_diffs)}
+
+
+def build_extract_lora_graph(model_a: str, model_b: str, rank: int,
+                             save_to: str) -> dict:
+    """Extract-only prompt: save a LoRA approximating (model_a - model_b) to
+    models/loras/<save_to> (ScomExtractLora, app/comfy_custom_nodes.py)."""
+    if not model_a or not model_b:
+        raise ValueError("差分を取る 2 つのモデルを指定してください")
+    if model_a == model_b:
+        raise ValueError("同じモデル同士の差分は空です")
+    if not save_to.strip():
+        raise ValueError("保存ファイル名が空です")
+    return {"4": {"class_type": "ScomExtractLora",
+                  "inputs": {"model_a": model_a, "model_b": model_b,
+                             "rank": int(rank), "save_to": save_to}}}
 
 
 def build_graph(p: GenParams) -> dict:
@@ -190,10 +226,12 @@ def build_graph(p: GenParams) -> dict:
     # (MODEL=0, CLIP=1, VAE=2); UNETLoader / merge output MODEL=0 only.
     clip_builtin = vae_builtin = None
     if merging:
-        _validate_merge(p.merge_models, p.merge_quant, p.merge_loras)
+        _validate_merge(p.merge_models, p.merge_quant, p.merge_loras,
+                        p.merge_diffs)
         graph["4"] = _merge_node(p.merge_models, p.merge_quant,
                                  p.merge_low_memory,
-                                 merge_loras=p.merge_loras)
+                                 merge_loras=p.merge_loras,
+                                 merge_diffs=p.merge_diffs)
     elif ckpt:
         graph["4"] = {
             "class_type": "CheckpointLoaderSimple",

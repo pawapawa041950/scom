@@ -38,16 +38,20 @@ NOTE_TEXT = (
 
 class MergeDialog(QDialog):
     # Recipe execution / management requests, handled by the main window.
-    # entries [(model, weight)], loras [(lora, strength)], quant, low_mem
-    merge_requested = Signal(object, object, str, bool)
-    save_requested = Signal(object, object, str, bool, str)    # + filename
+    # entries [(model, weight)], loras [(lora, strength)],
+    # diffs [(model_a, model_b, strength)], quant, low_mem
+    merge_requested = Signal(object, object, object, str, bool)
+    save_requested = Signal(object, object, object, str, bool, str)  # + filename
+    # 差分から LoRA を作成: model_a, model_b, rank, filename (models/loras 内)
+    extract_requested = Signal(str, str, int, str)
     delete_requested = Signal(int)                     # entry id
     rename_requested = Signal(int, str)                # entry id, new name
     free_memory_requested = Signal()
 
     def __init__(self, models: list[str], family_fn: FamilyFn,
                  model_dir: Path, loras: list[str] = (),
-                 lora_family_fn: Optional[FamilyFn] = None, parent=None):
+                 lora_family_fn: Optional[FamilyFn] = None,
+                 lora_dir: Optional[Path] = None, parent=None):
         super().__init__(parent)
         self.setWindowTitle("モデルマージ")
         self.setMinimumWidth(780)
@@ -57,8 +61,10 @@ class MergeDialog(QDialog):
         self._model_dir = model_dir
         self._loras = list(loras)
         self._lora_family = lora_family_fn or (lambda _n: "unknown")
+        self._lora_dir = lora_dir
         self._rows: list[dict] = []
         self._lora_rows: list[dict] = []
+        self._diff_rows: list[dict] = []
         self._entries: list[dict] = []
         self._built_ids: set[int] = set()
         self._editable = True
@@ -120,19 +126,30 @@ class MergeDialog(QDialog):
 
         # ----- 焼き込む LoRA（任意） -----
         lbl_lora = QLabel(
-            "焼き込む LoRA（任意）: マージ結果の重みに畳み込みます。生成時に "
-            "LoRA を掛けるのと同じ効果で、量子化の前に適用されます"
-            "（text encoder 側の重みを持つ LoRA はその部分だけ無視されます）。")
+            "焼き込む LoRA / モデル差分（任意）: マージ結果の重みに畳み込みます。"
+            "生成時に LoRA を掛けるのと同じ効果で、量子化の前に適用されます"
+            "（text encoder 側の重みを持つ LoRA はその部分だけ無視されます）。"
+            "モデル差分は「モデル1 − モデル2」× 強度をそのまま足し込みます"
+            "（ランク制限の無い LoRA 相当）。")
         lbl_lora.setWordWrap(True)
         right.addWidget(lbl_lora)
         self._lora_rows_layout = QVBoxLayout()
         self._lora_rows_layout.setSpacing(4)
         right.addLayout(self._lora_rows_layout)
+        self._diff_rows_layout = QVBoxLayout()
+        self._diff_rows_layout.setSpacing(4)
+        right.addLayout(self._diff_rows_layout)
         self.btn_add_lora = QPushButton("＋ LoRA を追加")
         self.btn_add_lora.clicked.connect(
             lambda: (self._add_lora_row(), self._refresh()))
+        self.btn_add_diff = QPushButton("＋ モデルの差分を追加")
+        self.btn_add_diff.setToolTip(
+            "2 つのモデルの差分（モデル1 − モデル2）をマージ結果に足し込みます")
+        self.btn_add_diff.clicked.connect(
+            lambda: (self._add_diff_row(), self._refresh()))
         add_lora_row = QHBoxLayout()
         add_lora_row.addWidget(self.btn_add_lora)
+        add_lora_row.addWidget(self.btn_add_diff)
         add_lora_row.addStretch(1)
         right.addLayout(add_lora_row)
         self.lbl_lora_warn = QLabel(
@@ -200,6 +217,13 @@ class MergeDialog(QDialog):
             "表示中の構成でマージを実行し、models/diffusion_models に "
             "safetensors として保存します")
         self.btn_save.clicked.connect(self._on_save)
+        self.btn_extract = QPushButton("差分から LoRA を作成")
+        self.btn_extract.setToolTip(
+            "モデルを 2 個だけ指定したときに使えます。「モデル1 − モデル2」の"
+            "差分を低ランク近似した LoRA を models/loras に保存します"
+            "（強度 1.0 でモデル2 + LoRA ≒ モデル1。比率と LoRA 行は無視）")
+        self.btn_extract.setEnabled(False)
+        self.btn_extract.clicked.connect(self._on_extract)
         self.btn_dup = QPushButton("複製して新規作成")
         self.btn_dup.setToolTip("この構成をコピーした新規作成に切り替えます")
         self.btn_dup.clicked.connect(self._on_duplicate)
@@ -208,6 +232,7 @@ class MergeDialog(QDialog):
         btns.addStretch(1)
         btns.addWidget(self.btn_merge)
         btns.addWidget(self.btn_save)
+        btns.addWidget(self.btn_extract)
         btns.addWidget(self.btn_dup)
         btns.addWidget(btn_close)
         right.addLayout(btns)
@@ -313,7 +338,8 @@ class MergeDialog(QDialog):
         self._load_recipe([(n, float(w)) for n, w in e["models"]],
                           str(e.get("quant", "")),
                           bool(e.get("low_memory", False)),
-                          [(n, float(s)) for n, s in e.get("loras", [])])
+                          [(n, float(s)) for n, s in e.get("loras", [])],
+                          [(a, b, float(s)) for a, b, s in e.get("diffs", [])])
         self._set_editable(False)
 
     # ----- right pane: rows --------------------------------------------------
@@ -417,14 +443,77 @@ class MergeDialog(QDialog):
                 out.append((name, float(row["spin"].value())))
         return out
 
+    # ----- right pane: model-difference rows (A − B) --------------------------
+    def _add_diff_row(self, a: str = "", b: str = "",
+                      strength: float = 1.0) -> None:
+        w = QWidget()
+        h = QHBoxLayout(w)
+        h.setContentsMargins(0, 0, 0, 0)
+        combos = []
+        for name in (a, b):
+            c = WideComboBox()
+            c.addItem("")
+            c.addItems(self._models)
+            c.setCurrentText(name)
+            c.currentTextChanged.connect(self._refresh)
+            combos.append(c)
+        spin = QDoubleSpinBox()
+        spin.setRange(-10.0, 10.0)
+        spin.setDecimals(2)
+        spin.setSingleStep(0.1)
+        spin.setValue(strength)
+        spin.setToolTip("強度: 結果 += 強度 × (モデル1 − モデル2)")
+        spin.valueChanged.connect(self._refresh)
+        trash = QPushButton("🗑")
+        trash.setFixedWidth(32)
+        trash.setToolTip("この差分を外す")
+        trash.clicked.connect(lambda *_a, widget=w: self._remove_diff_row(widget))
+        h.addWidget(QLabel("差分:"))
+        h.addWidget(combos[0], stretch=1)
+        h.addWidget(QLabel("−"))
+        h.addWidget(combos[1], stretch=1)
+        h.addWidget(spin)
+        h.addWidget(trash)
+        for x in (combos[0], combos[1], spin, trash):
+            x.setEnabled(self._editable)
+        self._diff_rows_layout.addWidget(w)
+        self._diff_rows.append({"widget": w, "combo_a": combos[0],
+                                "combo_b": combos[1], "spin": spin,
+                                "trash": trash})
+
+    def _remove_diff_row(self, widget: QWidget, refresh: bool = True) -> None:
+        for row in self._diff_rows:
+            if row["widget"] is widget:
+                self._diff_rows.remove(row)
+                self._diff_rows_layout.removeWidget(widget)
+                widget.deleteLater()
+                break
+        if refresh:
+            self._refresh()
+
+    def diff_entries(self) -> list[tuple[str, str, float]]:
+        """(model_a, model_b, strength) rows with both models chosen."""
+        out = []
+        for row in self._diff_rows:
+            a = row["combo_a"].currentText().strip()
+            b = row["combo_b"].currentText().strip()
+            if a and b:
+                out.append((a, b, float(row["spin"].value())))
+        return out
+
     def _load_recipe(self, models: list[tuple[str, float]], quant: str,
                      low_memory: bool,
-                     loras: list[tuple[str, float]] = ()) -> None:
+                     loras: list[tuple[str, float]] = (),
+                     diffs: list[tuple[str, str, float]] = ()) -> None:
         """Fill the right pane with a recipe (used for view and duplicate)."""
         while self._lora_rows:
             self._remove_lora_row(self._lora_rows[-1]["widget"], refresh=False)
         for n, s in loras:
             self._add_lora_row(n, float(s))
+        while self._diff_rows:
+            self._remove_diff_row(self._diff_rows[-1]["widget"], refresh=False)
+        for a, b, s in diffs:
+            self._add_diff_row(a, b, float(s))
         # A fresh recipe starts with two empty rows; a saved one shows
         # exactly its models (one row for a single-model entry).
         want = max(len(models), 2 if not models else 1)
@@ -453,8 +542,12 @@ class MergeDialog(QDialog):
             row["combo"].setEnabled(editable)
             row["spin"].setEnabled(editable)
             row["trash"].setEnabled(editable)
+        for row in self._diff_rows:
+            for x in (row["combo_a"], row["combo_b"], row["spin"], row["trash"]):
+                x.setEnabled(editable)
         self.btn_add.setEnabled(editable)
         self.btn_add_lora.setEnabled(editable)
+        self.btn_add_diff.setEnabled(editable)
         self.chk_quant.setEnabled(editable)
         self.chk_lowmem.setEnabled(editable)
         self._sync_quant_enabled()
@@ -494,7 +587,10 @@ class MergeDialog(QDialog):
         # Architecture check: warn when known families disagree (rows are
         # deliberately unfiltered, so mixing anima/krea2 files is possible).
         fams = {self._family(n) for n, _w in entries}
-        self.lbl_warn.setVisible(len(fams & {"anima", "krea2", "qwen21"}) > 1)
+        fams |= {self._family(n) for a, b, _s in self.diff_entries()
+                 for n in (a, b)}
+        self.lbl_warn.setVisible(
+            len(fams & {"anima", "krea2", "qwen21", "sdxl"}) > 1)
         # LoRA family check: a LoRA of another family (or of an unsupported
         # architecture, "other") has no keys to fold into this model.
         known = fams & {"anima", "krea2", "qwen21", "sdxl"}
@@ -515,12 +611,15 @@ class MergeDialog(QDialog):
                 pass
         self.lbl_info.setText(
             f"選択モデル合計: {size / 1e9:.1f} GB" if size else "")
+        # 差分 LoRA の抽出は「モデル 2 個」のときだけ。
+        self.btn_extract.setEnabled(len(self._displayed_recipe()[0]) == 2)
 
     # ----- actions --------------------------------------------------------------
     def _displayed_recipe(self) -> tuple[list[tuple[str, float]], str, bool,
-                                         list[tuple[str, float]]]:
+                                         list[tuple[str, float]],
+                                         list[tuple[str, str, float]]]:
         """The recipe currently shown (editor draft or selected entry):
-        (models, quant, low_memory, loras)."""
+        (models, quant, low_memory, loras, diffs)."""
         entry_id = self.selected_entry_id()
         if entry_id is not None:
             e = self._entry_by_id(entry_id)
@@ -528,9 +627,11 @@ class MergeDialog(QDialog):
                 return ([(n, float(w)) for n, w in e["models"]],
                         str(e.get("quant", "")),
                         bool(e.get("low_memory", False)),
-                        [(n, float(s)) for n, s in e.get("loras", [])])
+                        [(n, float(s)) for n, s in e.get("loras", [])],
+                        [(a, b, float(s)) for a, b, s in e.get("diffs", [])])
         return (self.entries(), self.quant_value(),
-                self.chk_lowmem.isChecked(), self.lora_entries())
+                self.chk_lowmem.isChecked(), self.lora_entries(),
+                self.diff_entries())
 
     def _validate(self, entries) -> bool:
         # 1 model is fine: that is a quantize-only (or copy-only) build.
@@ -545,11 +646,46 @@ class MergeDialog(QDialog):
         if not self._validate(entries):
             return
         self.merge_requested.emit(entries, self.lora_entries(),
-                                  self.quant_value(),
+                                  self.diff_entries(), self.quant_value(),
                                   self.chk_lowmem.isChecked())
 
+    def _on_extract(self) -> None:
+        """差分から LoRA を作成: モデル1 − モデル2（表示中の 2 行）。"""
+        models = self._displayed_recipe()[0]
+        if len(models) != 2:
+            QMessageBox.warning(self, "入力不足",
+                                "モデルをちょうど 2 個指定してください。")
+            return
+        (a, _wa), (b, _wb) = models
+        if a == b:
+            QMessageBox.warning(self, "入力不足", "同じモデル同士の差分は空です。")
+            return
+        rank, ok = QInputDialog.getInt(
+            self, "差分から LoRA を作成",
+            f"モデル1: {a}\nモデル2: {b}\n\n「モデル1 − モデル2」を LoRA にします。\n"
+            "ランク（大きいほど忠実、ファイルも大きい）:", 64, 1, 1024, 1)
+        if not ok:
+            return
+        default = f"{Path(a).stem}-{Path(b).stem}_r{rank}.safetensors"
+        name, ok = QInputDialog.getText(
+            self, "差分から LoRA を作成",
+            "保存ファイル名（models/loras 内）:", text=default)
+        if not ok:
+            return
+        name = name.strip()
+        if not name:
+            return
+        if not name.endswith(".safetensors"):
+            name += ".safetensors"
+        if self._lora_dir is not None and (self._lora_dir / name).exists():
+            res = QMessageBox.question(
+                self, "上書き確認", f"{name} は既に存在します。上書きしますか？")
+            if res != QMessageBox.Yes:
+                return
+        self.extract_requested.emit(a, b, int(rank), name)
+
     def _on_save(self) -> None:
-        entries, quant, low_memory, loras = self._displayed_recipe()
+        entries, quant, low_memory, loras, diffs = self._displayed_recipe()
         if not self._validate(entries):
             return
         name, ok = QInputDialog.getText(
@@ -568,12 +704,13 @@ class MergeDialog(QDialog):
                 self, "上書き確認", f"{name} は既に存在します。上書きしますか？")
             if res != QMessageBox.Yes:
                 return
-        self.save_requested.emit(entries, loras, quant, low_memory, name)
+        self.save_requested.emit(entries, loras, diffs, quant, low_memory,
+                                 name)
 
     def _on_duplicate(self) -> None:
-        entries, quant, low_memory, loras = self._displayed_recipe()
+        entries, quant, low_memory, loras, diffs = self._displayed_recipe()
         self.lst.setCurrentRow(0)  # switch to 新規作成 (makes pane editable)
-        self._load_recipe(entries, quant, low_memory, loras)
+        self._load_recipe(entries, quant, low_memory, loras, diffs)
 
     # ----- progress supplied by the main window ------------------------------
     def set_merge_running(self, running: bool) -> None:
