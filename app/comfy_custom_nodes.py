@@ -51,6 +51,8 @@ import time
 import psutil
 import torch
 
+import comfy.lora
+import comfy.lora_convert
 import comfy.model_management
 import comfy.model_patcher
 import comfy.quant_ops
@@ -221,6 +223,71 @@ def _arch_error(first_name, other_name):
         "{} と {}".format(first_name, other_name))
 
 
+def _parse_recipe(recipe):
+    """recipe JSON -> (models [[name, weight], ...], loras [[name, strength], ...]).
+
+    Two forms: a bare list (models only, the historical format, kept so that
+    recipes without LoRAs hash to the same pin-cache key as before) or
+    {"models": [...], "loras": [...]} when LoRAs are folded in.
+    """
+    data = json.loads(recipe)
+    if isinstance(data, dict):
+        entries = data.get("models", [])
+        loras = data.get("loras", []) or []
+    else:
+        entries, loras = data, []
+    if not isinstance(entries, list) or len(entries) < 1:
+        raise ValueError("マージには1個以上のモデルが必要です")
+    loras = [(str(n), float(s)) for n, s in loras]
+    return entries, loras
+
+
+def _load_lora_patches(patcher, loras):
+    """Resolve the LoRA files against ``patcher``'s model and return
+    {canonical key: [patch tuples]} in ModelPatcher.add_patches' layout, so
+    comfy.lora.calculate_weight can fold them into a weight. Same loader
+    chain ComfyUI uses at generation time (any format it can apply, it can
+    bake), restricted to the diffusion model: text-encoder parts of a LoRA
+    are not part of a merge and are skipped."""
+    if not loras:
+        return {}
+    key_map = comfy.lora.model_lora_keys_unet(patcher.model, {})
+    patches = {}
+    for name, strength in loras:
+        path = folder_paths.get_full_path("loras", name)
+        if path is None:
+            raise ValueError("LoRA が見つかりません: {}".format(name))
+        sd = comfy.utils.load_torch_file(path, safe_load=True)
+        sd = comfy.lora_convert.convert_lora(sd)
+        loaded = comfy.lora.load_lora(sd, key_map, log_missing=False)
+        hit = 0
+        for k, v in loaded.items():
+            if isinstance(k, str):
+                key, offset, function = k, None, None
+            else:
+                key, offset = k[0], k[1]
+                function = k[2] if len(k) > 2 else None
+            patches.setdefault(key, []).append(
+                (float(strength), v, 1.0, offset, function))
+            hit += 1
+        if hit == 0:
+            raise ValueError(
+                "LoRA {} にはこのモデルへ適用できる重みがありません"
+                "（系統の違う LoRA ではありませんか）".format(name))
+        logging.info("scom merge: folding LoRA {} x{} ({} tensors)".format(
+            name, strength, hit))
+    return patches
+
+
+def _apply_lora(patches, key, weight):
+    """Fold the LoRA deltas for ``key`` into ``weight`` (fp32, modified in
+    place by ComfyUI's calculate_weight) and return it."""
+    p = patches.get(key)
+    if not p:
+        return weight
+    return comfy.lora.calculate_weight(p, weight, key)
+
+
 # ---------------------------------------------------------------------------
 # Pin cache: merged models kept in RAM under OUR control.
 #
@@ -331,7 +398,9 @@ class ScomMergeModel:
     @classmethod
     def INPUT_TYPES(cls):
         return {"required": {
-            # JSON: [["file.safetensors", weight], ...] (relative weights)
+            # JSON: [["file.safetensors", weight], ...] (relative weights), or
+            # {"models": [...], "loras": [["lora.safetensors", strength], ...]}
+            # to also fold LoRAs into the merged weights (see _parse_recipe).
             "recipe": ("STRING", {"default": "[]", "multiline": True}),
             # "" (no quantization) | "fp8" | "int8_convrot"
             # | "int4_convrot" (hybrid) | "int4_convrot_full" (all int4)
@@ -350,9 +419,7 @@ class ScomMergeModel:
     CATEGORY = "scom"
 
     def merge(self, recipe, quantize="", low_memory=False, save_to=""):
-        entries = json.loads(recipe)
-        if not isinstance(entries, list) or len(entries) < 1:
-            raise ValueError("マージには1個以上のモデルが必要です")
+        entries, loras = _parse_recipe(recipe)
         weights = [float(w) for _n, w in entries]
         if any(w <= 0 for w in weights):
             raise ValueError("マージ比率は正の数値で指定してください")
@@ -372,10 +439,10 @@ class ScomMergeModel:
 
         if low_memory:
             out_sd, quant_layers = self._merge_sequential(
-                entries, weights, quantize)
+                entries, weights, quantize, loras)
         else:
             out_sd, quant_layers = self._merge_batch(
-                entries, weights, quantize)
+                entries, weights, quantize, loras)
 
         if save_to:
             self._save(out_sd, quant_layers, save_to)
@@ -395,12 +462,13 @@ class ScomMergeModel:
         return (model,)
 
     @staticmethod
-    def _merge_batch(entries, weights, quantize):
+    def _merge_batch(entries, weights, quantize, loras=()):
         """All sources open at once; each tensor combined in fp32, one pass."""
         total = sum(weights)
         patchers = [_load_patcher(name) for name, _w in entries]
 
         keys = _canonical_keys(patchers[0])
+        lora_patches = _load_lora_patches(patchers[0], loras)
         for (name, _w), p in zip(entries[1:], patchers[1:]):
             if _canonical_keys(p) != keys:
                 raise _arch_error(entries[0][0], name)
@@ -426,6 +494,8 @@ class ScomMergeModel:
             acc = first.to(torch.float32) * (weights[0] / total)
             for p, w in zip(patchers[1:], weights[1:]):
                 acc.add_(_dequant(p, k).to(torch.float32), alpha=w / total)
+            # LoRA は平均した結果に対して畳み込む（生成時の適用と同じ強度）。
+            acc = _apply_lora(lora_patches, k, acc)
 
             in_features = acc.shape[-1] if acc.ndim == 2 else 0
             if _quant_eligible(quantize, k, bare, quantizable, acc.ndim,
@@ -441,7 +511,7 @@ class ScomMergeModel:
         return out_sd, quant_layers
 
     @staticmethod
-    def _merge_sequential(entries, weights, quantize):
+    def _merge_sequential(entries, weights, quantize, loras=()):
         """One source open at a time, folded into a bf16 accumulator.
 
         Incremental weighted mean: folding model k with ratio w_k / S_k (S_k =
@@ -452,6 +522,7 @@ class ScomMergeModel:
         acc = {}
         keys = None
         quantizable = set()
+        lora_patches = {}
         running = 0.0
         pbar = None
         for i, ((name, _w), w) in enumerate(zip(entries, weights)):
@@ -459,6 +530,9 @@ class ScomMergeModel:
             k_set = _canonical_keys(patcher)
             if keys is None:
                 keys = k_set
+                # LoRA のキー対応は 1 つ目のモデルで解決しておく（この後
+                # モデルは順に解放されるため）。畳み込み自体は最後に行う。
+                lora_patches = _load_lora_patches(patcher, loras)
                 pbar = comfy.utils.ProgressBar(len(keys) * len(entries))
                 if quantize:
                     quantizable = {k for k in keys
@@ -490,6 +564,9 @@ class ScomMergeModel:
         for k in sorted(keys):
             bare = k[len(_PREFIX):]
             t = acc.pop(k)  # pop: free the bf16 copy once converted
+            if k in lora_patches and t.dtype.is_floating_point:
+                t = _apply_lora(lora_patches, k, t.to(torch.float32)).to(
+                    torch.bfloat16)
             in_features = t.shape[-1] if t.ndim == 2 else 0
             if (t.dtype.is_floating_point
                     and _quant_eligible(quantize, k, bare, quantizable,

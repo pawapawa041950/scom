@@ -1136,6 +1136,8 @@ class MainWindow(QMainWindow):
                     "models": [(str(n), float(w)) for n, w in e["models"]],
                     "quant": str(e.get("quant", "")),
                     "low_memory": bool(e.get("low_memory", False)),
+                    "loras": [(str(n), float(s))
+                              for n, s in e.get("loras", []) or []],
                 })
             if out:
                 return out
@@ -1154,7 +1156,14 @@ class MainWindow(QMainWindow):
             quant = "fp8"
         return [{"id": 1, "name": "マージモデル1", "models": old,
                  "quant": quant,
-                 "low_memory": bool(self.settings.get("merge_low_memory", False))}]
+                 "low_memory": bool(self.settings.get("merge_low_memory", False)),
+                 "loras": []}]
+
+    def _lora_family(self, relname: str) -> str:
+        if not relname:
+            return modelinfo.UNKNOWN
+        return modelinfo.family(
+            "loras", config.models_root() / "loras" / relname)
 
     def _merge_family(self, entry: dict) -> str:
         """Family of a merge entry, judged from its first source model
@@ -1207,7 +1216,8 @@ class MainWindow(QMainWindow):
         dlg = MergeDialog(
             self._all_models.get("diffusion_models", []),
             self._diffusion_family,
-            config.models_root() / "diffusion_models", None)
+            config.models_root() / "diffusion_models",
+            self._all_models.get("loras", []), self._lora_family, None)
         dlg.merge_requested.connect(self._on_merge_requested)
         dlg.save_requested.connect(self._on_save_requested)
         dlg.delete_requested.connect(self._on_merge_delete)
@@ -1219,18 +1229,21 @@ class MainWindow(QMainWindow):
             dlg.set_merge_running(True)
         dlg.show()
 
-    def _on_merge_requested(self, entries, quant: str, low_memory: bool) -> None:
+    def _on_merge_requested(self, entries, loras, quant: str,
+                            low_memory: bool) -> None:
         """マージ button: register a new entry and build it in backend RAM."""
         models = [(str(n), float(w)) for n, w in entries]
+        loras = [(str(n), float(s)) for n, s in loras]
         try:
-            graph = build_merge_graph(models, quant, low_memory)
+            graph = build_merge_graph(models, quant, low_memory,
+                                      merge_loras=loras)
         except ValueError as e:
             QMessageBox.warning(self, "入力不足", str(e))
             return
         self._merge_seq += 1
         entry = {"id": self._merge_seq, "name": f"マージモデル{self._merge_seq}",
                  "models": models, "quant": str(quant),
-                 "low_memory": bool(low_memory)}
+                 "low_memory": bool(low_memory), "loras": loras}
         self._merges.append(entry)
         self._schedule_save()
         self._apply_preset_filter()  # the new entry appears in the dropdown
@@ -1239,12 +1252,13 @@ class MainWindow(QMainWindow):
             self._merge_dlg.select_entry(entry["id"])
         self._run_merge(graph, saving=False, entry_id=entry["id"])
 
-    def _on_save_requested(self, entries, quant: str, low_memory: bool,
-                           filename: str) -> None:
+    def _on_save_requested(self, entries, loras, quant: str,
+                           low_memory: bool, filename: str) -> None:
         models = [(str(n), float(w)) for n, w in entries]
+        loras = [(str(n), float(s)) for n, s in loras]
         try:
             graph = build_merge_graph(models, quant, low_memory,
-                                      save_to=filename)
+                                      save_to=filename, merge_loras=loras)
         except ValueError as e:
             QMessageBox.warning(self, "入力不足", str(e))
             return
@@ -1260,8 +1274,8 @@ class MainWindow(QMainWindow):
         if entry is not None and self.backend.is_running():
             try:
                 self.backend.release_merge(
-                    merge_recipe(entry["models"]), entry["quant"],
-                    entry["low_memory"])
+                    merge_recipe(entry["models"], entry.get("loras", [])),
+                    entry["quant"], entry["low_memory"])
             except OSError as e:
                 self.append_log(f"メモリ解放に失敗: {e}")
         was_selected = (self.cb_diffusion.currentData()
@@ -1317,7 +1331,8 @@ class MainWindow(QMainWindow):
             return
         self._merge_built_ids = {
             int(e["id"]) for e in self._merges
-            if merge_pin_key(e["models"], e["quant"], e["low_memory"])
+            if merge_pin_key(e["models"], e["quant"], e["low_memory"],
+                             e.get("loras", []))
             in pinned}
         self._push_merge_state()
 
@@ -1987,7 +2002,9 @@ class MainWindow(QMainWindow):
                         merge_models=[(str(n), float(w))
                                       for n, w in entry["models"]],
                         merge_quant=str(entry["quant"]),
-                        merge_low_memory=bool(entry["low_memory"]))
+                        merge_low_memory=bool(entry["low_memory"]),
+                        merge_loras=[(str(n), float(s))
+                                     for n, s in entry.get("loras", [])])
             fam = self._merge_family(entry)
         else:
             fam = self._diffusion_family(p.diffusion)
@@ -2552,7 +2569,8 @@ class MainWindow(QMainWindow):
             "merges": json.dumps(
                 [{"id": e["id"], "name": e["name"],
                   "models": [[n, w] for n, w in e["models"]],
-                  "quant": e["quant"], "low_memory": e["low_memory"]}
+                  "quant": e["quant"], "low_memory": e["low_memory"],
+                  "loras": [[n, s] for n, s in e.get("loras", [])]}
                  for e in self._merges], ensure_ascii=False),
             "merge_seq": int(self._merge_seq),
             "width": self.sp_width.value(),
@@ -2651,6 +2669,7 @@ class MainWindow(QMainWindow):
             merge_models=list(entry["models"]) if entry else [],
             merge_quant=entry["quant"] if entry else "",
             merge_low_memory=entry["low_memory"] if entry else False,
+            merge_loras=list(entry.get("loras", [])) if entry else [],
             vae=vae,
             te=te_list,
             clip_type=self.cb_clip_type.currentText(),
@@ -3012,6 +3031,10 @@ class MainWindow(QMainWindow):
             # Record the merge recipe so the image stays reproducible.
             model_name = ("merge(" + ", ".join(
                 f"{n}:{w:g}" for n, w in p.merge_models) + ")")
+            if p.merge_loras:
+                # 焼き込んだ LoRA（生成時に掛ける LoRA とは別物）。
+                model_name += (" +lora(" + ", ".join(
+                    f"{n}:{s:g}" for n, s in p.merge_loras) + ")")
             if p.merge_quant:
                 model_name += f" {p.merge_quant}"
         else:

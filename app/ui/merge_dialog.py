@@ -38,14 +38,16 @@ NOTE_TEXT = (
 
 class MergeDialog(QDialog):
     # Recipe execution / management requests, handled by the main window.
-    merge_requested = Signal(object, str, bool)        # entries, quant, low_mem
-    save_requested = Signal(object, str, bool, str)    # + filename
+    # entries [(model, weight)], loras [(lora, strength)], quant, low_mem
+    merge_requested = Signal(object, object, str, bool)
+    save_requested = Signal(object, object, str, bool, str)    # + filename
     delete_requested = Signal(int)                     # entry id
     rename_requested = Signal(int, str)                # entry id, new name
     free_memory_requested = Signal()
 
     def __init__(self, models: list[str], family_fn: FamilyFn,
-                 model_dir: Path, parent=None):
+                 model_dir: Path, loras: list[str] = (),
+                 lora_family_fn: Optional[FamilyFn] = None, parent=None):
         super().__init__(parent)
         self.setWindowTitle("モデルマージ")
         self.setMinimumWidth(780)
@@ -53,7 +55,10 @@ class MergeDialog(QDialog):
         self._models = list(models)
         self._family = family_fn
         self._model_dir = model_dir
+        self._loras = list(loras)
+        self._lora_family = lora_family_fn or (lambda _n: "unknown")
         self._rows: list[dict] = []
+        self._lora_rows: list[dict] = []
         self._entries: list[dict] = []
         self._built_ids: set[int] = set()
         self._editable = True
@@ -112,6 +117,30 @@ class MergeDialog(QDialog):
         self.lbl_warn.setStyleSheet("color: red;")
         self.lbl_warn.hide()
         right.addWidget(self.lbl_warn)
+
+        # ----- 焼き込む LoRA（任意） -----
+        lbl_lora = QLabel(
+            "焼き込む LoRA（任意）: マージ結果の重みに畳み込みます。生成時に "
+            "LoRA を掛けるのと同じ効果で、量子化の前に適用されます"
+            "（text encoder 側の重みを持つ LoRA はその部分だけ無視されます）。")
+        lbl_lora.setWordWrap(True)
+        right.addWidget(lbl_lora)
+        self._lora_rows_layout = QVBoxLayout()
+        self._lora_rows_layout.setSpacing(4)
+        right.addLayout(self._lora_rows_layout)
+        self.btn_add_lora = QPushButton("＋ LoRA を追加")
+        self.btn_add_lora.clicked.connect(
+            lambda: (self._add_lora_row(), self._refresh()))
+        add_lora_row = QHBoxLayout()
+        add_lora_row.addWidget(self.btn_add_lora)
+        add_lora_row.addStretch(1)
+        right.addLayout(add_lora_row)
+        self.lbl_lora_warn = QLabel(
+            "モデルと系統の違う LoRA が選択されています（効かないか、"
+            "マージが失敗します）")
+        self.lbl_lora_warn.setStyleSheet("color: red;")
+        self.lbl_lora_warn.hide()
+        right.addWidget(self.lbl_lora_warn)
 
         self.lbl_info = QLabel("")
         right.addWidget(self.lbl_info)
@@ -283,7 +312,8 @@ class MergeDialog(QDialog):
             return
         self._load_recipe([(n, float(w)) for n, w in e["models"]],
                           str(e.get("quant", "")),
-                          bool(e.get("low_memory", False)))
+                          bool(e.get("low_memory", False)),
+                          [(n, float(s)) for n, s in e.get("loras", [])])
         self._set_editable(False)
 
     # ----- right pane: rows --------------------------------------------------
@@ -313,13 +343,9 @@ class MergeDialog(QDialog):
         trash.setFixedWidth(32)
         trash.setToolTip("この行を削除")
         trash.clicked.connect(lambda *_a, widget=w: self._remove_row(widget))
-        if len(self._rows) < 2:
-            # The first two rows are permanent: no trash icon. Keep its space
-            # reserved so the combos/spinboxes line up across all rows.
-            sp = trash.sizePolicy()
-            sp.setRetainSizeWhenHidden(True)
-            trash.setSizePolicy(sp)
-            trash.hide()
+        # Every row has a trash icon; a single model is a valid "merge"
+        # (RAM-pinned / quantized copy), so only the last row is protected
+        # (see _refresh, which disables the icon when one row remains).
 
         h.addWidget(combo, stretch=1)
         h.addWidget(spin)
@@ -331,7 +357,7 @@ class MergeDialog(QDialog):
                            "pct": pct, "trash": trash})
 
     def _remove_row(self, widget: QWidget) -> None:
-        if len(self._rows) <= 2:
+        if len(self._rows) <= 1:
             return
         for row in self._rows:
             if row["widget"] is widget:
@@ -341,12 +367,70 @@ class MergeDialog(QDialog):
                 break
         self._refresh()
 
+    # ----- right pane: LoRA rows -------------------------------------------
+    def _add_lora_row(self, name: str = "", strength: float = 1.0) -> None:
+        w = QWidget()
+        h = QHBoxLayout(w)
+        h.setContentsMargins(0, 0, 0, 0)
+        combo = WideComboBox()
+        combo.addItem("")
+        combo.addItems(self._loras)
+        combo.setCurrentText(name)
+        combo.currentTextChanged.connect(self._refresh)
+        spin = QDoubleSpinBox()
+        spin.setRange(-10.0, 10.0)
+        spin.setDecimals(2)
+        spin.setSingleStep(0.1)
+        spin.setValue(strength)
+        spin.setToolTip("強度（生成時の LoRA 強度と同じ意味。負の値も可）")
+        spin.valueChanged.connect(self._refresh)
+        trash = QPushButton("🗑")
+        trash.setFixedWidth(32)
+        trash.setToolTip("この LoRA を外す")
+        trash.clicked.connect(lambda *_a, widget=w: self._remove_lora_row(widget))
+        h.addWidget(QLabel("LoRA:"))
+        h.addWidget(combo, stretch=1)
+        h.addWidget(spin)
+        h.addWidget(trash)
+        for x in (combo, spin, trash):
+            x.setEnabled(self._editable)
+        self._lora_rows_layout.addWidget(w)
+        self._lora_rows.append({"widget": w, "combo": combo, "spin": spin,
+                                "trash": trash})
+
+    def _remove_lora_row(self, widget: QWidget, refresh: bool = True) -> None:
+        for row in self._lora_rows:
+            if row["widget"] is widget:
+                self._lora_rows.remove(row)
+                self._lora_rows_layout.removeWidget(widget)
+                widget.deleteLater()
+                break
+        if refresh:
+            self._refresh()
+
+    def lora_entries(self) -> list[tuple[str, float]]:
+        """Selected (lora, strength) pairs; rows with no file are skipped."""
+        out = []
+        for row in self._lora_rows:
+            name = row["combo"].currentText().strip()
+            if name:
+                out.append((name, float(row["spin"].value())))
+        return out
+
     def _load_recipe(self, models: list[tuple[str, float]], quant: str,
-                     low_memory: bool) -> None:
+                     low_memory: bool,
+                     loras: list[tuple[str, float]] = ()) -> None:
         """Fill the right pane with a recipe (used for view and duplicate)."""
-        while len(self._rows) > max(2, len(models)):
+        while self._lora_rows:
+            self._remove_lora_row(self._lora_rows[-1]["widget"], refresh=False)
+        for n, s in loras:
+            self._add_lora_row(n, float(s))
+        # A fresh recipe starts with two empty rows; a saved one shows
+        # exactly its models (one row for a single-model entry).
+        want = max(len(models), 2 if not models else 1)
+        while len(self._rows) > want:
             self._remove_row(self._rows[-1]["widget"])
-        while len(self._rows) < max(2, len(models)):
+        while len(self._rows) < want:
             self._add_row()
         for row, (name, w) in zip(self._rows, models + [("", 1.0)] * 2):
             row["combo"].setCurrentText(name)
@@ -365,7 +449,12 @@ class MergeDialog(QDialog):
             row["combo"].setEnabled(editable)
             row["spin"].setEnabled(editable)
             row["trash"].setEnabled(editable)
+        for row in self._lora_rows:
+            row["combo"].setEnabled(editable)
+            row["spin"].setEnabled(editable)
+            row["trash"].setEnabled(editable)
         self.btn_add.setEnabled(editable)
+        self.btn_add_lora.setEnabled(editable)
         self.chk_quant.setEnabled(editable)
         self.chk_lowmem.setEnabled(editable)
         self._sync_quant_enabled()
@@ -400,13 +489,23 @@ class MergeDialog(QDialog):
             w = float(row["spin"].value())
             row["pct"].setText(f"{w / total * 100:.0f}%"
                                if name and total > 0 else "")
-            if row["trash"].isVisible():
-                row["trash"].setEnabled(self._editable and len(self._rows) > 2)
+            row["trash"].setEnabled(self._editable and len(self._rows) > 1)
 
         # Architecture check: warn when known families disagree (rows are
         # deliberately unfiltered, so mixing anima/krea2 files is possible).
         fams = {self._family(n) for n, _w in entries}
         self.lbl_warn.setVisible(len(fams & {"anima", "krea2", "qwen21"}) > 1)
+        # LoRA family check: a LoRA of another family (or of an unsupported
+        # architecture, "other") has no keys to fold into this model.
+        known = fams & {"anima", "krea2", "qwen21", "sdxl"}
+        bad = False
+        if known:
+            for n, _s in self.lora_entries():
+                lf = self._lora_family(n)
+                if lf == "other" or (lf in ("anima", "krea2", "qwen21", "sdxl")
+                                     and lf not in known):
+                    bad = True
+        self.lbl_lora_warn.setVisible(bad)
 
         size = 0
         for n, _w in entries:
@@ -418,16 +517,20 @@ class MergeDialog(QDialog):
             f"選択モデル合計: {size / 1e9:.1f} GB" if size else "")
 
     # ----- actions --------------------------------------------------------------
-    def _displayed_recipe(self) -> tuple[list[tuple[str, float]], str, bool]:
-        """The recipe currently shown (editor draft or selected entry)."""
+    def _displayed_recipe(self) -> tuple[list[tuple[str, float]], str, bool,
+                                         list[tuple[str, float]]]:
+        """The recipe currently shown (editor draft or selected entry):
+        (models, quant, low_memory, loras)."""
         entry_id = self.selected_entry_id()
         if entry_id is not None:
             e = self._entry_by_id(entry_id)
             if e is not None:
                 return ([(n, float(w)) for n, w in e["models"]],
                         str(e.get("quant", "")),
-                        bool(e.get("low_memory", False)))
-        return self.entries(), self.quant_value(), self.chk_lowmem.isChecked()
+                        bool(e.get("low_memory", False)),
+                        [(n, float(s)) for n, s in e.get("loras", [])])
+        return (self.entries(), self.quant_value(),
+                self.chk_lowmem.isChecked(), self.lora_entries())
 
     def _validate(self, entries) -> bool:
         # 1 model is fine: that is a quantize-only (or copy-only) build.
@@ -441,11 +544,12 @@ class MergeDialog(QDialog):
         entries = self.entries()
         if not self._validate(entries):
             return
-        self.merge_requested.emit(entries, self.quant_value(),
+        self.merge_requested.emit(entries, self.lora_entries(),
+                                  self.quant_value(),
                                   self.chk_lowmem.isChecked())
 
     def _on_save(self) -> None:
-        entries, quant, low_memory = self._displayed_recipe()
+        entries, quant, low_memory, loras = self._displayed_recipe()
         if not self._validate(entries):
             return
         name, ok = QInputDialog.getText(
@@ -464,12 +568,12 @@ class MergeDialog(QDialog):
                 self, "上書き確認", f"{name} は既に存在します。上書きしますか？")
             if res != QMessageBox.Yes:
                 return
-        self.save_requested.emit(entries, quant, low_memory, name)
+        self.save_requested.emit(entries, loras, quant, low_memory, name)
 
     def _on_duplicate(self) -> None:
-        entries, quant, low_memory = self._displayed_recipe()
+        entries, quant, low_memory, loras = self._displayed_recipe()
         self.lst.setCurrentRow(0)  # switch to 新規作成 (makes pane editable)
-        self._load_recipe(entries, quant, low_memory)
+        self._load_recipe(entries, quant, low_memory, loras)
 
     # ----- progress supplied by the main window ------------------------------
     def set_merge_running(self, running: bool) -> None:

@@ -61,6 +61,10 @@ class GenParams:
     merge_quant: str = ""
     # True: fold sources one at a time (low RAM); False: all at once (fp32).
     merge_low_memory: bool = False
+    # LoRAs folded into the merged weights: [(filename under models/loras,
+    # strength), ...]. Applied to the averaged result (same effect as applying
+    # them at generation, minus any text-encoder part), then quantized.
+    merge_loras: list[tuple[str, float]] = field(default_factory=list)
     te: list[str] = field(default_factory=list)  # 1 -> CLIPLoader, 2 -> DualCLIPLoader
     clip_type: str = "stable_diffusion"
     # Applied LoRAs: [(filename under models/loras, strength), ...], chained
@@ -99,7 +103,8 @@ MERGE_QUANT_MODES = ("", "fp8", "int8_convrot", "int4_convrot",
 
 
 def _validate_merge(merge_models: list[tuple[str, float]],
-                    quant: str = "") -> None:
+                    quant: str = "",
+                    merge_loras: list[tuple[str, float]] = ()) -> None:
     # A single model is allowed: the "merge" is then just (optionally
     # quantized) materialization of that model into backend RAM.
     if len(merge_models) < 1:
@@ -109,42 +114,60 @@ def _validate_merge(merge_models: list[tuple[str, float]],
             raise ValueError("マージ対象のモデル名が空です")
         if w <= 0:
             raise ValueError(f"マージ比率は正の数値が必要です: {name} = {w}")
+    for name, s in merge_loras:
+        if not name:
+            raise ValueError("焼き込む LoRA のファイル名が空です")
+        if s == 0:
+            raise ValueError(f"LoRA の強度が 0 です: {name}")
     if quant not in MERGE_QUANT_MODES:
         raise ValueError(f"不明な量子化形式です: {quant}")
 
 
-def merge_recipe(merge_models: list[tuple[str, float]]) -> str:
+def merge_recipe(merge_models: list[tuple[str, float]],
+                 merge_loras: list[tuple[str, float]] = ()) -> str:
     """The merge node's recipe input. A stable string matters: both ComfyUI's
     output cache and the node's own pin cache key on it, so an identical
-    config reuses the merged model already sitting in RAM."""
-    return json.dumps([[n, float(w)] for n, w in merge_models])
+    config reuses the merged model already sitting in RAM. Without LoRAs the
+    historical bare-list form is kept (same keys as before)."""
+    models = [[n, float(w)] for n, w in merge_models]
+    if not merge_loras:
+        return json.dumps(models)
+    return json.dumps({"models": models,
+                       "loras": [[n, float(s)] for n, s in merge_loras]})
 
 
 def merge_pin_key(merge_models: list[tuple[str, float]], quant: str,
-                  low_memory: bool) -> str:
+                  low_memory: bool,
+                  merge_loras: list[tuple[str, float]] = ()) -> str:
     """Key of the backend pin cache entry (must mirror the node's _pin_key)."""
-    return json.dumps([merge_recipe(merge_models), quant, bool(low_memory)])
+    return json.dumps([merge_recipe(merge_models, merge_loras), quant,
+                       bool(low_memory)])
 
 
 def _merge_node(merge_models: list[tuple[str, float]], quant: str,
-                low_memory: bool, save_to: str = "") -> dict:
+                low_memory: bool, save_to: str = "",
+                merge_loras: list[tuple[str, float]] = ()) -> dict:
     return {
         "class_type": "ScomMergeModel",
-        "inputs": {"recipe": merge_recipe(merge_models), "quantize": quant,
-                   "low_memory": bool(low_memory), "save_to": save_to},
+        "inputs": {"recipe": merge_recipe(merge_models, merge_loras),
+                   "quantize": quant, "low_memory": bool(low_memory),
+                   "save_to": save_to},
     }
 
 
 def build_merge_graph(merge_models: list[tuple[str, float]], quant: str = "",
-                      low_memory: bool = False, save_to: str = "") -> dict:
+                      low_memory: bool = False, save_to: str = "",
+                      merge_loras: list[tuple[str, float]] = ()) -> dict:
     """Merge-only prompt: build (or refresh) the merged model in backend RAM.
 
     With ``save_to`` the merged model is also written to the diffusion_models
     folder as a safetensors file. The node id matches build_graph's diffusion
     node, so a following generation with the same config is a cache hit.
+    ``merge_loras`` are folded into the result (see GenParams.merge_loras).
     """
-    _validate_merge(merge_models, quant)
-    return {"4": _merge_node(merge_models, quant, low_memory, save_to)}
+    _validate_merge(merge_models, quant, merge_loras)
+    return {"4": _merge_node(merge_models, quant, low_memory, save_to,
+                             merge_loras)}
 
 
 def build_graph(p: GenParams) -> dict:
@@ -167,9 +190,10 @@ def build_graph(p: GenParams) -> dict:
     # (MODEL=0, CLIP=1, VAE=2); UNETLoader / merge output MODEL=0 only.
     clip_builtin = vae_builtin = None
     if merging:
-        _validate_merge(p.merge_models, p.merge_quant)
+        _validate_merge(p.merge_models, p.merge_quant, p.merge_loras)
         graph["4"] = _merge_node(p.merge_models, p.merge_quant,
-                                 p.merge_low_memory)
+                                 p.merge_low_memory,
+                                 merge_loras=p.merge_loras)
     elif ckpt:
         graph["4"] = {
             "class_type": "CheckpointLoaderSimple",
