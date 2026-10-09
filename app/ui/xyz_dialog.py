@@ -11,10 +11,13 @@ from typing import Callable, Optional
 
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
-    QCheckBox, QDialog, QGridLayout, QHBoxLayout, QLabel, QLineEdit, QMenu,
-    QMessageBox, QProgressBar, QPushButton, QSpinBox, QVBoxLayout, QWidget,
-    QWidgetAction,
+    QApplication, QCheckBox, QDialog, QGridLayout, QHBoxLayout, QLabel,
+    QLineEdit, QMenu, QMessageBox, QProgressBar, QPushButton, QScrollArea,
+    QSpinBox, QVBoxLayout, QWidget, QWidgetAction,
 )
+
+# 候補メニューの一覧部分の最大高さ [px]（画面高の 60% も上限）。
+_CHOICES_MAX_HEIGHT = 480
 
 from .widgets import WideComboBox
 from .window_state import bind_geometry
@@ -30,7 +33,8 @@ class XyzDialog(QDialog):
 
     def __init__(self, model_choices: list[str],
                  state: Optional[dict] = None, parent=None,
-                 rescan_fn: Optional[Callable[[], list[str]]] = None):
+                 rescan_fn: Optional[Callable[[], list[str]]] = None,
+                 lora_choices_fn: Optional[Callable[[], list[str]]] = None):
         super().__init__(parent)
         self.setWindowTitle("XYZ プロット")
         self.setMinimumWidth(720)
@@ -39,6 +43,9 @@ class XyzDialog(QDialog):
         # モデル軸の候補を作り直す関数（メイン側がモデルを再スキャンして
         # 「マージモデル：…」+ ファイル一覧を返す）。
         self._rescan_fn = rescan_fn
+        # LoRA 軸の候補（"名前:1" の一覧。表示モデルの系統で絞り込み済み）。
+        # メニューを開くたびに取り直すので、表示モデルの切り替えにも追従。
+        self._lora_choices_fn = lora_choices_fn or (lambda: [])
         self._rows: list[dict] = []
 
         root = QVBoxLayout(self)
@@ -244,6 +251,8 @@ class XyzDialog(QDialog):
     def _axis_choices(self, axis: xyz.AxisDef) -> list[str]:
         if axis.id == "model":
             return self._models
+        if axis.id == "lora":
+            return [xyz.LORA_NONE] + list(self._lora_choices_fn())
         return list(axis.choices)
 
     def _on_axis_changed(self, row: dict) -> None:
@@ -255,7 +264,7 @@ class XyzDialog(QDialog):
         self._update_counts()
 
     # 再スキャン対象の軸（候補がファイル一覧から作られるもの）。
-    _RESCAN_AXES = ("model",)
+    _RESCAN_AXES = ("model", "lora")
 
     def _show_choices_menu(self, row: dict) -> None:
         menu = self._build_choices_menu(row)
@@ -287,13 +296,16 @@ class XyzDialog(QDialog):
         if not choices:
             return None
         menu = QMenu(self)
-        current = xyz.split_values(row["edit"].text())
+        free_text = axis.kind == "lora"
+        current = (xyz.split_lora_values(row["edit"].text()) if free_text
+                   else xyz.split_values(row["edit"].text()))
         pairs: list[tuple[str, QCheckBox]] = []
         # チェック順を保持する選択リスト。初期値は欄の現在の並び
-        # （候補に存在する値のみ・重複除去）。
+        # （候補に存在する値のみ・重複除去）。LoRA 軸は手入力の値（強度を
+        # 変えたもの等、候補に無い値）も消さずに残す。
         selected: list[str] = []
         for v in current:
-            if v in choices and v not in selected:
+            if (free_text or v in choices) and v not in selected:
                 selected.append(v)
 
         def sync() -> None:
@@ -344,6 +356,13 @@ class XyzDialog(QDialog):
         menu.addAction(head_act)
         menu.addSeparator()
 
+        # 候補は 1 つのスクロール領域にまとめる。QMenu に項目を直接並べると
+        # 候補が多い（LoRA 数百件）ときに画面いっぱいに伸び、しかも
+        # スクロールバーもホイールも効かないため。高さは上限付き。
+        body = QWidget()
+        bl = QVBoxLayout(body)
+        bl.setContentsMargins(0, 0, 0, 0)
+        bl.setSpacing(0)
         for c in choices:
             cb = QCheckBox(c.replace("&", "&&"))  # & はアクセラレータ扱いを回避
             cb.setChecked(c in selected)
@@ -353,10 +372,26 @@ class XyzDialog(QDialog):
             wl = QHBoxLayout(wrap)
             wl.setContentsMargins(8, 2, 8, 2)
             wl.addWidget(cb)
-            act = QWidgetAction(menu)
-            act.setDefaultWidget(wrap)
-            menu.addAction(act)
+            bl.addWidget(wrap)
             pairs.append((c, cb))
+        bl.addStretch(1)
+        scroll = QScrollArea()
+        scroll.setWidget(body)
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QScrollArea.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        screen = (self.screen() or QApplication.primaryScreen())
+        avail = screen.availableGeometry().height() if screen else 900
+        max_h = max(160, min(_CHOICES_MAX_HEIGHT, int(avail * 0.6)))
+        content = body.sizeHint()
+        scroll.setFixedHeight(min(content.height(), max_h))
+        sb_w = scroll.verticalScrollBar().sizeHint().width()
+        scroll.setMinimumWidth(content.width()
+                               + (sb_w if content.height() > max_h else 0))
+        list_act = QWidgetAction(menu)
+        list_act.setDefaultWidget(scroll)
+        menu.addAction(list_act)
+        menu._scom_scroll = scroll
         menu._scom_pairs = pairs      # 状態の取得用（テストでも使う）
         menu._scom_set_all = set_all
         return menu

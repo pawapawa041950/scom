@@ -1991,7 +1991,8 @@ class MainWindow(QMainWindow):
         # behind the main window. Model-axis choices list merge entries
         # first (as "マージモデル：<name>" tokens), like the main dropdown.
         dlg = XyzDialog(self._xyz_model_choices(), state, None,
-                        rescan_fn=self._rescan_xyz_model_choices)
+                        rescan_fn=self._rescan_xyz_model_choices,
+                        lora_choices_fn=self._xyz_lora_choices)
         dlg.run_requested.connect(self._on_xyz_requested)
         dlg.cancel_requested.connect(self._on_xyz_cancel_requested)
         # チェック状態は実行しなくても記憶する（次回開いたとき再現）。
@@ -2011,6 +2012,43 @@ class MainWindow(QMainWindow):
     def _xyz_model_choices(self) -> list[str]:
         return ([MERGE_PREFIX + e["name"] for e in self._merges]
                 + self._all_models.get("diffusion_models", []))
+
+    _XYZ_CACHED_PREFIX = "[キャッシュ]"
+
+    def _xyz_lora_choices(self) -> list[str]:
+        """XYZ の LoRA 軸の候補: 表示モデルの系統に合う LoRA（判定不能も
+        含む）と差分 LoRA（キャッシュ）を "名前:1" の形で。"""
+        preset = self._current_preset()
+        root = config.models_root() / "loras"
+        out = []
+        for rel in self._all_models.get("loras", []):
+            fam = modelinfo.cached_family(root / rel)
+            if fam in (None, modelinfo.UNKNOWN, preset):
+                out.append(f"{Path(rel).with_suffix('')}:1")
+        for c in self._cached_lora_items():
+            if c["family"] in (modelinfo.UNKNOWN, preset):
+                out.append(f"{self._XYZ_CACHED_PREFIX}{c['name']}:1")
+        return out
+
+    def _resolve_xyz_lora(self, value: str):
+        """LoRA 軸の値 1 つを (GenParams.loras の name, 強度) に解決する
+        （「なし」は None）。見つからなければ ValueError。"""
+        parsed = xyz.parse_lora_value(value)
+        if parsed is None:
+            return None
+        name, strength = parsed
+        if name.startswith(self._XYZ_CACHED_PREFIX):
+            want = name[len(self._XYZ_CACHED_PREFIX):].strip()
+            for e in self._cached_loras:
+                if e["name"] == want:
+                    return cached_lora_spec(e), strength
+            raise ValueError(f"LoRA 軸: 差分 LoRA「{want}」がキャッシュ一覧に"
+                             "見つかりません")
+        rel = self._resolve_lora_name(name)
+        if rel is None:
+            raise ValueError(f"LoRA 軸: 「{name}」に該当する LoRA が "
+                             "models/loras に見つかりません")
+        return rel, strength
 
     def _rescan_xyz_model_choices(self) -> list[str]:
         """XYZ ウィンドウの「再スキャン」: モデルを読み直して候補を返す
@@ -2097,6 +2135,11 @@ class MainWindow(QMainWindow):
                     "XYZ: Hires fix 有効（各セルが2段生成になります）")
             axes = [xyz.axis_by_id(a["id"]) for a in spec["axes"]]
             values = [a["values"] for a in spec["axes"]]
+            # LoRA 軸の値（"名前:強度"）はここでファイル / 差分 LoRA に解決
+            # する（凡例ラベルは入力どおりの文字列のまま）。
+            values = [[self._resolve_xyz_lora(v) for v in vals]
+                      if a.id == "lora" else vals
+                      for a, vals in zip(axes, values)]
             has_model_axis = any(a.id == "model" for a in axes)
             if not has_model_axis:
                 # モデル軸があるときは全セルでモデルが差し替わるので、ベース

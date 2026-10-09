@@ -41,7 +41,7 @@ VALUE_SYNTAX_HELP = (
 class AxisDef:
     """One selectable axis type.
 
-    kind: "none" | "int" | "float" | "choice" | "size" | "text"
+    kind: "none" | "int" | "float" | "choice" | "size" | "text" | "lora"
     cost: 値の切替が重い軸ほど大きく（実行順で外側ループに回される）
     """
     id: str
@@ -72,6 +72,14 @@ AXES: tuple[AxisDef, ...] = (
                     "banana / cherry に置き換えて比較。\n"
                     "末尾の空白は値の一部として扱われます。空白のみの値や"
                     "先頭に空白を含む値は \" \" のように引用符で囲んでください"),
+    AxisDef("lora", "LoRA", "lora", cost=0.3,
+            tooltip="LoRA名:強度 をカンマ区切りで指定（強度省略時は 1）。\n"
+                    "例: なし, head_size_slider:-0.5, head_size_slider:0.5\n"
+                    "メイン画面で適用中の LoRA に追加して適用します（同じ LoRA が"
+                    "適用中なら強度を置き換え）。「なし」またはカンマの間を空に"
+                    "すると、そのセルは追加の LoRA なしになります。\n"
+                    "名前は拡張子・フォルダを省略可。差分 LoRA（キャッシュ）は"
+                    "[キャッシュ]名前 で指定します（候補▾から選択できます）"),
     AxisDef("dtype", "UNet dtype", "choice", cost=0.5,
             choices=("default", "fp8_e4m3fn", "fp8_e5m2"),
             tooltip="UNETLoader の読み込み精度（マージモデル選択時は無効）"),
@@ -98,6 +106,42 @@ def _split_csv(text: str, strip: bool = True) -> list[str]:
     if strip:
         return [s.strip() for s in values if s.strip()]
     return [s for s in values if s != ""]
+
+
+LORA_NONE = "なし"
+
+
+def split_lora_values(text: str) -> list[str]:
+    """LoRA 軸の値欄を値リストに分解する。空の項目（カンマの間が空）は
+    「なし」として扱う。欄全体が空なら []。"""
+    if not text.strip():
+        return []
+    reader = csv.reader(StringIO(text), skipinitialspace=True)
+    out = []
+    for v in chain.from_iterable(reader):
+        v = v.strip()
+        out.append(v if v else LORA_NONE)
+    return out
+
+
+def parse_lora_value(value: str) -> Optional[tuple[str, float]]:
+    """"名前:強度" -> (名前, 強度)。「なし」は None。強度は省略可（1.0）。
+    名前に ':' が含まれても最後の ':' 以降が数値のときだけ強度とみなす。"""
+    v = str(value).strip()
+    if not v or v == LORA_NONE or v.lower() == "none":
+        return None
+    name, sep, tail = v.rpartition(":")
+    if sep:
+        try:
+            strength = float(tail)
+        except ValueError:
+            name, strength = v, 1.0
+    else:
+        name, strength = v, 1.0
+    name = name.strip()
+    if not name:
+        raise ValueError(f"LoRA 名が空です: {value}")
+    return name, strength
 
 
 def split_values(text: str) -> list[str]:
@@ -156,6 +200,13 @@ def parse_values(axis: AxisDef, text: str,
     """Parse the value string for ``axis``. Raises ValueError (Japanese)."""
     if axis.kind == "none":
         return [None]
+    if axis.kind == "lora":
+        vals = split_lora_values(text)
+        if not vals:
+            raise ValueError(f"{axis.label} 軸の値が空です")
+        for v in vals:
+            parse_lora_value(v)   # 書式チェック（名前の解決は実行時）
+        return vals
     vals = _split_csv(text, strip=(axis.kind != "text"))
     if not vals:
         raise ValueError(f"{axis.label} 軸の値が空です")
@@ -221,6 +272,14 @@ def apply_value(axis: AxisDef, p: GenParams, value, values: list) -> GenParams:
         return replace(p, width=int(value[0]), height=int(value[1]))
     if axis.id == "dtype":
         return replace(p, weight_dtype=str(value))
+    if axis.id == "lora":
+        # value は実行前に解決済みの (LoRA 指定, 強度) か None（なし）。
+        # 適用中の LoRA に追加し、同じ LoRA があれば強度を置き換える。
+        if value is None:
+            return p
+        lora, strength = value
+        loras = [(n, w) for n, w in p.loras if n != lora]
+        return replace(p, loras=loras + [(lora, float(strength))])
     if axis.id == "prompt_sr":
         search = str(values[0])
         if search not in p.prompt and search not in p.negative:
