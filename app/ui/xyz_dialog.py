@@ -7,7 +7,7 @@
 """
 from __future__ import annotations
 
-from typing import Optional
+from typing import Callable, Optional
 
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
@@ -29,12 +29,16 @@ class XyzDialog(QDialog):
     cancel_requested = Signal()
 
     def __init__(self, model_choices: list[str],
-                 state: Optional[dict] = None, parent=None):
+                 state: Optional[dict] = None, parent=None,
+                 rescan_fn: Optional[Callable[[], list[str]]] = None):
         super().__init__(parent)
         self.setWindowTitle("XYZ プロット")
         self.setMinimumWidth(720)
         bind_geometry(self, "xyz")
         self._models = list(model_choices)
+        # モデル軸の候補を作り直す関数（メイン側がモデルを再スキャンして
+        # 「マージモデル：…」+ ファイル一覧を返す）。
+        self._rescan_fn = rescan_fn
         self._rows: list[dict] = []
 
         root = QVBoxLayout(self)
@@ -134,6 +138,8 @@ class XyzDialog(QDialog):
             "ONの間、完了するたびに同じ設定で次の XYZ 生成を自動で開始します"
             "（メイン画面の Seed が -1 なら毎回新しい seed になります。"
             "ON中のキャンセルボタンは「スキップ」= 現在の実行だけ中断）")
+        self._running = False
+        self._queued = 0   # 待機中の XYZ タスク数（メイン側が供給）
         self.btn_run = QPushButton("実行")
         self.btn_run.clicked.connect(self._on_run)
         self.btn_cancel = QPushButton("キャンセル")
@@ -164,12 +170,37 @@ class XyzDialog(QDialog):
             self.chk_save_grid.setChecked(False)
 
     def _update_cancel_label(self, *_a) -> None:
-        """連続 ON のときはキャンセルボタンを「スキップ」表示にする。"""
+        """連続 ON かタスクが積まれているときはキャンセルボタンを
+        「スキップ」表示にする（メイン画面と同じ）。"""
         cont = self.chk_continuous.isChecked()
-        self.btn_cancel.setText("スキップ" if cont else "キャンセル")
-        self.btn_cancel.setToolTip(
-            "現在の実行を中断して次の実行に進みます（連続は続行）" if cont
-            else "")
+        skip = cont or self._queued > 0
+        self.btn_cancel.setText("スキップ" if skip else "キャンセル")
+        if not skip:
+            self.btn_cancel.setToolTip("")
+        elif self._queued:
+            self.btn_cancel.setToolTip(
+                "現在の実行を中断して次の待機タスクに進みます"
+                f"（待機 {self._queued} 件）")
+        else:
+            self.btn_cancel.setToolTip(
+                "現在の実行を中断して次の実行に進みます（連続は続行）")
+
+    def _update_run_label(self) -> None:
+        """実行中は「実行をタスクに積む (待機数)」表示にする。"""
+        if self._running:
+            self.btn_run.setText(f"実行をタスクに積む ({self._queued})")
+            self.btn_run.setToolTip(
+                "現在の軸とメイン画面の設定のスナップショットを待機タスクとして"
+                "積みます。現在の実行が終わると順番に実行されます")
+        else:
+            self.btn_run.setText("実行")
+            self.btn_run.setToolTip("")
+
+    def set_queue(self, n: int) -> None:
+        """待機中の XYZ タスク数（メイン側が供給）。"""
+        self._queued = int(n)
+        self._update_run_label()
+        self._update_cancel_label()
 
     # ----- state -------------------------------------------------------------
     @staticmethod
@@ -223,10 +254,24 @@ class XyzDialog(QDialog):
         row["edit"].setToolTip(tip)
         self._update_counts()
 
+    # 再スキャン対象の軸（候補がファイル一覧から作られるもの）。
+    _RESCAN_AXES = ("model",)
+
     def _show_choices_menu(self, row: dict) -> None:
         menu = self._build_choices_menu(row)
-        if menu is not None:
-            menu.exec(row["btn"].mapToGlobal(row["btn"].rect().bottomLeft()))
+        if menu is None:
+            return
+        menu.exec(row["btn"].mapToGlobal(row["btn"].rect().bottomLeft()))
+        if getattr(menu, "_scom_rescanned", False):
+            # 再スキャン後は新しい候補でメニューを開き直す（チェック状態は
+            # 値欄から復元される）。
+            self._show_choices_menu(row)
+
+    def _rescan_choices(self, menu) -> None:
+        if self._rescan_fn is not None:
+            self._models = list(self._rescan_fn())
+        menu._scom_rescanned = True
+        menu.close()
 
     def _build_choices_menu(self, row: dict):
         """チェック式の候補メニューを作る。
@@ -285,6 +330,14 @@ class XyzDialog(QDialog):
         btn_none.clicked.connect(lambda: set_all(False))
         hl.addWidget(btn_all)
         hl.addWidget(btn_none)
+        if axis.id in self._RESCAN_AXES and self._rescan_fn is not None:
+            btn_rescan = QPushButton("再スキャン")
+            btn_rescan.setToolTip(
+                "models フォルダを読み直して候補を最新にします"
+                "（追加・削除したファイルやマージモデルを反映）")
+            btn_rescan.clicked.connect(lambda: self._rescan_choices(menu))
+            hl.addWidget(btn_rescan)
+            menu._scom_rescan_btn = btn_rescan
         hl.addStretch(1)
         head_act = QWidgetAction(menu)
         head_act.setDefaultWidget(head)
@@ -374,13 +427,11 @@ class XyzDialog(QDialog):
 
     # ----- progress supplied by the main window ----------------------------------
     def set_running(self, running: bool, total: int = 0) -> None:
-        self.btn_run.setEnabled(not running)
+        # 実行中も「実行」は押せる（タスクに積む）。積む内容を変えられる
+        # よう軸の入力欄も編集可能のまま。
+        self._running = running
         self.btn_cancel.setEnabled(running)
-        for row in self._rows:
-            row["combo"].setEnabled(not running)
-            row["edit"].setEnabled(
-                not running and self._axis_def(row).kind != "none")
-            row["btn"].setEnabled(not running)
+        self._update_run_label()
         self.progress.setVisible(running)
         if running:
             self.progress.setMaximum(total)

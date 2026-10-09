@@ -326,6 +326,9 @@ class MainWindow(QMainWindow):
         self._xyz_thread: Optional[QThread] = None
         self._xyz_worker: Optional[_XyzWorker] = None
         self._xyz_ctx: Optional[dict] = None
+        # XYZ 実行中に「実行」を押すと、その時点の設定（メイン画面の値 +
+        # XYZ ウィンドウの軸）で組んだ実行を待機タスクとして積む。
+        self._xyz_queue: list[dict] = []
         # 比較グリッド合成スレッド（完了後に非同期で走る; 複数保持可）。
         self._xyz_compose_jobs: list = []
         self._loading = True
@@ -1987,9 +1990,8 @@ class MainWindow(QMainWindow):
         # Parentless on purpose: same as the merge window, so it can go
         # behind the main window. Model-axis choices list merge entries
         # first (as "マージモデル：<name>" tokens), like the main dropdown.
-        choices = ([MERGE_PREFIX + e["name"] for e in self._merges]
-                   + self._all_models.get("diffusion_models", []))
-        dlg = XyzDialog(choices, state, None)
+        dlg = XyzDialog(self._xyz_model_choices(), state, None,
+                        rescan_fn=self._rescan_xyz_model_choices)
         dlg.run_requested.connect(self._on_xyz_requested)
         dlg.cancel_requested.connect(self._on_xyz_cancel_requested)
         # チェック状態は実行しなくても記憶する（次回開いたとき再現）。
@@ -2003,7 +2005,19 @@ class MainWindow(QMainWindow):
         self._xyz_dlg = dlg
         if self._xyz_thread is not None and self._xyz_ctx is not None:
             dlg.set_running(True, int(self._xyz_ctx.get("total", 0)))
+        dlg.set_queue(len(self._xyz_queue))
         dlg.show()
+
+    def _xyz_model_choices(self) -> list[str]:
+        return ([MERGE_PREFIX + e["name"] for e in self._merges]
+                + self._all_models.get("diffusion_models", []))
+
+    def _rescan_xyz_model_choices(self) -> list[str]:
+        """XYZ ウィンドウの「再スキャン」: モデルを読み直して候補を返す
+        （メイン画面のドロップダウンも同時に最新になる）。"""
+        self.refresh_models()
+        self.append_log("モデルを再スキャンしました（XYZ ウィンドウ）")
+        return self._xyz_model_choices()
 
     def _persist_xyz_flag(self, key: str, checked: bool) -> None:
         """XYZ ウィンドウのチェック状態だけを即座に永続化する（他の入力欄は
@@ -2033,20 +2047,47 @@ class MainWindow(QMainWindow):
             return
         try:
             self._xyz_dlg.set_running(running, total)
+            self._xyz_dlg.set_queue(len(self._xyz_queue))
+        except RuntimeError:
+            self._xyz_dlg = None
+
+    def _push_xyz_queue(self) -> None:
+        if self._xyz_dlg is None:
+            return
+        try:
+            self._xyz_dlg.set_queue(len(self._xyz_queue))
         except RuntimeError:
             self._xyz_dlg = None
 
     def _on_xyz_requested(self, spec: dict, auto: bool = False) -> None:
-        """Start an XYZ run. ``auto`` marks a continuous-mode chained run
-        (skips the many-cells confirmation so the loop keeps going)."""
+        """XYZ ウィンドウの「実行」。アイドルなら即開始、XYZ 実行中なら
+        押した時点の設定で組んだ実行を待機タスクとして積む（メイン画面の
+        生成ボタンと同じ流儀）。``auto`` は連続モードの自動実行（多セル
+        確認を出さずにループを続ける）。"""
         if not self._backend_ready():
             QMessageBox.warning(self._xyz_parent(), "未準備",
                                 "ComfyUI の準備がまだ完了していません。")
             return
-        if self._gen_thread is not None or self._xyz_thread is not None:
+        if self._gen_thread is not None:
             QMessageBox.information(self._xyz_parent(), "実行中",
                                     "生成の完了後に実行してください。")
             return
+        run = self._prepare_xyz_run(spec, auto)
+        if run is None:
+            return
+        if self._xyz_thread is not None:
+            self._xyz_queue.append(run)
+            self.append_log(
+                f"XYZ プロットをタスクに積みました（待機 {len(self._xyz_queue)} 件, "
+                f"{run['ctx']['total']} セル, seed={run['ctx']['base'].seed}）")
+            self._push_xyz_queue()
+            return
+        self._start_xyz_run(run)
+
+    def _prepare_xyz_run(self, spec: dict, auto: bool = False
+                         ) -> Optional[dict]:
+        """押した時点のメイン画面の値と XYZ の軸から実行を組み立てる
+        （{"ctx", "jobs"}）。入力エラー・確認キャンセル時は None。"""
         try:
             base = self._collect_params()
             base.batch_size = 1  # 1セル = 1枚
@@ -2083,14 +2124,14 @@ class MainWindow(QMainWindow):
             jobs = [(idx, build_graph(p)) for idx, p in plan]
         except ValueError as e:
             QMessageBox.warning(self._xyz_parent(), "入力エラー", str(e))
-            return
+            return None
         total = len(jobs)
         if total > 64 and not auto:
             res = QMessageBox.question(
                 self._xyz_parent(), "確認",
                 f"{total} 枚の画像を生成します。実行しますか？")
             if res != QMessageBox.Yes:
-                return
+                return None
         # ウィンドウの入力状態を保存（次回開いたとき復元される）。
         if self._xyz_dlg is not None:
             try:
@@ -2100,9 +2141,8 @@ class MainWindow(QMainWindow):
             except RuntimeError:
                 self._xyz_dlg = None
 
-        from datetime import datetime
         # 個別保存はセル完成のたびに行う（キャンセルしても済んだ分は残る）。
-        # フォーマットは開始時点の設定で run 全体を通して固定する。
+        # フォーマットは押した時点の設定で run 全体を通して固定する。
         cell_fmt = None
         if spec.get("save_cells"):
             fmt = self.cb_img_format.currentText()
@@ -2110,17 +2150,26 @@ class MainWindow(QMainWindow):
                 self.append_log("Format = 保存しない のため個別画像は保存しません")
             else:
                 cell_fmt = (fmt, *self._encode_params(fmt))
-        self._xyz_ctx = {
+        ctx = {
             "spec": spec,
             "base": base,
             "params": dict(plan),
             "nx": len(values[0]), "ny": len(values[1]), "nz": len(values[2]),
             "total": total,
-            "stamp": datetime.now().strftime("%Y%m%d_%H%M%S"),
             "cell_fmt": cell_fmt,   # (fmt, ext, quality) | None
             "cells_saved": 0,
             "embed": self.chk_embed_meta.isChecked(),  # run 全体で固定
         }
+        return {"ctx": ctx, "jobs": jobs}
+
+    def _start_xyz_run(self, run: dict) -> None:
+        """組み立て済みの XYZ 実行を開始する。"""
+        from datetime import datetime
+        ctx, jobs = run["ctx"], run["jobs"]
+        spec, base, total = ctx["spec"], ctx["base"], ctx["total"]
+        # ファイル名のタイムスタンプは実際に開始した時刻。
+        ctx["stamp"] = datetime.now().strftime("%Y%m%d_%H%M%S")
+        self._xyz_ctx = ctx
         self._xyz_last_spec = spec   # 連続モードの次回実行用
         self._xyz_last_ok = False
         self._last_seed = base.seed
@@ -2412,13 +2461,26 @@ class MainWindow(QMainWindow):
         self.btn_generate.setEnabled(True)
         self.btn_cancel.setEnabled(False)
         self._push_xyz_running(False)
-        # XYZ 連続モード: 成功（またはスキップによる中断）で終わり、
-        # ウィンドウの連続がONなら同じ設定で次の実行を開始する。
+        # 成功（またはスキップによる中断）で終わったら、待機タスクを最優先
+        # で消費し、無ければ XYZ 連続モード（同じ設定で次の実行）へ。
         skip = self._xyz_skip
         self._xyz_skip = False
+        proceed = getattr(self, "_xyz_last_ok", False) or skip
+        if proceed and self._xyz_queue:
+            run = self._xyz_queue.pop(0)
+            self.append_log(
+                f"待機中の XYZ プロットを開始します（残り {len(self._xyz_queue)} 件）")
+            self._push_xyz_queue()
+            QTimer.singleShot(0, lambda r=run: self._start_xyz_run(r))
+            return
+        if not proceed and self._xyz_queue:
+            # キャンセル/エラーで停止したときは待機タスクも破棄する。
+            n = len(self._xyz_queue)
+            self._xyz_queue.clear()
+            self.append_log(f"停止したため待機中の XYZ タスク {n} 件を破棄しました")
+            self._push_xyz_queue()
         spec = getattr(self, "_xyz_last_spec", None)
-        if not ((getattr(self, "_xyz_last_ok", False) or skip)
-                and spec is not None and self._xyz_dlg is not None):
+        if not (proceed and spec is not None and self._xyz_dlg is not None):
             return
         try:
             chained = self._xyz_dlg.chk_continuous.isChecked()
@@ -3076,8 +3138,9 @@ class MainWindow(QMainWindow):
     def _on_xyz_cancel_requested(self) -> None:
         """XYZ ウィンドウのキャンセル/スキップボタン。
 
-        XYZ の連続 ON なら「スキップ」: 現在の実行だけ中断し、連続は維持
-        したまま次の実行へ進む。OFF なら従来どおりのキャンセル。"""
+        XYZ の連続 ON、またはタスクが積まれているときは「スキップ」: 現在の
+        実行だけ中断し、待機タスク/連続はそのまま次へ進む。どちらでもない
+        ときだけ従来どおりのキャンセル。"""
         if not self._xyz_worker:
             return
         xyz_cont = False
@@ -3086,9 +3149,9 @@ class MainWindow(QMainWindow):
                 xyz_cont = self._xyz_dlg.chk_continuous.isChecked()
             except RuntimeError:
                 self._xyz_dlg = None
-        if xyz_cont:
+        if xyz_cont or self._xyz_queue:
             self._xyz_skip = True
-            self.append_log("スキップ: 現在の XYZ 実行を中断して次の実行へ進みます")
+            self.append_log("スキップ: 現在の XYZ 実行を中断して次へ進みます")
         else:
             self.append_log("XYZ プロットのキャンセルを要求しました")
         self._xyz_worker.cancel()
