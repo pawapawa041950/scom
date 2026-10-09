@@ -96,6 +96,18 @@ def _is_linear(patcher, key):
 
 
 def _load_patcher(name):
+    """Open a merge source. ``name`` is a file in diffusion_models, or a dict
+    describing a nested merge ({"name", "models", "loras", "diffs", "quant",
+    "low_memory"}): that merge is built (or taken from the pin cache) and its
+    in-RAM model is read exactly like a file."""
+    if isinstance(name, dict):
+        logging.info("scom merge: resolving nested merge {}".format(
+            _label(name)))
+        recipe = _recipe_string(name.get("models", []),
+                                name.get("loras", []) or [],
+                                name.get("diffs", []) or [])
+        return ScomMergeModel().merge(recipe, name.get("quant", "") or "",
+                                      bool(name.get("low_memory", False)))[0]
     path = folder_paths.get_full_path("diffusion_models", name)
     if path is None:
         raise ValueError("モデルが見つかりません: {}".format(name))
@@ -217,10 +229,37 @@ def _quantize_out(bare, acc32, mode):
              "convrot_groupsize": _CONVROT_GROUP})
 
 
+def _label(spec):
+    """Display name of a merge source: a file name, or a nested merge's name."""
+    return spec.get("name", "merge") if isinstance(spec, dict) else spec
+
+
+def _resolve_source(s):
+    """A STRING node input naming a source: a file name, or the JSON of a
+    nested merge spec (see _load_patcher)."""
+    if isinstance(s, str) and s.lstrip().startswith("{"):
+        return json.loads(s)
+    return s
+
+
+def _recipe_string(models, loras, diffs):
+    """Mirror of the app's workflow.merge_recipe(), so a nested merge built
+    here shares the pin-cache key with the same entry built on its own."""
+    models = [[n, float(w)] for n, w in models]
+    if not loras and not diffs:
+        return json.dumps(models)
+    out = {"models": models}
+    if loras:
+        out["loras"] = [[n, float(s)] for n, s in loras]
+    if diffs:
+        out["diffs"] = [[a, b, float(s)] for a, b, s in diffs]
+    return json.dumps(out)
+
+
 def _arch_error(first_name, other_name):
     return ValueError(
         "アーキテクチャの異なるモデルはマージできません: "
-        "{} と {}".format(first_name, other_name))
+        "{} と {}".format(_label(first_name), _label(other_name)))
 
 
 def _parse_recipe(recipe):
@@ -241,7 +280,9 @@ def _parse_recipe(recipe):
         raise ValueError("マージには1個以上のモデルが必要です")
     loras = [(str(n), float(s)) for n, s in loras]
     # diffs: [[model_a, model_b, strength], ...] -> + strength * (A - B)
-    diffs = [(str(a), str(b), float(s)) for a, b, s in diffs]
+    # (sources are file names or nested-merge dicts: keep dicts as they are)
+    src = lambda x: x if isinstance(x, dict) else str(x)
+    diffs = [(src(a), src(b), float(s)) for a, b, s in diffs]
     return entries, loras, diffs
 
 
@@ -341,6 +382,20 @@ def _pin_key(recipe, quantize, low_memory):
     return json.dumps([recipe, quantize, bool(low_memory)])
 
 
+# Difference LoRAs kept in RAM ("差分からLoRAを作成しキャッシュに配置"):
+# key (see _lora_key) -> {"sd": kohya-style LoRA state dict, "ts": float}.
+# ScomCachedLora applies them like a file LoRA and re-extracts on a miss, so
+# losing the cache (release / restart) only costs time.
+_LORA_CACHE = {}
+
+
+def _lora_key(model_a, model_b, rank):
+    """Cache key of a difference LoRA; model_a/b are resolved sources (file
+    name or nested-merge dict), so any spelling of the same spec matches."""
+    return json.dumps([model_a, model_b, int(rank)], sort_keys=True,
+                      ensure_ascii=False)
+
+
 def _evict_pins_locked():
     entries = sorted(_PIN_CACHE.items(), key=lambda kv: kv[1]["ts"])
     freed = False
@@ -365,13 +420,35 @@ def _register_routes():
         with _PIN_LOCK:
             return web.json_response({"pinned": list(_PIN_CACHE.keys())})
 
+    @routes.get("/scom/loras")
+    async def scom_loras(request):
+        with _PIN_LOCK:
+            return web.json_response({"cached": list(_LORA_CACHE.keys())})
+
+    @routes.post("/scom/lora_release")
+    async def scom_lora_release(request):
+        data = await request.json()
+        with _PIN_LOCK:
+            if data.get("all"):
+                released = len(_LORA_CACHE)
+                _LORA_CACHE.clear()
+            else:
+                key = _lora_key(_resolve_source(data.get("model_a", "")),
+                                _resolve_source(data.get("model_b", "")),
+                                int(data.get("rank", 0)))
+                released = 1 if _LORA_CACHE.pop(key, None) is not None else 0
+        gc.collect()
+        return web.json_response({"released": released})
+
     @routes.post("/scom/merge_release")
     async def scom_merge_release(request):
         data = await request.json()
         with _PIN_LOCK:
             if data.get("all"):
-                released = len(_PIN_CACHE)
+                # 「メモリ全解放」: 差分 LoRA のキャッシュも一緒に解放する。
+                released = len(_PIN_CACHE) + len(_LORA_CACHE)
                 _PIN_CACHE.clear()
+                _LORA_CACHE.clear()
             else:
                 key = _pin_key(data.get("recipe", "[]"),
                                data.get("quantize", ""),
@@ -655,6 +732,8 @@ class ScomExtractLora:
             "model_b": ("STRING", {"default": ""}),
             "rank": ("INT", {"default": 64, "min": 1, "max": 1024}),
             "save_to": ("STRING", {"default": ""}),  # file name in models/loras
+            # True: keep the LoRA in RAM (_LORA_CACHE) instead of a file.
+            "to_cache": ("BOOLEAN", {"default": False}),
         }}
 
     RETURN_TYPES = ()
@@ -662,69 +741,36 @@ class ScomExtractLora:
     OUTPUT_NODE = True
     CATEGORY = "scom"
 
-    def extract(self, model_a, model_b, rank=64, save_to=""):
+    @classmethod
+    def IS_CHANGED(cls, **_kw):
+        # An explicit request always runs (ComfyUI would otherwise skip an
+        # output node whose inputs did not change, e.g. a re-save).
+        return float("nan")
+
+    def extract(self, model_a, model_b, rank=64, save_to="", to_cache=False):
+        model_a, model_b = _resolve_source(model_a), _resolve_source(model_b)
+        if model_a == model_b:
+            raise ValueError("同じモデル同士の差分は空です")
+        rank = max(1, int(rank))
+        if to_cache:
+            key = _lora_key(model_a, model_b, rank)
+            with _PIN_LOCK:
+                hit = _LORA_CACHE.get(key)
+            if hit is not None:
+                hit["ts"] = time.time()
+                logging.info("scom extract: LoRA already in the cache")
+                return {"ui": {"text": ["cached"]}}
+            sd, info = _extract_lora_sd(model_a, model_b, rank)
+            with _PIN_LOCK:
+                _LORA_CACHE[key] = {"sd": sd, "ts": time.time()}
+            logging.info("scom extract: cached in RAM ({})".format(info))
+            return {"ui": {"text": [info]}}
         name = os.path.basename(save_to).strip()
         if not name:
             raise ValueError("保存ファイル名が不正です")
         if not name.endswith(".safetensors"):
             name += ".safetensors"
-        if model_a == model_b:
-            raise ValueError("同じモデル同士の差分は空です")
-        rank = max(1, int(rank))
-        pa, pb = _load_patcher(model_a), _load_patcher(model_b)
-        keys = _canonical_keys(pa)
-        if _canonical_keys(pb) != keys:
-            raise _arch_error(model_a, model_b)
-        device = comfy.model_management.get_torch_device()
-        targets = sorted(k for k in keys
-                         if k.endswith(".weight") and _is_linear(pa, k))
-        out = {}
-        energy_total = energy_kept = 0.0
-        n_layers = 0
-        worst = (1.0, "")
-        pbar = comfy.utils.ProgressBar(len(targets))
-        for k in targets:
-            comfy.model_management.throw_exception_if_processing_interrupted()
-            pbar.update(1)
-            wa = _dequant(pa, k)
-            if not wa.dtype.is_floating_point or wa.ndim != 2:
-                continue
-            wb = _dequant(pb, k)
-            if wb.shape != wa.shape:
-                raise ValueError("形状が一致しません: {}".format(k))
-            delta = (wa.to(device=device, dtype=torch.float32)
-                     - wb.to(device=device, dtype=torch.float32))
-            total = float(delta.pow(2).sum())
-            if total <= 1e-12:
-                continue  # identical layer: nothing to extract
-            r = min(rank, min(delta.shape))
-            if r >= min(delta.shape):
-                # small layer: exact SVD (the LoRA is then lossless here)
-                U, S, Vh = torch.linalg.svd(delta, full_matrices=False)
-                V = Vh.T
-            else:
-                q = min(r + 16, min(delta.shape))
-                U, S, V = torch.svd_lowrank(delta, q=q, niter=4)
-            U, S, V = U[:, :r], S[:r], V[:, :r]
-            kept = min(float(S.pow(2).sum()), total)
-            energy_total += total
-            energy_kept += kept
-            n_layers += 1
-            ratio = kept / total
-            if ratio < worst[0]:
-                worst = (ratio, k)
-            sq = S.sqrt()
-            up = (U * sq).contiguous().to(torch.float16).cpu()      # [out, r]
-            down = (V * sq).T.contiguous().to(torch.float16).cpu()  # [r, in]
-            base = "lora_unet_" + k[len(_PREFIX):-len(".weight")].replace(".", "_")
-            out[base + ".lora_up.weight"] = up
-            out[base + ".lora_down.weight"] = down
-            out[base + ".alpha"] = torch.tensor(float(r), dtype=torch.float16)
-            del delta, U, S, V
-        del pa, pb
-        if not out:
-            raise ValueError("2 つのモデルに差分がありません（同一の重みです）")
-        captured = energy_kept / energy_total if energy_total else 1.0
+        sd, info = _extract_lora_sd(model_a, model_b, rank)
         out_dir = folder_paths.get_folder_paths("loras")[0]
         os.makedirs(out_dir, exist_ok=True)
         path = os.path.join(out_dir, name)
@@ -734,22 +780,130 @@ class ScomExtractLora:
             "ss_network_dim": str(rank),
             "ss_network_alpha": str(rank),
             "scom_extract": json.dumps({
-                "model_a": model_a, "model_b": model_b, "rank": rank,
-                "layers": n_layers, "captured": round(captured, 4)}),
+                "model_a": _label(model_a), "model_b": _label(model_b),
+                "rank": rank, "info": info}, ensure_ascii=False),
         }
-        comfy.utils.save_torch_file(out, path, metadata=meta)
-        logging.info(
-            "scom extract: saved {} ({} layers, rank {}, captured {:.1%} of "
-            "the difference, worst layer {:.1%} at {})".format(
-                path, n_layers, rank, captured, worst[0], worst[1]))
-        return {"ui": {"text": ["captured={:.4f} layers={} worst={:.4f}".format(
-            captured, n_layers, worst[0])]}}
+        comfy.utils.save_torch_file(sd, path, metadata=meta)
+        logging.info("scom extract: saved {} ({})".format(path, info))
+        return {"ui": {"text": [info]}}
+
+
+class ScomCachedLora:
+    """Apply a difference LoRA held in the RAM cache (extracting it again
+    when it is missing), the in-memory counterpart of LoraLoader."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {"required": {
+            "model": ("MODEL",),
+            "clip": ("CLIP",),
+            "model_a": ("STRING", {"default": ""}),
+            "model_b": ("STRING", {"default": ""}),
+            "rank": ("INT", {"default": 64, "min": 1, "max": 1024}),
+            "strength": ("FLOAT", {"default": 1.0, "min": -10.0, "max": 10.0,
+                                   "step": 0.01}),
+        }}
+
+    RETURN_TYPES = ("MODEL", "CLIP")
+    FUNCTION = "apply"
+    CATEGORY = "scom"
+
+    def apply(self, model, clip, model_a, model_b, rank=64, strength=1.0):
+        a, b = _resolve_source(model_a), _resolve_source(model_b)
+        key = _lora_key(a, b, int(rank))
+        with _PIN_LOCK:
+            hit = _LORA_CACHE.get(key)
+        if hit is None:
+            logging.info("scom lora: not in cache, extracting {} - {}".format(
+                _label(a), _label(b)))
+            sd, info = _extract_lora_sd(a, b, int(rank))
+            hit = {"sd": sd, "ts": time.time()}
+            with _PIN_LOCK:
+                _LORA_CACHE[key] = hit
+            logging.info("scom lora: cached ({})".format(info))
+        hit["ts"] = time.time()
+        if strength == 0:
+            return (model, clip)
+        m, c = comfy.sd.load_lora_for_models(model, clip, hit["sd"],
+                                             float(strength), float(strength))
+        return (m, c)
+
+
+def _extract_lora_sd(model_a, model_b, rank):
+    """Rank-``rank`` kohya LoRA approximating model_a - model_b. Returns
+    (state dict, human-readable stats)."""
+    pa, pb = _load_patcher(model_a), _load_patcher(model_b)
+    keys = _canonical_keys(pa)
+    if _canonical_keys(pb) != keys:
+        raise _arch_error(model_a, model_b)
+    device = comfy.model_management.get_torch_device()
+    targets = sorted(k for k in keys
+                     if k.endswith(".weight") and _is_linear(pa, k))
+    out = {}
+    energy_total = energy_kept = 0.0
+    n_layers = 0
+    worst = (1.0, "")
+    pbar = comfy.utils.ProgressBar(len(targets))
+    for k in targets:
+        comfy.model_management.throw_exception_if_processing_interrupted()
+        pbar.update(1)
+        wa = _dequant(pa, k)
+        if not wa.dtype.is_floating_point or wa.ndim != 2:
+            continue
+        wb = _dequant(pb, k)
+        if wb.shape != wa.shape:
+            raise ValueError("形状が一致しません: {}".format(k))
+        delta = (wa.to(device=device, dtype=torch.float32)
+                 - wb.to(device=device, dtype=torch.float32))
+        total = float(delta.pow(2).sum())
+        if total <= 1e-12:
+            continue  # identical layer: nothing to extract
+        r = min(rank, min(delta.shape))
+        if r >= min(delta.shape):
+            # small layer: exact SVD (the LoRA is then lossless here)
+            U, S, Vh = torch.linalg.svd(delta, full_matrices=False)
+            V = Vh.T
+        else:
+            q = min(r + 16, min(delta.shape))
+            # svd_lowrank is randomized: seed it per layer so the same
+            # (model_a, model_b, rank) always yields the same LoRA (a cached
+            # LoRA re-extracted after a release must match the original).
+            devs = [device] if device.type == "cuda" else []
+            with torch.random.fork_rng(devices=devs):
+                torch.manual_seed(comfy.utils.string_to_seed(k) or 1)
+                U, S, V = torch.svd_lowrank(delta, q=q, niter=4)
+        U, S, V = U[:, :r], S[:r], V[:, :r]
+        kept = min(float(S.pow(2).sum()), total)
+        energy_total += total
+        energy_kept += kept
+        n_layers += 1
+        ratio = kept / total
+        if ratio < worst[0]:
+            worst = (ratio, k)
+        sq = S.sqrt()
+        up = (U * sq).contiguous().to(torch.float16).cpu()      # [out, r]
+        down = (V * sq).T.contiguous().to(torch.float16).cpu()  # [r, in]
+        base = "lora_unet_" + k[len(_PREFIX):-len(".weight")].replace(".", "_")
+        out[base + ".lora_up.weight"] = up
+        out[base + ".lora_down.weight"] = down
+        out[base + ".alpha"] = torch.tensor(float(r), dtype=torch.float16)
+        del delta, U, S, V
+    del pa, pb
+    if not out:
+        raise ValueError("2 つのモデルに差分がありません（同一の重みです）")
+    captured = energy_kept / energy_total if energy_total else 1.0
+    info = ("{} layers, rank {}, captured {:.1%} of the difference, worst "
+            "layer {:.1%} at {}".format(n_layers, rank, captured, worst[0],
+                                        worst[1]))
+    return out, info
 
 
 NODE_CLASS_MAPPINGS = {"ScomMergeModel": ScomMergeModel,
-                       "ScomExtractLora": ScomExtractLora}
+                       "ScomExtractLora": ScomExtractLora,
+                       "ScomCachedLora": ScomCachedLora}
 NODE_DISPLAY_NAME_MAPPINGS = {"ScomMergeModel": "Merge Models (scom)",
-                              "ScomExtractLora": "Extract LoRA from diff (scom)"}
+                              "ScomExtractLora": "Extract LoRA from diff (scom)",
+                              "ScomCachedLora": "Cached diff LoRA (scom)"}
 '''
 
 

@@ -23,7 +23,8 @@ from PySide6.QtGui import (
 )
 from PySide6.QtWidgets import (
     QComboBox, QDialog, QDoubleSpinBox, QFrame, QHBoxLayout, QLabel, QLineEdit,
-    QListWidget, QListWidgetItem, QPlainTextEdit, QPushButton, QScrollArea,
+    QListWidget, QListWidgetItem, QMessageBox, QPlainTextEdit, QPushButton,
+    QScrollArea,
     QSplitter, QVBoxLayout, QWidget,
 )
 
@@ -228,13 +229,16 @@ class _ThumbList(QListWidget):
 class LoraDialog(QDialog):
     apply_requested = Signal(str, float)     # relname, strength
     remove_requested = Signal(str)           # relname
+    # キャッシュ上の差分 LoRA を一覧から削除（token = "__cachedlora__:<id>"）
+    cached_delete_requested = Signal(str)
     # トリガーワードのトグル: (token, negative, text)。token はどのリンク由来か
     # を一意に表す識別子。メイン側は token が未挿入なら挿入、挿入済みなら削除
     # する。negative=True でネガティブ欄が対象。
     toggle_prompt_requested = Signal(str, bool, str)
 
     def __init__(self, lora_dir: Path, cache_dir: Path,
-                 preset_fn: Callable[[], str], parent=None):
+                 preset_fn: Callable[[], str], parent=None,
+                 cached_fn: Optional[Callable[[], list]] = None):
         super().__init__(parent)
         self.setWindowTitle("LoRA")
         self.setMinimumSize(900, 560)
@@ -242,6 +246,12 @@ class LoraDialog(QDialog):
         self._lora_dir = Path(lora_dir)
         self._cache_dir = Path(cache_dir)
         self._preset_fn = preset_fn
+        # キャッシュ上の差分 LoRA の一覧を返す関数（メイン側が供給）:
+        # [{"token", "name", "family", "desc"}]。ファイルの LoRA と並べて
+        # 表示し、適用・トリガーワード編集も同じ操作でできる。
+        self._cached_fn = cached_fn or (lambda: [])
+        self._cached: dict[str, dict] = {}   # token -> item info
+        self._cached_icon = self._make_cached_icon()
         self._items: dict[str, QListWidgetItem] = {}
         self._meta: dict[str, dict] = {}   # relname -> {"sha","thumb","meta"}
         # 系統はヘッダ（キー名+形状）から自前判定する。civitai の baseModel
@@ -350,6 +360,11 @@ class LoraDialog(QDialog):
         self.btn_civitai = QPushButton("civitai を開く")
         self.btn_civitai.setEnabled(False)
         self.btn_civitai.clicked.connect(self._open_civitai)
+        self.btn_delete_cached = QPushButton("キャッシュから削除")
+        self.btn_delete_cached.setToolTip(
+            "この差分 LoRA を一覧から外し、メインメモリからも解放します")
+        self.btn_delete_cached.setVisible(False)
+        self.btn_delete_cached.clicked.connect(self._on_delete_cached)
 
         self.sp_strength = QDoubleSpinBox()
         self.sp_strength.setRange(-4.0, 4.0)
@@ -386,6 +401,7 @@ class LoraDialog(QDialog):
         btn_row = QHBoxLayout()
         btn_row.addWidget(self.btn_edit)
         btn_row.addWidget(self.btn_civitai)
+        btn_row.addWidget(self.btn_delete_cached)
         btn_row.addStretch(1)
         # 強度設定と適用ボタンを1行に（縦を節約）。
         strength_row = QHBoxLayout()
@@ -426,6 +442,27 @@ class LoraDialog(QDialog):
         pix.fill(QColor("#2a2a2a"))
         return QIcon(pix)
 
+    @staticmethod
+    def _make_cached_icon() -> QIcon:
+        """差分 LoRA（キャッシュ）用のアイコン: 文字入りのタイル。"""
+        from PySide6.QtGui import QFont, QPainter
+        pix = QPixmap(_ICON_SIZE, _ICON_SIZE)
+        pix.fill(QColor("#203a4a"))
+        p = QPainter(pix)
+        p.setPen(QColor("#9cd"))
+        f = QFont()
+        f.setPointSize(13)
+        f.setBold(True)
+        p.setFont(f)
+        p.drawText(pix.rect(), Qt.AlignCenter, "差分 LoRA\nキャッシュ")
+        p.end()
+        return QIcon(pix)
+
+    def _label(self, relname: str) -> str:
+        """一覧・適用表示用の名前（差分 LoRA は "[キャッシュ] 名前"）。"""
+        c = self._cached.get(relname)
+        return f"[キャッシュ] {c['name']}" if c else relname
+
     def rescan(self) -> None:
         """(Re)list models/loras and restart the metadata worker."""
         self._stop_worker()
@@ -457,6 +494,16 @@ class LoraDialog(QDialog):
                 self._set_item_tooltip(item, relname)
                 self.lst.addItem(item)
                 self._items[relname] = item
+                # キャッシュ上の差分 LoRA（ファイルが無いのでワーカー対象外）。
+            self._cached = {c["token"]: c for c in self._cached_fn()}
+            for token, c in self._cached.items():
+                self._fams[token] = c.get("family") or modelinfo.UNKNOWN
+                self._stats[token] = (0.0, 0)
+                item = QListWidgetItem(self._cached_icon, self._label(token))
+                item.setData(Qt.UserRole, token)
+                item.setToolTip(f"{self._label(token)}\n{c.get('desc', '')}")
+                self.lst.addItem(item)
+                self._items[token] = item
             self._refresh_applied_marks()
             self._apply_filter()
         finally:
@@ -555,7 +602,7 @@ class LoraDialog(QDialog):
     # ----- filtering -----------------------------------------------------------
     def _visible(self, relname: str) -> bool:
         text = self.ed_search.text().strip().lower()
-        if text and text not in relname.lower():
+        if text and text not in self._label(relname).lower():
             return False
         if self.cb_filter.currentData() == "preset":
             fam = self._fams.get(relname, modelinfo.UNKNOWN)
@@ -575,7 +622,8 @@ class LoraDialog(QDialog):
         self._refresh_applied_marks()
         if applied:
             self.lbl_applied.setText("適用中: " + ", ".join(
-                f"{Path(n).stem}×{w:g}" for n, w in applied.items()))
+                f"{self._label(n) if n in self._cached else Path(n).stem}"
+                f"×{w:g}" for n, w in applied.items()))
         else:
             self.lbl_applied.setText("適用中: なし")
         current = self.lst.currentItem()
@@ -585,10 +633,10 @@ class LoraDialog(QDialog):
     def _refresh_applied_marks(self) -> None:
         for relname, item in self._items.items():
             if relname in self._applied:
-                item.setText(f"✓ {relname}")
+                item.setText(f"✓ {self._label(relname)}")
                 item.setBackground(_APPLIED_BG)
             else:
-                item.setText(relname)
+                item.setText(self._label(relname))
                 item.setBackground(QBrush())
 
     # ----- detail pane -----------------------------------------------------------
@@ -615,9 +663,15 @@ class LoraDialog(QDialog):
             self.lbl_base.setText(fam_text)
             self._civitai_url = str(meta.get("url", ""))
         else:
-            self.lbl_name.setText(relname)
+            self.lbl_name.setText(self._label(relname))
+            cached = self._cached.get(relname)
+            if cached:
+                fam_text += "\n" + cached.get("desc", "") + (
+                    "\nバックエンドのメインメモリ上の LoRA です"
+                    "（キャッシュから消えても使用時に自動で再作成されます）")
             self.lbl_base.setText(fam_text)
             self._civitai_url = ""
+        self.btn_delete_cached.setVisible(relname in self._cached)
         self._refresh_words(relname)
         self.btn_civitai.setEnabled(bool(self._civitai_url))
         applied = relname in self._applied
@@ -652,7 +706,8 @@ class LoraDialog(QDialog):
         self._pos_groups = split_groups(pos)
         self._neg_groups = split_groups(neg)
         meta = (self._meta.get(relname) or {}).get("meta")
-        self._pos_empty = ("ポジティブ: （情報取得中…）" if not meta
+        self._pos_empty = ("ポジティブ: （情報取得中…）"
+                           if not meta and relname not in self._cached
                            else "ポジティブ: （なし）")
         self._hover = ""              # 選択が変わったらホバー強調はリセット
         self._render_words()
@@ -747,6 +802,17 @@ class LoraDialog(QDialog):
         self._prompts.set(relname, _from_edit_text(ed_pos.toPlainText()),
                           _from_edit_text(ed_neg.toPlainText()))
         self._refresh_words(relname)
+
+    def _on_delete_cached(self) -> None:
+        relname = self._current_relname()
+        c = self._cached.get(relname or "")
+        if c is None:
+            return
+        res = QMessageBox.question(
+            self, "削除の確認",
+            f"差分 LoRA「{c['name']}」をキャッシュから削除しますか？")
+        if res == QMessageBox.Yes:
+            self.cached_delete_requested.emit(relname)
 
     def _open_civitai(self) -> None:
         if getattr(self, "_civitai_url", ""):

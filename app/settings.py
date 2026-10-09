@@ -31,6 +31,11 @@ DEFAULTS: dict[str, Any] = {
     # merge_seq is the last id handed out (numbering never reuses ids).
     "merges": "[]",
     "merge_seq": 0,
+    # 差分 LoRA（バックエンドの RAM キャッシュに置くもの）: JSON list of
+    #   {"id", "name", "model_a", "model_b", "rank"}（model_* はファイル名か
+    #   入れ子マージの dict）。中身はキャッシュに無ければ使用時に再抽出。
+    "cached_loras": "[]",
+    "cached_lora_seq": 0,
     # NOTE: 適用中の LoRA は意図的に永続化しない（毎回まっさらで起動）。
     # SageAttention（量子化attentionによる高速化）を使うか。ONでもパッケージ
     # 未導入なら起動フラグは付けない（バックエンドが起動不能になるため）。

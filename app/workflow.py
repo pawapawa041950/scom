@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass, field
+from pathlib import Path
 
 # Common option lists surfaced in the UI. These mirror ComfyUI's built-ins.
 SAMPLERS = [
@@ -104,6 +105,105 @@ class GenParams:
 MERGE_QUANT_MODES = ("", "fp8", "int8_convrot", "int4_convrot",
                      "int4_convrot_full")
 
+# ----- merge sources ----------------------------------------------------------
+# A merge source (model row / diff row / LoRA extraction input) is either a
+# file name under models/diffusion_models (str) or a *nested merge*: a dict
+# snapshot of a saved merge entry ({"name", "id", "models", "loras", "diffs",
+# "quant", "low_memory"}). The backend node builds the nested merge (reusing
+# its pin cache) and reads it like a file. Snapshots, not ids, so deleting or
+# renaming the inner entry later cannot break the outer one.
+_SPEC_KEYS = ("name", "id", "models", "loras", "diffs", "quant", "low_memory")
+
+
+def is_merge_spec(x) -> bool:
+    return isinstance(x, dict)
+
+
+def norm_source(x):
+    """Canonical form of a merge source (stable key order -> stable recipe
+    strings -> stable cache keys)."""
+    if not isinstance(x, dict):
+        return str(x)
+    return {
+        "name": str(x.get("name", "")),
+        "id": int(x.get("id", 0) or 0),
+        "models": [[norm_source(n), float(w)] for n, w in x.get("models", [])],
+        "loras": [[str(n), float(s)] for n, s in x.get("loras", []) or []],
+        "diffs": [[norm_source(a), norm_source(b), float(s)]
+                  for a, b, s in x.get("diffs", []) or []],
+        "quant": str(x.get("quant", "") or ""),
+        "low_memory": bool(x.get("low_memory", False)),
+    }
+
+
+def merge_spec_from_entry(entry: dict) -> dict:
+    """Snapshot of a saved merge entry, usable as a nested merge source."""
+    return norm_source(entry)
+
+
+def merge_source_file(x) -> str:
+    """Leaf file name of a source (first model, recursively): used for the
+    family checks, which only need the architecture."""
+    while isinstance(x, dict):
+        models = x.get("models") or []
+        if not models:
+            return ""
+        x = models[0][0]
+    return str(x)
+
+
+def source_input(x) -> str:
+    """A source as a node STRING input (nested specs travel as JSON)."""
+    return json.dumps(norm_source(x)) if is_merge_spec(x) else str(x)
+
+
+# ----- cached difference LoRAs ------------------------------------------------
+# An applied LoRA (GenParams.loras name) is normally a file under models/loras.
+# A *cached difference LoRA* ("差分からLoRAを作成しキャッシュに配置") is a dict
+# {"cached_lora": name, "id", "model_a", "model_b", "rank"}: the backend keeps
+# it in RAM (ScomCachedLora) and re-extracts it from the two models on a miss.
+def is_cached_lora(x) -> bool:
+    return isinstance(x, dict) and "cached_lora" in x
+
+
+def cached_lora_spec(entry: dict) -> dict:
+    return {"cached_lora": str(entry.get("name", "")),
+            "id": int(entry.get("id", 0) or 0),
+            "model_a": norm_source(entry["model_a"]),
+            "model_b": norm_source(entry["model_b"]),
+            "rank": int(entry.get("rank", 64))}
+
+
+def lora_label(x) -> str:
+    """Display / metadata name of an applied LoRA (file stem or cache name)."""
+    if is_cached_lora(x):
+        return str(x["cached_lora"])
+    return Path(str(x)).stem
+
+
+def merge_source_label(x) -> str:
+    """Short UI label of a source."""
+    return f"[マージ] {x.get('name', '')}" if isinstance(x, dict) else str(x)
+
+
+def format_merge_source(x) -> str:
+    """Human-readable recipe of a source for logs / image metadata, e.g.
+    ``merge(merge(a:1, b:1):1, c:1) +lora(l:0.5) int8_convrot``."""
+    if not isinstance(x, dict):
+        return str(x)
+    s = "merge(" + ", ".join(
+        f"{format_merge_source(n)}:{float(w):g}" for n, w in x.get("models", [])) + ")"
+    if x.get("diffs"):
+        s += " +diff(" + ", ".join(
+            f"{format_merge_source(a)}-{format_merge_source(b)}:{float(st):g}"
+            for a, b, st in x["diffs"]) + ")"
+    if x.get("loras"):
+        s += " +lora(" + ", ".join(
+            f"{n}:{float(st):g}" for n, st in x["loras"]) + ")"
+    if x.get("quant"):
+        s += f" {x['quant']}"
+    return s
+
 
 def _validate_merge(merge_models: list[tuple[str, float]],
                     quant: str = "",
@@ -141,14 +241,18 @@ def merge_recipe(merge_models: list[tuple[str, float]],
     output cache and the node's own pin cache key on it, so an identical
     config reuses the merged model already sitting in RAM. Without LoRAs /
     diffs the historical bare-list form is kept (same keys as before)."""
-    models = [[n, float(w)] for n, w in merge_models]
+    # norm_source: nested specs get a fixed key order (a dict that went
+    # through a Qt signal comes back with sorted keys), so the string is the
+    # same whichever path produced it.
+    models = [[norm_source(n), float(w)] for n, w in merge_models]
     if not merge_loras and not merge_diffs:
         return json.dumps(models)
     out = {"models": models}
     if merge_loras:
-        out["loras"] = [[n, float(s)] for n, s in merge_loras]
+        out["loras"] = [[str(n), float(s)] for n, s in merge_loras]
     if merge_diffs:
-        out["diffs"] = [[a, b, float(s)] for a, b, s in merge_diffs]
+        out["diffs"] = [[norm_source(a), norm_source(b), float(s)]
+                        for a, b, s in merge_diffs]
     return json.dumps(out)
 
 
@@ -191,19 +295,22 @@ def build_merge_graph(merge_models: list[tuple[str, float]], quant: str = "",
                              merge_loras, merge_diffs)}
 
 
-def build_extract_lora_graph(model_a: str, model_b: str, rank: int,
-                             save_to: str) -> dict:
-    """Extract-only prompt: save a LoRA approximating (model_a - model_b) to
-    models/loras/<save_to> (ScomExtractLora, app/comfy_custom_nodes.py)."""
+def build_extract_lora_graph(model_a, model_b, rank: int,
+                             save_to: str = "", to_cache: bool = False) -> dict:
+    """Extract-only prompt: a LoRA approximating (model_a - model_b), saved to
+    models/loras/<save_to> or (``to_cache``) kept in backend RAM for
+    ScomCachedLora (ScomExtractLora, app/comfy_custom_nodes.py)."""
     if not model_a or not model_b:
         raise ValueError("差分を取る 2 つのモデルを指定してください")
     if model_a == model_b:
         raise ValueError("同じモデル同士の差分は空です")
-    if not save_to.strip():
+    if not to_cache and not save_to.strip():
         raise ValueError("保存ファイル名が空です")
     return {"4": {"class_type": "ScomExtractLora",
-                  "inputs": {"model_a": model_a, "model_b": model_b,
-                             "rank": int(rank), "save_to": save_to}}}
+                  "inputs": {"model_a": source_input(model_a),
+                             "model_b": source_input(model_b),
+                             "rank": int(rank), "save_to": save_to,
+                             "to_cache": bool(to_cache)}}}
 
 
 def build_graph(p: GenParams) -> dict:
@@ -279,6 +386,22 @@ def build_graph(p: GenParams) -> dict:
         if not lora_name:
             raise ValueError("LoRA のファイル名が空です")
         nid = str(20 + i)
+        if is_cached_lora(lora_name):
+            # 差分 LoRA（バックエンドの RAM キャッシュ。無ければ再抽出）。
+            graph[nid] = {
+                "class_type": "ScomCachedLora",
+                "inputs": {
+                    "model_a": source_input(lora_name["model_a"]),
+                    "model_b": source_input(lora_name["model_b"]),
+                    "rank": int(lora_name["rank"]),
+                    "strength": float(strength),
+                    "model": model_src,
+                    "clip": clip_src,
+                },
+            }
+            model_src = [nid, 0]
+            clip_src = [nid, 1]
+            continue
         graph[nid] = {
             "class_type": "LoraLoader",
             "inputs": {

@@ -17,11 +17,16 @@ from typing import Callable, Optional
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QAction
 from PySide6.QtWidgets import (
-    QCheckBox, QComboBox, QDialog, QDoubleSpinBox, QHBoxLayout, QInputDialog,
+    QButtonGroup, QCheckBox, QComboBox, QDialog, QDoubleSpinBox, QHBoxLayout,
+    QInputDialog, QRadioButton,
     QLabel, QListWidget, QListWidgetItem, QMenu, QMessageBox, QProgressBar,
     QPushButton, QVBoxLayout, QWidget,
 )
 
+from ..workflow import (
+    is_merge_spec, merge_source_file, merge_source_label,
+    merge_spec_from_entry,
+)
 from .widgets import WideComboBox
 from .window_state import bind_geometry
 
@@ -42,8 +47,11 @@ class MergeDialog(QDialog):
     # diffs [(model_a, model_b, strength)], quant, low_mem
     merge_requested = Signal(object, object, object, str, bool)
     save_requested = Signal(object, object, object, str, bool, str)  # + filename
-    # 差分から LoRA を作成: model_a, model_b, rank, filename (models/loras 内)
-    extract_requested = Signal(str, str, int, str)
+    # 差分から LoRA を作成: model_a, model_b, rank, name, to_cache
+    # （model_a / model_b はファイル名、または入れ子マージの dict。name は
+    # to_cache=True ならキャッシュ上の表示名、False なら models/loras の
+    # ファイル名）
+    extract_requested = Signal(object, object, int, str, bool)
     delete_requested = Signal(int)                     # entry id
     rename_requested = Signal(int, str)                # entry id, new name
     free_memory_requested = Signal()
@@ -158,6 +166,12 @@ class MergeDialog(QDialog):
         self.lbl_lora_warn.setStyleSheet("color: red;")
         self.lbl_lora_warn.hide()
         right.addWidget(self.lbl_lora_warn)
+        self.lbl_nested_warn = QLabel(
+            "量子化済みのマージモデルを素材にしています。逆量子化した重みを"
+            "使うため量子化誤差が乗ります（素材にする側は量子化なしを推奨）")
+        self.lbl_nested_warn.setStyleSheet("color: #c80;")
+        self.lbl_nested_warn.hide()
+        right.addWidget(self.lbl_nested_warn)
 
         self.lbl_info = QLabel("")
         right.addWidget(self.lbl_info)
@@ -207,35 +221,54 @@ class MergeDialog(QDialog):
 
         right.addStretch(1)
 
-        btns = QHBoxLayout()
-        self.btn_merge = QPushButton("マージ")
-        self.btn_merge.setToolTip(
-            "この構成を一覧に登録し、マージモデルをメインメモリ上に構築します")
-        self.btn_merge.clicked.connect(self._on_merge)
-        self.btn_save = QPushButton("ファイルとして保存")
-        self.btn_save.setToolTip(
-            "表示中の構成でマージを実行し、models/diffusion_models に "
+        # 出力先（ラジオ）→ 実行ボタン（モデルマージ / 差分を LoRA 化）→ 閉じる。
+        self.rb_cache = QRadioButton("キャッシュに配置")
+        self.rb_cache.setToolTip(
+            "バックエンドのメインメモリ上に置きます。マージモデルは一覧に登録"
+            "されてモデル選択に並び、差分 LoRA は LoRA ウィンドウに"
+            "「キャッシュ」として並びます（消えても使用時に自動で再作成）")
+        self.rb_file = QRadioButton("ファイルとして保存")
+        self.rb_file.setToolTip(
+            "マージモデルは models/diffusion_models、差分 LoRA は models/loras に"
             "safetensors として保存します")
-        self.btn_save.clicked.connect(self._on_save)
-        self.btn_extract = QPushButton("差分から LoRA を作成")
+        self.rb_cache.setChecked(True)
+        self._dest_group = QButtonGroup(self)
+        self._dest_group.addButton(self.rb_cache)
+        self._dest_group.addButton(self.rb_file)
+        self.rb_cache.toggled.connect(self._sync_action_buttons)
+        self.btn_merge = QPushButton("モデルマージ")
+        self.btn_merge.setToolTip(
+            "表示中の構成でマージします（出力先は上の選択に従う）")
+        self.btn_merge.clicked.connect(self._on_merge_clicked)
+        self.btn_extract = QPushButton("差分を LoRA 化")
         self.btn_extract.setToolTip(
             "モデルを 2 個だけ指定したときに使えます。「モデル1 − モデル2」の"
-            "差分を低ランク近似した LoRA を models/loras に保存します"
-            "（強度 1.0 でモデル2 + LoRA ≒ モデル1。比率と LoRA 行は無視）")
+            "差分を低ランク近似した LoRA を作ります（強度 1.0 でモデル2 + "
+            "LoRA ≒ モデル1。比率・LoRA 行・差分行は無視。出力先は上の選択に"
+            "従う）")
         self.btn_extract.setEnabled(False)
-        self.btn_extract.clicked.connect(self._on_extract)
+        self.btn_extract.clicked.connect(
+            lambda: self._on_extract(self.rb_cache.isChecked()))
         self.btn_dup = QPushButton("複製して新規作成")
         self.btn_dup.setToolTip("この構成をコピーした新規作成に切り替えます")
         self.btn_dup.clicked.connect(self._on_duplicate)
         btn_close = QPushButton("閉じる")
         btn_close.clicked.connect(self.close)
-        btns.addStretch(1)
-        btns.addWidget(self.btn_merge)
-        btns.addWidget(self.btn_save)
-        btns.addWidget(self.btn_extract)
-        btns.addWidget(self.btn_dup)
-        btns.addWidget(btn_close)
-        right.addLayout(btns)
+        row_dest = QHBoxLayout()
+        row_dest.addWidget(QLabel("出力先:"))
+        row_dest.addWidget(self.rb_cache)
+        row_dest.addWidget(self.rb_file)
+        row_dest.addStretch(1)
+        row_run = QHBoxLayout()
+        row_run.addStretch(1)
+        row_run.addWidget(self.btn_merge)
+        row_run.addWidget(self.btn_extract)
+        row_close = QHBoxLayout()
+        row_close.addStretch(1)
+        row_close.addWidget(self.btn_dup)
+        row_close.addWidget(btn_close)
+        for r in (row_dest, row_run, row_close):
+            right.addLayout(r)
         panes.addLayout(right, 2)
 
         while len(self._rows) < 2:
@@ -263,7 +296,52 @@ class MergeDialog(QDialog):
                     row = i
         self.lst.setCurrentRow(row)
         self.lst.blockSignals(False)
+        # 新しい項目をモデル欄の候補（入れ子マージ）にも反映する。
+        for r in self._rows:
+            self._fill_source_combo(r["combo"], self._source_of(r["combo"]))
+        for r in self._diff_rows:
+            for c in (r["combo_a"], r["combo_b"]):
+                self._fill_source_combo(c, self._source_of(c))
         self._on_row_changed(self.lst.currentRow())
+
+    # ----- model source combos (files + saved merges) --------------------------
+    def _fill_source_combo(self, combo, current=None) -> None:
+        """候補 = ファイル + 登録済みマージ項目（"[マージ] 名前"）。項目の
+        data はファイル名（str）か ("merge", id)。"""
+        combo.blockSignals(True)
+        combo.clear()
+        combo.addItem("", "")
+        for n in self._models:
+            combo.addItem(n, n)
+        for e in self._entries:
+            combo.addItem(merge_source_label(e), ("merge", int(e["id"])))
+        combo.blockSignals(False)
+        if current:
+            self._select_source(combo, current)
+
+    def _source_of(self, combo):
+        """選択中のソース: "" | ファイル名 | 入れ子マージの dict（スナップ
+        ショット）。削除済み項目のプレースホルダは dict をそのまま持つ。"""
+        data = combo.currentData()
+        if isinstance(data, tuple):
+            e = self._entry_by_id(int(data[1]))
+            return merge_spec_from_entry(e) if e is not None else ""
+        if isinstance(data, dict):
+            return data
+        return str(data or "")
+
+    def _select_source(self, combo, src) -> None:
+        if is_merge_spec(src):
+            idx = combo.findData(("merge", int(src.get("id", 0) or 0)))
+            if idx < 0:
+                # 参照先がもう無い（削除済み）: スナップショットをそのまま
+                # 候補に足して表示・再利用できるようにする。
+                combo.addItem(f"{merge_source_label(src)}（削除済み）", src)
+                idx = combo.count() - 1
+            combo.setCurrentIndex(idx)
+            return
+        idx = combo.findData(str(src)) if src else 0
+        combo.setCurrentIndex(max(idx, 0))
 
     def _make_row_widget(self, entry: dict) -> QWidget:
         w = QWidget()
@@ -349,10 +427,8 @@ class MergeDialog(QDialog):
         h.setContentsMargins(0, 0, 0, 0)
 
         combo = WideComboBox()
-        combo.addItem("")
-        combo.addItems(self._models)
-        combo.setCurrentText(name)
-        combo.currentTextChanged.connect(self._refresh)
+        self._fill_source_combo(combo, name)
+        combo.currentIndexChanged.connect(self._refresh)
 
         spin = QDoubleSpinBox()
         spin.setRange(0.01, 1000.0)
@@ -452,10 +528,8 @@ class MergeDialog(QDialog):
         combos = []
         for name in (a, b):
             c = WideComboBox()
-            c.addItem("")
-            c.addItems(self._models)
-            c.setCurrentText(name)
-            c.currentTextChanged.connect(self._refresh)
+            self._fill_source_combo(c, name)
+            c.currentIndexChanged.connect(self._refresh)
             combos.append(c)
         spin = QDoubleSpinBox()
         spin.setRange(-10.0, 10.0)
@@ -495,8 +569,8 @@ class MergeDialog(QDialog):
         """(model_a, model_b, strength) rows with both models chosen."""
         out = []
         for row in self._diff_rows:
-            a = row["combo_a"].currentText().strip()
-            b = row["combo_b"].currentText().strip()
+            a = self._source_of(row["combo_a"])
+            b = self._source_of(row["combo_b"])
             if a and b:
                 out.append((a, b, float(row["spin"].value())))
         return out
@@ -522,7 +596,7 @@ class MergeDialog(QDialog):
         while len(self._rows) < want:
             self._add_row()
         for row, (name, w) in zip(self._rows, models + [("", 1.0)] * 2):
-            row["combo"].setCurrentText(name)
+            self._select_source(row["combo"], name)
             row["spin"].setValue(float(w))
         self.chk_quant.setChecked(bool(quant))
         if quant:
@@ -551,20 +625,34 @@ class MergeDialog(QDialog):
         self.chk_quant.setEnabled(editable)
         self.chk_lowmem.setEnabled(editable)
         self._sync_quant_enabled()
-        self.btn_merge.setEnabled(editable)
         self.btn_dup.setVisible(not editable)
+        self._sync_action_buttons()
+
+    def _sync_action_buttons(self, *_a) -> None:
+        """「モデルマージ」: キャッシュ配置は一覧への新規登録なので編集中
+        のみ、ファイル保存は表示中の構成（保存済み項目でも）で実行できる。
+        「差分を LoRA 化」はモデルがちょうど 2 個のときだけ。"""
+        self.btn_merge.setEnabled(self._editable or self.rb_file.isChecked())
+        self.btn_extract.setEnabled(len(self._displayed_recipe()[0]) == 2)
+
+    def _on_merge_clicked(self) -> None:
+        if self.rb_cache.isChecked():
+            self._on_merge()
+        else:
+            self._on_save()
 
     def _sync_quant_enabled(self, *_a) -> None:
         self.cb_quant.setEnabled(self._editable and self.chk_quant.isChecked())
 
     # ----- state --------------------------------------------------------------
-    def entries(self) -> list[tuple[str, float]]:
-        """Selected (model, weight) pairs; rows with no model are skipped."""
+    def entries(self) -> list:
+        """Selected (source, weight) pairs; rows with no model are skipped.
+        A source is a file name or a nested-merge dict."""
         out = []
         for row in self._rows:
-            name = row["combo"].currentText().strip()
-            if name:
-                out.append((name, float(row["spin"].value())))
+            src = self._source_of(row["combo"])
+            if src:
+                out.append((src, float(row["spin"].value())))
         return out
 
     def quant_value(self) -> str:
@@ -578,7 +666,7 @@ class MergeDialog(QDialog):
         entries = self.entries()
         total = sum(w for _n, w in entries)
         for row in self._rows:
-            name = row["combo"].currentText().strip()
+            name = self._source_of(row["combo"])
             w = float(row["spin"].value())
             row["pct"].setText(f"{w / total * 100:.0f}%"
                                if name and total > 0 else "")
@@ -586,9 +674,14 @@ class MergeDialog(QDialog):
 
         # Architecture check: warn when known families disagree (rows are
         # deliberately unfiltered, so mixing anima/krea2 files is possible).
-        fams = {self._family(n) for n, _w in entries}
-        fams |= {self._family(n) for a, b, _s in self.diff_entries()
-                 for n in (a, b)}
+        # Nested merges are judged by their leaf (first) model.
+        sources = [n for n, _w in entries]
+        sources += [n for a, b, _s in self.diff_entries() for n in (a, b)]
+        fams = {self._family(merge_source_file(n)) for n in sources}
+        # 量子化済みのマージを素材にすると、逆量子化した重みを使うので
+        # その誤差が乗る（入れ子にする内側は量子化なしが望ましい）。
+        self.lbl_nested_warn.setVisible(any(
+            is_merge_spec(n) and n.get("quant") for n in sources))
         self.lbl_warn.setVisible(
             len(fams & {"anima", "krea2", "qwen21", "sdxl"}) > 1)
         # LoRA family check: a LoRA of another family (or of an unsupported
@@ -605,14 +698,15 @@ class MergeDialog(QDialog):
 
         size = 0
         for n, _w in entries:
+            if is_merge_spec(n):
+                continue
             try:
                 size += (self._model_dir / n).stat().st_size
             except OSError:
                 pass
         self.lbl_info.setText(
             f"選択モデル合計: {size / 1e9:.1f} GB" if size else "")
-        # 差分 LoRA の抽出は「モデル 2 個」のときだけ。
-        self.btn_extract.setEnabled(len(self._displayed_recipe()[0]) == 2)
+        self._sync_action_buttons()
 
     # ----- actions --------------------------------------------------------------
     def _displayed_recipe(self) -> tuple[list[tuple[str, float]], str, bool,
@@ -649,8 +743,9 @@ class MergeDialog(QDialog):
                                   self.diff_entries(), self.quant_value(),
                                   self.chk_lowmem.isChecked())
 
-    def _on_extract(self) -> None:
-        """差分から LoRA を作成: モデル1 − モデル2（表示中の 2 行）。"""
+    def _on_extract(self, to_cache: bool = False) -> None:
+        """差分から LoRA を作成: モデル1 − モデル2（表示中の 2 行）。
+        to_cache=True はキャッシュ（メインメモリ）、False はファイルに保存。"""
         models = self._displayed_recipe()[0]
         if len(models) != 2:
             QMessageBox.warning(self, "入力不足",
@@ -660,15 +755,33 @@ class MergeDialog(QDialog):
         if a == b:
             QMessageBox.warning(self, "入力不足", "同じモデル同士の差分は空です。")
             return
+        la, lb = merge_source_label(a), merge_source_label(b)
+        title = ("差分から LoRA を作成しキャッシュに配置" if to_cache
+                 else "差分から LoRA を作成しファイルに保存")
         rank, ok = QInputDialog.getInt(
-            self, "差分から LoRA を作成",
-            f"モデル1: {a}\nモデル2: {b}\n\n「モデル1 − モデル2」を LoRA にします。\n"
+            self, title,
+            f"モデル1: {la}\nモデル2: {lb}\n\n「モデル1 − モデル2」を LoRA にします。\n"
             "ランク（大きいほど忠実、ファイルも大きい）:", 64, 1, 1024, 1)
         if not ok:
             return
-        default = f"{Path(a).stem}-{Path(b).stem}_r{rank}.safetensors"
+
+        def stem(src) -> str:
+            if is_merge_spec(src):
+                return "".join(ch if ch not in "\\/:*?\"<>|" else "_"
+                               for ch in str(src.get("name", "merge")))
+            return Path(src).stem
+
+        if to_cache:
+            name, ok = QInputDialog.getText(
+                self, title, "LoRA ウィンドウに表示する名前:",
+                text=f"{stem(a)}-{stem(b)}_r{rank}")
+            name = name.strip()
+            if ok and name:
+                self.extract_requested.emit(a, b, int(rank), name, True)
+            return
+        default = f"{stem(a)}-{stem(b)}_r{rank}.safetensors"
         name, ok = QInputDialog.getText(
-            self, "差分から LoRA を作成",
+            self, title,
             "保存ファイル名（models/loras 内）:", text=default)
         if not ok:
             return
@@ -682,7 +795,7 @@ class MergeDialog(QDialog):
                 self, "上書き確認", f"{name} は既に存在します。上書きしますか？")
             if res != QMessageBox.Yes:
                 return
-        self.extract_requested.emit(a, b, int(rank), name)
+        self.extract_requested.emit(a, b, int(rank), name, False)
 
     def _on_save(self) -> None:
         entries, quant, low_memory, loras, diffs = self._displayed_recipe()

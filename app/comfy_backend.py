@@ -726,8 +726,27 @@ class ComfyBackend:
             "low_memory": bool(low_memory)})
 
     def release_all_merges(self) -> int:
-        """Free every pinned merged model from backend RAM."""
+        """Free every pinned merged model (and cached difference LoRA) from
+        backend RAM."""
         return self._post_merge_release({"all": True})
+
+    def cached_loras(self) -> list[str]:
+        """Keys of the difference LoRAs currently held in backend RAM."""
+        with urllib.request.urlopen(self.base_url + "/scom/loras",
+                                    timeout=5) as resp:
+            return list(json.loads(resp.read()).get("cached", []))
+
+    def release_cached_lora(self, model_a: str, model_b: str,
+                            rank: int) -> int:
+        """Free one cached difference LoRA (inputs as in the graph)."""
+        req = urllib.request.Request(
+            self.base_url + "/scom/lora_release",
+            data=json.dumps({"model_a": model_a, "model_b": model_b,
+                             "rank": int(rank)}).encode(),
+            headers={"Content-Type": "application/json"},
+        )
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            return int(json.loads(resp.read()).get("released", 0))
 
     def object_info(self, class_type: str) -> dict:
         """Fetch node metadata (used to discover valid sampler/clip options)."""

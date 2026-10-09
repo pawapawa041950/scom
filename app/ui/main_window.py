@@ -30,7 +30,9 @@ from .widgets import FlowLayout, GrowingTextEdit, WideComboBox
 from ..comfy_backend import ComfyBackend, BackendError, Progress
 from ..workflow import (
     GenParams, build_extract_lora_graph, build_graph, build_merge_graph,
-    merge_pin_key, merge_recipe,
+    cached_lora_spec, format_merge_source, is_cached_lora, lora_label,
+    merge_pin_key, merge_recipe, merge_source_file, merge_source_label,
+    norm_source, source_input,
     SAMPLERS, SCHEDULERS, CLIP_TYPES_SINGLE, CLIP_TYPES_DUAL, DEFAULT_NEGATIVE,
 )
 
@@ -67,6 +69,9 @@ NO_SAVE = "保存しない"
 # colored prefix; the item data is "__merge__:<id>".
 MERGE_PREFIX = "マージモデル："
 MERGE_TOKEN = "__merge__"
+# 適用中 LoRA の name に使う、キャッシュ上の差分 LoRA の識別子
+# （"__cachedlora__:<id>"）。生成時に workflow.cached_lora_spec に展開する。
+CACHED_LORA_TOKEN = "__cachedlora__"
 # 系統ごとに必要な CLIPLoader の type（無い系統は stable_diffusion で可）。
 # krea2: Qwen3-VL 4B、qwen21: Qwen3-VL 8B（ComfyUI が 8B を検出すると
 # 自動で Qwen-Image 2.1 用のトークナイザ/テンプレートに切り替わる）。
@@ -293,6 +298,11 @@ class MainWindow(QMainWindow):
         # corrected via execution_cached events whenever an entry is used).
         self._merge_built_ids: set[int] = set()
         self._last_merge_id: Optional[int] = None   # entry used by last gen
+        # 差分 LoRA（RAM キャッシュ）: {"id","name","model_a","model_b","rank"}
+        self._cached_loras: list[dict] = self._load_cached_loras()
+        self._cached_lora_seq = max(
+            [int(self.settings.get("cached_lora_seq", 0) or 0)]
+            + [int(e["id"]) for e in self._cached_loras])
         self._merge_was_cached = False              # node "4" was a cache hit
         self._merge_dlg = None  # non-modal MergeDialog (at most one)
         self._merge_running = False  # a merge-only run is in flight
@@ -1056,7 +1066,8 @@ class MainWindow(QMainWindow):
     def _qwen21_config_warning(self, params: GenParams) -> Optional[str]:
         """Pre-flight check for Qwen-Image 2.1: CLIP type 'qwen_image' /
         Qwen3-VL 8B text encoder / 専用 VAE（64ch）。"""
-        name = params.merge_models[0][0] if params.merge_models else params.diffusion
+        name = (merge_source_file(params.merge_models[0][0])
+                if params.merge_models else params.diffusion)
         if self._diffusion_family(name) != "qwen21":
             return None
         msgs = []
@@ -1078,7 +1089,8 @@ class MainWindow(QMainWindow):
         """Pre-flight check: translate the cryptic backend mismatch into a
         clear, actionable message before a Krea-2 run is even submitted."""
         # For a merge, the family is judged from the first source model.
-        name = params.merge_models[0][0] if params.merge_models else params.diffusion
+        name = (merge_source_file(params.merge_models[0][0])
+                if params.merge_models else params.diffusion)
         if self._diffusion_family(name) != "krea2":
             return None
         msgs = []
@@ -1095,7 +1107,8 @@ class MainWindow(QMainWindow):
     def _sdxl_config_warning(self, params: GenParams) -> Optional[str]:
         """Pre-flight check for SDXL: dual CLIP (clip_l+clip_g) / CLIP type
         'sdxl' / kl-f8 VAE — どれが欠けても生成は確実に失敗する。"""
-        name = params.merge_models[0][0] if params.merge_models else params.diffusion
+        name = (merge_source_file(params.merge_models[0][0])
+                if params.merge_models else params.diffusion)
         if self._diffusion_family(name) != "sdxl":
             return None
         msgs = []
@@ -1134,12 +1147,13 @@ class MainWindow(QMainWindow):
                 out.append({
                     "id": int(e["id"]),
                     "name": str(e["name"]),
-                    "models": [(str(n), float(w)) for n, w in e["models"]],
+                    "models": [(norm_source(n), float(w))
+                               for n, w in e["models"]],
                     "quant": str(e.get("quant", "")),
                     "low_memory": bool(e.get("low_memory", False)),
                     "loras": [(str(n), float(s))
                               for n, s in e.get("loras", []) or []],
-                    "diffs": [(str(a), str(b), float(s))
+                    "diffs": [(norm_source(a), norm_source(b), float(s))
                               for a, b, s in e.get("diffs", []) or []],
                 })
             if out:
@@ -1162,6 +1176,90 @@ class MainWindow(QMainWindow):
                  "low_memory": bool(self.settings.get("merge_low_memory", False)),
                  "loras": [], "diffs": []}]
 
+    # ----- cached difference LoRAs ------------------------------------------
+    def _load_cached_loras(self) -> list[dict]:
+        try:
+            raw = json.loads(str(self.settings.get("cached_loras", "[]")))
+            return [{"id": int(e["id"]), "name": str(e["name"]),
+                     "model_a": norm_source(e["model_a"]),
+                     "model_b": norm_source(e["model_b"]),
+                     "rank": int(e.get("rank", 64))} for e in raw]
+        except (ValueError, TypeError, KeyError):
+            return []
+
+    def _cached_lora_by_token(self, token) -> Optional[dict]:
+        if not (isinstance(token, str)
+                and token.startswith(CACHED_LORA_TOKEN + ":")):
+            return None
+        try:
+            entry_id = int(token.split(":", 1)[1])
+        except ValueError:
+            return None
+        return next((e for e in self._cached_loras
+                     if int(e["id"]) == entry_id), None)
+
+    def _lora_display(self, name: str) -> str:
+        """Short label of an applied LoRA (file stem / cache entry name)."""
+        e = self._cached_lora_by_token(name)
+        if e is not None:
+            return f"[キャッシュ] {e['name']}"
+        if isinstance(name, str) and name.startswith(CACHED_LORA_TOKEN):
+            return "[キャッシュ] (削除済み)"
+        return Path(name).stem
+
+    def _cached_lora_items(self) -> list[dict]:
+        """LoRA ウィンドウに並べる差分 LoRA（系統はモデル1の先頭モデル）。"""
+        out = []
+        for e in self._cached_loras:
+            out.append({
+                "token": f"{CACHED_LORA_TOKEN}:{e['id']}",
+                "name": e["name"],
+                "family": self._diffusion_family(
+                    merge_source_file(e["model_a"])),
+                "desc": (f"差分: {merge_source_label(e['model_a'])} − "
+                         f"{merge_source_label(e['model_b'])}／ランク {e['rank']}"),
+            })
+        return out
+
+    def _lora_param(self, name: str):
+        """GenParams.loras の name: ファイル名、または差分 LoRA の spec。"""
+        e = self._cached_lora_by_token(name)
+        if e is not None:
+            return cached_lora_spec(e)
+        if isinstance(name, str) and name.startswith(CACHED_LORA_TOKEN):
+            raise ValueError("適用中の差分 LoRA がキャッシュ一覧から"
+                             "削除されています。LoRA を解除してください。")
+        return name
+
+    def _on_cached_lora_delete(self, token: str) -> None:
+        e = self._cached_lora_by_token(token)
+        if e is None:
+            return
+        self._cached_loras = [x for x in self._cached_loras
+                              if int(x["id"]) != int(e["id"])]
+        if any(x["name"] == token for x in self._loras):
+            self._loras = [x for x in self._loras if x["name"] != token]
+            self._rebuild_lora_rows()
+        if self.backend.is_running():
+            try:
+                self.backend.release_cached_lora(
+                    source_input(e["model_a"]), source_input(e["model_b"]),
+                    int(e["rank"]))
+            except OSError as ex:
+                self.append_log(f"メモリ解放に失敗: {ex}")
+        self.append_log(f"差分 LoRA「{e['name']}」をキャッシュから削除しました")
+        self._schedule_save()
+        self._refresh_lora_dialog()
+
+    def _refresh_lora_dialog(self) -> None:
+        if self._lora_dlg is None:
+            return
+        try:
+            self._lora_dlg.rescan()
+            self._push_lora_state()
+        except RuntimeError:
+            self._lora_dlg = None
+
     def _lora_family(self, relname: str) -> str:
         if not relname:
             return modelinfo.UNKNOWN
@@ -1173,7 +1271,7 @@ class MainWindow(QMainWindow):
         (same convention as _krea2_config_warning)."""
         if not entry.get("models"):
             return "unknown"
-        return self._diffusion_family(entry["models"][0][0])
+        return self._diffusion_family(merge_source_file(entry["models"][0][0]))
 
     def _merge_selected(self) -> bool:
         data = self.cb_diffusion.currentData()
@@ -1237,9 +1335,10 @@ class MainWindow(QMainWindow):
     def _on_merge_requested(self, entries, loras, diffs, quant: str,
                             low_memory: bool) -> None:
         """マージ button: register a new entry and build it in backend RAM."""
-        models = [(str(n), float(w)) for n, w in entries]
+        models = [(norm_source(n), float(w)) for n, w in entries]
         loras = [(str(n), float(s)) for n, s in loras]
-        diffs = [(str(a), str(b), float(s)) for a, b, s in diffs]
+        diffs = [(norm_source(a), norm_source(b), float(s))
+                 for a, b, s in diffs]
         try:
             graph = build_merge_graph(models, quant, low_memory,
                                       merge_loras=loras, merge_diffs=diffs)
@@ -1261,9 +1360,10 @@ class MainWindow(QMainWindow):
 
     def _on_save_requested(self, entries, loras, diffs, quant: str,
                            low_memory: bool, filename: str) -> None:
-        models = [(str(n), float(w)) for n, w in entries]
+        models = [(norm_source(n), float(w)) for n, w in entries]
         loras = [(str(n), float(s)) for n, s in loras]
-        diffs = [(str(a), str(b), float(s)) for a, b, s in diffs]
+        diffs = [(norm_source(a), norm_source(b), float(s))
+                 for a, b, s in diffs]
         try:
             graph = build_merge_graph(models, quant, low_memory,
                                       save_to=filename, merge_loras=loras,
@@ -1273,15 +1373,37 @@ class MainWindow(QMainWindow):
             return
         self._run_merge(graph, saving=True, entry_id=None)
 
-    def _on_extract_requested(self, model_a: str, model_b: str, rank: int,
-                              filename: str) -> None:
-        """「差分から LoRA を作成」: model_a − model_b を低ランク近似して
-        models/loras に保存する（バックエンドの ScomExtractLora）。"""
+    def _on_extract_requested(self, model_a, model_b, rank: int,
+                              name: str, to_cache: bool) -> None:
+        """「差分から LoRA を作成」: model_a − model_b を低ランク近似する
+        （バックエンドの ScomExtractLora）。to_cache=True はバックエンドの RAM
+        に置いて LoRA ウィンドウに「キャッシュ」として並べ、False は
+        models/loras/<name> に保存。model_a / model_b はファイル名か入れ子
+        マージの指定（dict）。"""
+        a, b = norm_source(model_a), norm_source(model_b)
         try:
-            graph = build_extract_lora_graph(model_a, model_b, int(rank),
-                                             filename)
+            graph = build_extract_lora_graph(a, b, int(rank),
+                                             "" if to_cache else name,
+                                             to_cache=to_cache)
         except ValueError as e:
             QMessageBox.warning(self, "入力不足", str(e))
+            return
+        if to_cache:
+            # 同じ (モデル1, モデル2, ランク) の項目は作り直さず名前だけ更新。
+            entry = next((e for e in self._cached_loras
+                          if e["model_a"] == a and e["model_b"] == b
+                          and int(e["rank"]) == int(rank)), None)
+            if entry is None:
+                self._cached_lora_seq += 1
+                entry = {"id": self._cached_lora_seq, "name": name,
+                         "model_a": a, "model_b": b, "rank": int(rank)}
+                self._cached_loras.append(entry)
+            else:
+                entry["name"] = name
+            self._schedule_save()
+            self._refresh_lora_dialog()
+            self._run_merge(graph, saving=False, entry_id=None,
+                            kind="extract_cache")
             return
         self._run_merge(graph, saving=True, entry_id=None, kind="extract")
 
@@ -1340,7 +1462,8 @@ class MainWindow(QMainWindow):
             return
         self._merge_built_ids.clear()
         self._push_merge_state()
-        self.append_log("バックエンドのキャッシュとモデルをすべて解放しました"
+        self.append_log("バックエンドのキャッシュとモデル（マージモデル・"
+                        "差分 LoRA を含む）をすべて解放しました"
                         "（次回使用時に自動で再構築されます）")
 
     def _sync_merge_states(self) -> None:
@@ -1377,7 +1500,7 @@ class MainWindow(QMainWindow):
         self.btn_generate.setEnabled(False)
         self.btn_cancel.setEnabled(True)
         self.progress.setValue(0)
-        if kind == "extract":
+        if kind in ("extract", "extract_cache"):
             note = "2 モデルの差分から LoRA を抽出中…"
         else:
             note = ("マージモデルを保存中…" if saving
@@ -1415,13 +1538,22 @@ class MainWindow(QMainWindow):
     def _on_merge_worker_done(self, _images: list) -> None:
         saving, entry_id, kind = getattr(self, "_merge_run_ctx",
                                          (False, None, "merge"))
+        if kind == "extract_cache":
+            self.status.showMessage("差分 LoRA をキャッシュに配置しました")
+            self.append_log(
+                "2 モデルの差分から LoRA を抽出し、バックエンドのキャッシュ"
+                "（メインメモリ）に配置しました。LoRA ウィンドウに「キャッシュ」"
+                "として表示されます（キャッシュから消えても使用時に自動で"
+                "再作成されます）")
+            self._refresh_lora_dialog()
+            return
         if kind == "extract":
             self.status.showMessage("差分 LoRA を保存しました")
             self.append_log(
                 "2 モデルの差分から LoRA を抽出し、models/loras に保存しました"
-                "（LoRA ウィンドウを開き直すと一覧に出ます。捉えた差分の割合は"
-                "バックエンドのログ「scom extract」を参照）")
+                "（捉えた差分の割合はバックエンドのログ「scom extract」を参照）")
             self.refresh_models()  # the new LoRA appears in the LoRA window
+            self._refresh_lora_dialog()
             return
         self._on_merge_done(saving, entry_id)
 
@@ -1478,7 +1610,9 @@ class MainWindow(QMainWindow):
                 pass
         dlg = LoraDialog(config.models_root() / "loras",
                          self.paths.user_data / "lora_cache",
-                         self._current_preset, None)
+                         self._current_preset, None,
+                         cached_fn=self._cached_lora_items)
+        dlg.cached_delete_requested.connect(self._on_cached_lora_delete)
         dlg.apply_requested.connect(self._on_lora_apply)
         dlg.remove_requested.connect(self._on_lora_remove)
         dlg.toggle_prompt_requested.connect(self._on_lora_toggle_prompt)
@@ -1504,7 +1638,8 @@ class MainWindow(QMainWindow):
                 break
         else:
             self._loras.append({"name": name, "strength": float(strength)})
-            self.append_log(f"LoRA を適用: {name} ×{strength:g}")
+            self.append_log(
+                f"LoRA を適用: {self._lora_display(name)} ×{strength:g}")
         self._rebuild_lora_rows()
         self._push_lora_state()
         self._schedule_save()
@@ -1513,7 +1648,7 @@ class MainWindow(QMainWindow):
         before = len(self._loras)
         self._loras = [e for e in self._loras if e["name"] != name]
         if len(self._loras) != before:
-            self.append_log(f"LoRA を解除: {name}")
+            self.append_log(f"LoRA を解除: {self._lora_display(name)}")
         self._rebuild_lora_rows()
         self._push_lora_state()
         self._schedule_save()
@@ -1717,6 +1852,8 @@ class MainWindow(QMainWindow):
         return self._lora_popup
 
     def _show_lora_popup(self, relname: str, anchor) -> None:
+        # 差分 LoRA のトリガーワードも LoRA ウィンドウで編集でき、token を
+        # キーに保存される（ファイルが無いので civitai の初期値は無い）。
         pos, neg = lora_meta.effective_trigger_words(
             relname, config.models_root() / "loras",
             self.paths.user_data / "lora_cache")
@@ -1798,8 +1935,13 @@ class MainWindow(QMainWindow):
             trash.setToolTip("この LoRA を解除")
             trash.clicked.connect(
                 lambda *_a, n=name: self._on_lora_remove(n))
-            lbl = QLabel(Path(name).stem)
-            lbl.setToolTip(name)
+            lbl = QLabel(self._lora_display(name))
+            cached = self._cached_lora_by_token(name)
+            lbl.setToolTip(
+                name if cached is None else
+                f"差分 LoRA（キャッシュ）: {merge_source_label(cached['model_a'])}"
+                f" − {merge_source_label(cached['model_b'])}／"
+                f"ランク {cached['rank']}")
             spin = QDoubleSpinBox()
             spin.setRange(-4.0, 4.0)
             spin.setDecimals(2)
@@ -2034,13 +2176,13 @@ class MainWindow(QMainWindow):
                     f"モデル軸のマージモデル「{name}」が見つかりません"
                     "（削除または名前変更されていませんか）")
             p = replace(p, diffusion="", checkpoint=False,
-                        merge_models=[(str(n), float(w))
+                        merge_models=[(norm_source(n), float(w))
                                       for n, w in entry["models"]],
                         merge_quant=str(entry["quant"]),
                         merge_low_memory=bool(entry["low_memory"]),
                         merge_loras=[(str(n), float(s))
                                      for n, s in entry.get("loras", [])],
-                        merge_diffs=[(str(a), str(b), float(s))
+                        merge_diffs=[(norm_source(a), norm_source(b), float(s))
                                      for a, b, s in entry.get("diffs", [])])
             fam = self._merge_family(entry)
         else:
@@ -2611,6 +2753,11 @@ class MainWindow(QMainWindow):
                   "diffs": [[a, b, s] for a, b, s in e.get("diffs", [])]}
                  for e in self._merges], ensure_ascii=False),
             "merge_seq": int(self._merge_seq),
+            "cached_loras": json.dumps(
+                [{"id": e["id"], "name": e["name"], "model_a": e["model_a"],
+                  "model_b": e["model_b"], "rank": e["rank"]}
+                 for e in self._cached_loras], ensure_ascii=False),
+            "cached_lora_seq": int(self._cached_lora_seq),
             "width": self.sp_width.value(),
             "height": self.sp_height.value(),
             "steps": self.sp_steps.value(),
@@ -2712,7 +2859,8 @@ class MainWindow(QMainWindow):
             vae=vae,
             te=te_list,
             clip_type=self.cb_clip_type.currentText(),
-            loras=[(e["name"], float(e["strength"])) for e in self._loras],
+            loras=[(self._lora_param(e["name"]), float(e["strength"]))
+                   for e in self._loras],
             prompt=self.txt_prompt.toPlainText(),
             negative=self.txt_negative.toPlainText(),
             width=self.sp_width.value(),
@@ -3067,19 +3215,11 @@ class MainWindow(QMainWindow):
         if p is None:
             return "", {}
         if p.merge_models:
-            # Record the merge recipe so the image stays reproducible.
-            model_name = ("merge(" + ", ".join(
-                f"{n}:{w:g}" for n, w in p.merge_models) + ")")
-            if p.merge_diffs:
-                # 足し込んだモデル差分 strength × (A − B)。
-                model_name += (" +diff(" + ", ".join(
-                    f"{a}-{b}:{s:g}" for a, b, s in p.merge_diffs) + ")")
-            if p.merge_loras:
-                # 焼き込んだ LoRA（生成時に掛ける LoRA とは別物）。
-                model_name += (" +lora(" + ", ".join(
-                    f"{n}:{s:g}" for n, s in p.merge_loras) + ")")
-            if p.merge_quant:
-                model_name += f" {p.merge_quant}"
+            # Record the full merge recipe (nested merges expanded, folded
+            # diffs / LoRAs, quantization) so the image stays reproducible.
+            model_name = format_merge_source({
+                "models": p.merge_models, "diffs": p.merge_diffs,
+                "loras": p.merge_loras, "quant": p.merge_quant})
         else:
             model_name = p.diffusion
         # webui 互換: メタデータ上のプロンプトには適用中 LoRA を
@@ -3087,7 +3227,7 @@ class MainWindow(QMainWindow):
         # プロンプトには含まれない — 適用は LoraLoader ノードで行う）。
         prompt_meta = p.prompt
         if p.loras:
-            tags = " ".join(f"<lora:{Path(n).stem}:{w:g}>"
+            tags = " ".join(f"<lora:{lora_label(n)}:{w:g}>"
                             for n, w in p.loras)
             body = prompt_meta.rstrip()
             prompt_meta = (body + ", " + tags) if body.strip() else tags
@@ -3117,13 +3257,22 @@ class MainWindow(QMainWindow):
             meta["denoising_strength"] = f"{p.hires_denoise:g}"
             meta["hires_method"] = f"Latent ({p.hires_method})"
         if p.loras:
-            meta["loras"] = ", ".join(f"{n}:{w:g}" for n, w in p.loras)
+            def _lora_meta_name(n) -> str:
+                if is_cached_lora(n):
+                    return ("diff-lora(" + format_merge_source(n["model_a"])
+                            + "-" + format_merge_source(n["model_b"])
+                            + f", rank {n['rank']})")
+                return str(n)
+            meta["loras"] = ", ".join(f"{_lora_meta_name(n)}:{w:g}"
+                                      for n, w in p.loras)
             # webui の "Lora hashes" フィールド（AutoV2 = SHA256 先頭10桁）。
             # ハッシュは LoRA ブラウザが計算・キャッシュ済みのものだけ使う
             # （ここで数GBのハッシュ計算を始めない）。
             cache = lora_meta.LoraCache(self.paths.user_data / "lora_cache")
             hashes = []
             for n, _w in p.loras:
+                if is_cached_lora(n):
+                    continue   # ファイルが無い（ハッシュも無い）
                 e = cache.lookup(n, config.models_root() / "loras" / n)
                 if e and e.get("sha256"):
                     hashes.append(f"{Path(n).stem}: {e['sha256'][:10]}")
