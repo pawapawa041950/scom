@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Callable, Optional
 
 from PySide6.QtCore import Qt, Signal
-from PySide6.QtGui import QAction
+from PySide6.QtGui import QAction, QBrush, QColor
 from PySide6.QtWidgets import (
     QButtonGroup, QCheckBox, QComboBox, QDialog, QDoubleSpinBox, QHBoxLayout,
     QInputDialog, QRadioButton,
@@ -306,15 +306,20 @@ class MergeDialog(QDialog):
 
     # ----- model source combos (files + saved merges) --------------------------
     def _fill_source_combo(self, combo, current=None) -> None:
-        """候補 = ファイル + 登録済みマージ項目（"[マージ] 名前"）。項目の
-        data はファイル名（str）か ("merge", id)。"""
+        """候補 = 登録済みマージ項目（"[マージ] 名前"、上位）+ ファイル。
+        項目の data はファイル名（str）か ("merge", id)。"""
         combo.blockSignals(True)
         combo.clear()
         combo.addItem("", "")
-        for n in self._models:
-            combo.addItem(n, n)
         for e in self._entries:
             combo.addItem(merge_source_label(e), ("merge", int(e["id"])))
+            # メイン画面のモデル欄と同じ色（main_window.MERGE_COLOR）で区別する。
+            combo.setItemData(combo.count() - 1, QBrush(QColor("#1a7f37")),
+                              Qt.ForegroundRole)
+        if self._entries and self._models:
+            combo.insertSeparator(combo.count())
+        for n in self._models:
+            combo.addItem(n, n)
         combo.blockSignals(False)
         if current:
             self._select_source(combo, current)
@@ -460,6 +465,12 @@ class MergeDialog(QDialog):
 
     def _remove_row(self, widget: QWidget) -> None:
         if len(self._rows) <= 1:
+            # 最後の 1 行は消さずに値を空に戻す（比率も既定の 1）。
+            for row in self._rows:
+                if row["widget"] is widget:
+                    row["combo"].setCurrentIndex(0)
+                    row["spin"].setValue(1.0)
+            self._refresh()
             return
         for row in self._rows:
             if row["widget"] is widget:
@@ -670,7 +681,7 @@ class MergeDialog(QDialog):
             w = float(row["spin"].value())
             row["pct"].setText(f"{w / total * 100:.0f}%"
                                if name and total > 0 else "")
-            row["trash"].setEnabled(self._editable and len(self._rows) > 1)
+            row["trash"].setEnabled(self._editable)
 
         # Architecture check: warn when known families disagree (rows are
         # deliberately unfiltered, so mixing anima/krea2 files is possible).
