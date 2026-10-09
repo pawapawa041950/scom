@@ -69,6 +69,9 @@ class GenParams:
     # Model differences folded in like a full-rank LoRA: [(model_a, model_b,
     # strength), ...] adds strength * (A - B) to the merged weights.
     merge_diffs: list[tuple[str, str, float]] = field(default_factory=list)
+    # キャッシュ上のマージモデル（一覧の項目）を使うときのその項目名。
+    # 画像メタデータの Model 欄にはレシピではなくこの名前を書く。
+    merge_name: str = ""
     te: list[str] = field(default_factory=list)  # 1 -> CLIPLoader, 2 -> DualCLIPLoader
     clip_type: str = "stable_diffusion"
     # Applied LoRAs: [(filename under models/loras, strength), ...], chained

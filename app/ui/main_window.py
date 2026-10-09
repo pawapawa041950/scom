@@ -2197,6 +2197,9 @@ class MainWindow(QMainWindow):
             "spec": spec,
             "base": base,
             "params": dict(plan),
+            # セルごとの ComfyUI グラフ（個別保存の画像に埋め込む。通常の
+            # 生成画像と同じく、そのセルを再現できるワークフローになる）。
+            "graphs": dict(jobs),
             "nx": len(values[0]), "ny": len(values[1]), "nz": len(values[2]),
             "total": total,
             "cell_fmt": cell_fmt,   # (fmt, ext, quality) | None
@@ -2272,6 +2275,7 @@ class MainWindow(QMainWindow):
                                       for n, w in entry["models"]],
                         merge_quant=str(entry["quant"]),
                         merge_low_memory=bool(entry["low_memory"]),
+                        merge_name=str(entry["name"]),
                         merge_loras=[(str(n), float(s))
                                      for n, s in entry.get("loras", [])],
                         merge_diffs=[(norm_source(a), norm_source(b), float(s))
@@ -2416,6 +2420,7 @@ class MainWindow(QMainWindow):
         try:
             metadata.save_with_metadata(
                 data, path, fmt, quality, cell_text, extra=cell_extra,
+                comfy_prompt=ctx.get("graphs", {}).get(idx),
                 embed=bool(ctx.get("embed", True)))
             ctx["cells_saved"] += 1
         except Exception as e:  # noqa: BLE001
@@ -2959,6 +2964,7 @@ class MainWindow(QMainWindow):
             merge_models=list(entry["models"]) if entry else [],
             merge_quant=entry["quant"] if entry else "",
             merge_low_memory=entry["low_memory"] if entry else False,
+            merge_name=str(entry["name"]) if entry else "",
             merge_loras=list(entry.get("loras", [])) if entry else [],
             merge_diffs=list(entry.get("diffs", [])) if entry else [],
             vae=vae,
@@ -3321,9 +3327,10 @@ class MainWindow(QMainWindow):
         if p is None:
             return "", {}
         if p.merge_models:
-            # Record the full merge recipe (nested merges expanded, folded
-            # diffs / LoRAs, quantization) so the image stays reproducible.
-            model_name = format_merge_source({
+            # キャッシュ上のマージモデルは一覧の項目名だけを書く（マージ元の
+            # モデル名・比率は残さない）。名前の無い場合だけレシピで代用。
+            # 再現用の完全な構成は埋め込みの ComfyUI グラフ側に残る。
+            model_name = p.merge_name or format_merge_source({
                 "models": p.merge_models, "diffs": p.merge_diffs,
                 "loras": p.merge_loras, "quant": p.merge_quant})
         else:
@@ -3364,10 +3371,9 @@ class MainWindow(QMainWindow):
             meta["hires_method"] = f"Latent ({p.hires_method})"
         if p.loras:
             def _lora_meta_name(n) -> str:
+                # キャッシュ上の差分 LoRA は登録名だけ（差分元は書かない）。
                 if is_cached_lora(n):
-                    return ("diff-lora(" + format_merge_source(n["model_a"])
-                            + "-" + format_merge_source(n["model_b"])
-                            + f", rank {n['rank']})")
+                    return str(n["cached_lora"])
                 return str(n)
             meta["loras"] = ", ".join(f"{_lora_meta_name(n)}:{w:g}"
                                       for n, w in p.loras)

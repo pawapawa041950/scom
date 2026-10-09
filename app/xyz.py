@@ -267,7 +267,8 @@ def apply_value(axis: AxisDef, p: GenParams, value, values: list) -> GenParams:
     if axis.id == "model":
         # モデル軸は通常のモデルファイル前提: マージ設定は外して差し替える。
         return replace(p, diffusion=str(value), merge_models=[],
-                       merge_quant="", merge_low_memory=False)
+                       merge_quant="", merge_low_memory=False,
+                       merge_loras=[], merge_diffs=[], merge_name="")
     if axis.id == "size":
         return replace(p, width=int(value[0]), height=int(value[1]))
     if axis.id == "dtype":
