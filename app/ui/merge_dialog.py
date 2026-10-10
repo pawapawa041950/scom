@@ -24,8 +24,8 @@ from PySide6.QtWidgets import (
 )
 
 from ..workflow import (
-    is_merge_spec, merge_source_file, merge_source_label,
-    merge_spec_from_entry,
+    entry_ref_ids, is_merge_spec, merge_source_file, merge_source_label,
+    merge_spec_from_entry, norm_source,
 )
 from .widgets import WideComboBox
 from .window_state import bind_geometry
@@ -46,6 +46,8 @@ class MergeDialog(QDialog):
     # entries [(model, weight)], loras [(lora, strength)],
     # diffs [(model_a, model_b, strength)], quant, low_mem
     merge_requested = Signal(object, object, object, str, bool)
+    # 作成済み項目の設定を上書き: entry_id + merge_requested と同じ引数
+    update_requested = Signal(int, object, object, object, str, bool)
     save_requested = Signal(object, object, object, str, bool, str)  # + filename
     # 差分から LoRA を作成: model_a, model_b, rank, name, to_cache
     # （model_a / model_b はファイル名、または入れ子マージの dict。name は
@@ -172,6 +174,13 @@ class MergeDialog(QDialog):
         self.lbl_nested_warn.setStyleSheet("color: #c80;")
         self.lbl_nested_warn.hide()
         right.addWidget(self.lbl_nested_warn)
+        self.lbl_dirty = QLabel(
+            "※ 設定が変更されています。「モデルマージ（この項目を上書き）」で"
+            "更新すると、古い設定のキャッシュは破棄されます")
+        self.lbl_dirty.setWordWrap(True)
+        self.lbl_dirty.setStyleSheet("color: #c80;")
+        self.lbl_dirty.hide()
+        right.addWidget(self.lbl_dirty)
 
         self.lbl_info = QLabel("")
         right.addWidget(self.lbl_info)
@@ -205,6 +214,9 @@ class MergeDialog(QDialog):
                "高精度維持）", Qt.ToolTipRole)
         self.cb_quant.setEnabled(False)
         self.chk_quant.toggled.connect(self._sync_quant_enabled)
+        # 変更表示（※ 設定が変更されています）を追従させる。
+        self.chk_quant.toggled.connect(self._sync_action_buttons)
+        self.cb_quant.currentIndexChanged.connect(self._sync_action_buttons)
         quant_row = QHBoxLayout()
         quant_row.addWidget(self.chk_quant)
         quant_row.addWidget(self.cb_quant)
@@ -218,6 +230,7 @@ class MergeDialog(QDialog):
             "bf16 で保持するためごくわずかに精度が落ちます。"
             "OFF は全モデルを同時に開いて fp32 で一括合成します（最高精度）")
         right.addWidget(self.chk_lowmem)
+        self.chk_lowmem.toggled.connect(self._sync_action_buttons)
 
         right.addStretch(1)
 
@@ -296,13 +309,16 @@ class MergeDialog(QDialog):
                     row = i
         self.lst.setCurrentRow(row)
         self.lst.blockSignals(False)
-        # 新しい項目をモデル欄の候補（入れ子マージ）にも反映する。
+        self._on_row_changed(self.lst.currentRow())
+
+    def _refill_source_combos(self) -> None:
+        """モデル欄の候補（入れ子マージ）を現在の一覧・選択に合わせ直す
+        （選択中の値は保つ）。"""
         for r in self._rows:
             self._fill_source_combo(r["combo"], self._source_of(r["combo"]))
         for r in self._diff_rows:
             for c in (r["combo_a"], r["combo_b"]):
                 self._fill_source_combo(c, self._source_of(c))
-        self._on_row_changed(self.lst.currentRow())
 
     # ----- model source combos (files + saved merges) --------------------------
     def _fill_source_combo(self, combo, current=None) -> None:
@@ -311,12 +327,14 @@ class MergeDialog(QDialog):
         combo.blockSignals(True)
         combo.clear()
         combo.addItem("", "")
-        for e in self._entries:
+        excluded = self._excluded_source_ids()
+        usable = [e for e in self._entries if int(e["id"]) not in excluded]
+        for e in usable:
             combo.addItem(merge_source_label(e), ("merge", int(e["id"])))
             # メイン画面のモデル欄と同じ色（main_window.MERGE_COLOR）で区別する。
             combo.setItemData(combo.count() - 1, QBrush(QColor("#1a7f37")),
                               Qt.ForegroundRole)
-        if self._entries and self._models:
+        if usable and self._models:
             combo.insertSeparator(combo.count())
         for n in self._models:
             combo.addItem(n, n)
@@ -348,6 +366,25 @@ class MergeDialog(QDialog):
         idx = combo.findData(str(src)) if src else 0
         combo.setCurrentIndex(max(idx, 0))
 
+    # ----- entry references (nested merges) ------------------------------------
+    def _ids(self) -> set:
+        return {int(e["id"]) for e in self._entries}
+
+    def _is_broken(self, entry: dict) -> bool:
+        """削除済みのマージを（入れ子のどこかで）素材にしている項目。"""
+        return bool(entry_ref_ids(entry) - self._ids())
+
+    def _excluded_source_ids(self) -> set:
+        """素材の候補から外す項目: 使用不可の項目と、編集中の項目自身・
+        それを素材にしている項目（選ぶと循環するため）。"""
+        out = {int(e["id"]) for e in self._entries if self._is_broken(e)}
+        eid = self.selected_entry_id()
+        if eid is not None:
+            out.add(int(eid))
+            out |= {int(e["id"]) for e in self._entries
+                    if int(eid) in entry_ref_ids(e)}
+        return out
+
     def _make_row_widget(self, entry: dict) -> QWidget:
         w = QWidget()
         h = QHBoxLayout(w)
@@ -357,9 +394,17 @@ class MergeDialog(QDialog):
         trash.setToolTip("このマージモデルを一覧から削除し、メモリからも解放します")
         trash.clicked.connect(
             lambda *_a, eid=int(entry["id"]): self._on_trash(eid))
-        mark = "●" if int(entry["id"]) in self._built_ids else "○"
-        lbl = QLabel(f"{mark} {entry['name']}")
-        lbl.setToolTip("● = メモリ上に構築済み / ○ = 未構築（生成時に自動マージ）")
+        if self._is_broken(entry):
+            lbl = QLabel(f"✕ {entry['name']}（素材が削除済み）")
+            lbl.setStyleSheet("color: #c33;")
+            lbl.setToolTip(
+                "素材にしていたマージモデルが削除されたため使用できません。"
+                "選択して素材を変更し「モデルマージ」で更新すると再び使えます")
+        else:
+            mark = "●" if int(entry["id"]) in self._built_ids else "○"
+            lbl = QLabel(f"{mark} {entry['name']}")
+            lbl.setToolTip(
+                "● = メモリ上に構築済み / ○ = 未構築（生成時に自動マージ）")
         h.addWidget(trash)
         h.addWidget(lbl, stretch=1)
         return w
@@ -410,20 +455,42 @@ class MergeDialog(QDialog):
                 self.rename_requested.emit(entry_id, name)
 
     def _on_row_changed(self, row: int) -> None:
+        # 候補（自分自身・循環になる項目を除く）は選択ごとに変わる。
+        self._refill_source_combos()
         entry_id = self.selected_entry_id()
+        self._set_editable(True)
         if entry_id is None:
-            self._set_editable(True)
             self._refresh()
             return
         e = self._entry_by_id(entry_id)
         if e is None:
             return
-        self._load_recipe([(n, float(w)) for n, w in e["models"]],
-                          str(e.get("quant", "")),
-                          bool(e.get("low_memory", False)),
-                          [(n, float(s)) for n, s in e.get("loras", [])],
-                          [(a, b, float(s)) for a, b, s in e.get("diffs", [])])
-        self._set_editable(False)
+        # 作成済みの項目も編集できる（「モデルマージ」で上書き更新）。
+        self._load_recipe(*self._stored_recipe(e))
+        self._refresh()
+
+    @staticmethod
+    def _stored_recipe(e: dict):
+        return ([(n, float(w)) for n, w in e["models"]],
+                str(e.get("quant", "")),
+                bool(e.get("low_memory", False)),
+                [(n, float(s)) for n, s in e.get("loras", [])],
+                [(a, b, float(s)) for a, b, s in e.get("diffs", [])])
+
+    def _is_dirty(self) -> bool:
+        """選択中の作成済み項目から設定が変わっているか。"""
+        eid = self.selected_entry_id()
+        e = self._entry_by_id(eid) if eid is not None else None
+        if e is None:
+            return False
+        def canon(models, quant, low, loras, diffs):
+            return (
+                [[norm_source(n), float(w)] for n, w in models],
+                str(quant), bool(low),
+                [[str(n), float(s)] for n, s in loras],
+                [[norm_source(a), norm_source(b), float(s)]
+                 for a, b, s in diffs])
+        return canon(*self._stored_recipe(e)) != canon(*self._displayed_recipe())
 
     # ----- right pane: rows --------------------------------------------------
     def _add_row(self, name: str = "", weight: float = 1.0) -> None:
@@ -636,21 +703,59 @@ class MergeDialog(QDialog):
         self.chk_quant.setEnabled(editable)
         self.chk_lowmem.setEnabled(editable)
         self._sync_quant_enabled()
-        self.btn_dup.setVisible(not editable)
         self._sync_action_buttons()
 
     def _sync_action_buttons(self, *_a) -> None:
-        """「モデルマージ」: キャッシュ配置は一覧への新規登録なので編集中
-        のみ、ファイル保存は表示中の構成（保存済み項目でも）で実行できる。
+        """「モデルマージ」: 新規作成ならキャッシュに新しく登録、作成済み
+        項目の選択中は（キャッシュ配置なら）その項目を上書き更新。
         「差分を LoRA 化」はモデルがちょうど 2 個のときだけ。"""
-        self.btn_merge.setEnabled(self._editable or self.rb_file.isChecked())
+        entry_sel = self.selected_entry_id() is not None
+        self.btn_dup.setVisible(entry_sel)
+        self.btn_merge.setEnabled(self._editable)
+        if entry_sel and self.rb_cache.isChecked():
+            self.btn_merge.setText("モデルマージ（この項目を上書き）")
+            self.btn_merge.setToolTip(
+                "選択中のマージモデルを表示中の設定で作り直します。古い設定の"
+                "キャッシュは破棄され、この項目を素材にしているマージモデルも"
+                "新しい設定で作り直されます")
+        else:
+            self.btn_merge.setText("モデルマージ")
+            self.btn_merge.setToolTip(
+                "表示中の構成でマージします（出力先は上の選択に従う）")
         self.btn_extract.setEnabled(len(self._displayed_recipe()[0]) == 2)
+        dirty = entry_sel and self._is_dirty()
+        self.lbl_dirty.setVisible(dirty)
+
+    def _has_deleted_refs(self, entries, diffs) -> bool:
+        missing = entry_ref_ids({"models": entries, "diffs": diffs}) - self._ids()
+        if missing:
+            QMessageBox.warning(
+                self, "削除済みのマージモデル",
+                "素材に削除済みのマージモデルが含まれているため実行できません。"
+                "該当の行を別のモデルに変更してください。")
+            return True
+        return False
 
     def _on_merge_clicked(self) -> None:
         if self.rb_cache.isChecked():
-            self._on_merge()
+            eid = self.selected_entry_id()
+            if eid is not None:
+                self._on_update(eid)
+            else:
+                self._on_merge()
         else:
             self._on_save()
+
+    def _on_update(self, entry_id: int) -> None:
+        entries = self.entries()
+        if not self._validate(entries):
+            return
+        if self._has_deleted_refs(entries, self.diff_entries()):
+            return
+        self.update_requested.emit(int(entry_id), entries,
+                                   self.lora_entries(), self.diff_entries(),
+                                   self.quant_value(),
+                                   self.chk_lowmem.isChecked())
 
     def _sync_quant_enabled(self, *_a) -> None:
         self.cb_quant.setEnabled(self._editable and self.chk_quant.isChecked())
@@ -723,17 +828,8 @@ class MergeDialog(QDialog):
     def _displayed_recipe(self) -> tuple[list[tuple[str, float]], str, bool,
                                          list[tuple[str, float]],
                                          list[tuple[str, str, float]]]:
-        """The recipe currently shown (editor draft or selected entry):
-        (models, quant, low_memory, loras, diffs)."""
-        entry_id = self.selected_entry_id()
-        if entry_id is not None:
-            e = self._entry_by_id(entry_id)
-            if e is not None:
-                return ([(n, float(w)) for n, w in e["models"]],
-                        str(e.get("quant", "")),
-                        bool(e.get("low_memory", False)),
-                        [(n, float(s)) for n, s in e.get("loras", [])],
-                        [(a, b, float(s)) for a, b, s in e.get("diffs", [])])
+        """The recipe currently in the editor (作成済み項目の選択中も、
+        編集中の内容): (models, quant, low_memory, loras, diffs)."""
         return (self.entries(), self.quant_value(),
                 self.chk_lowmem.isChecked(), self.lora_entries(),
                 self.diff_entries())
@@ -749,6 +845,8 @@ class MergeDialog(QDialog):
     def _on_merge(self) -> None:
         entries = self.entries()
         if not self._validate(entries):
+            return
+        if self._has_deleted_refs(entries, self.diff_entries()):
             return
         self.merge_requested.emit(entries, self.lora_entries(),
                                   self.diff_entries(), self.quant_value(),

@@ -139,6 +139,44 @@ def norm_source(x):
     }
 
 
+def merge_ref_ids(x) -> set:
+    """Ids of every nested merge referenced by a source (recursively)."""
+    if not isinstance(x, dict):
+        return set()
+    out = set()
+    if int(x.get("id", 0) or 0):
+        out.add(int(x["id"]))
+    out |= entry_ref_ids(x)
+    return out
+
+
+def entry_ref_ids(entry: dict) -> set:
+    """Ids of the merges an entry (or spec) uses as sources, recursively
+    (model rows and both sides of diff rows)."""
+    out = set()
+    for n, _w in entry.get("models", []) or []:
+        out |= merge_ref_ids(n)
+    for a, b, _s in entry.get("diffs", []) or []:
+        out |= merge_ref_ids(a) | merge_ref_ids(b)
+    return out
+
+
+def replace_merge_spec(x, entry_id: int, new_spec: dict):
+    """Return ``x`` with every nested spec of ``entry_id`` (at any depth)
+    replaced by ``new_spec``: keeps snapshots in sync after an edit."""
+    if not isinstance(x, dict):
+        return x
+    if int(x.get("id", 0) or 0) == int(entry_id):
+        return new_spec
+    y = dict(x)
+    y["models"] = [[replace_merge_spec(n, entry_id, new_spec), w]
+                   for n, w in x.get("models", []) or []]
+    y["diffs"] = [[replace_merge_spec(a, entry_id, new_spec),
+                   replace_merge_spec(b, entry_id, new_spec), s]
+                  for a, b, s in x.get("diffs", []) or []]
+    return y
+
+
 def merge_spec_from_entry(entry: dict) -> dict:
     """Snapshot of a saved merge entry, usable as a nested merge source."""
     return norm_source(entry)

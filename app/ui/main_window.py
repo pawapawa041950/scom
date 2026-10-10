@@ -30,7 +30,8 @@ from .widgets import FlowLayout, GrowingTextEdit, WideComboBox
 from ..comfy_backend import ComfyBackend, BackendError, Progress
 from ..workflow import (
     GenParams, build_extract_lora_graph, build_graph, build_merge_graph,
-    cached_lora_spec, format_merge_source, is_cached_lora, lora_label,
+    cached_lora_spec, entry_ref_ids, format_merge_source, is_cached_lora,
+    lora_label, merge_spec_from_entry, replace_merge_spec,
     merge_pin_key, merge_recipe, merge_source_file, merge_source_label,
     norm_source, source_input,
     SAMPLERS, SCHEDULERS, CLIP_TYPES_SINGLE, CLIP_TYPES_DUAL, DEFAULT_NEGATIVE,
@@ -1290,6 +1291,21 @@ class MainWindow(QMainWindow):
             return None
         return self._merge_entry_by_id(entry_id)
 
+    def _merge_missing_refs(self, entry: dict) -> set:
+        """Ids of merges this entry uses (at any depth) that no longer exist."""
+        ids = {int(e["id"]) for e in self._merges}
+        return entry_ref_ids(entry) - ids
+
+    def _merge_broken(self, entry: dict) -> bool:
+        """削除済みのマージを（入れ子のどこかで）素材にしている項目は使用
+        不可（モデル一覧に出さず、生成・マージもしない）。"""
+        return bool(self._merge_missing_refs(entry))
+
+    def _merge_dependents(self, entry_id: int) -> list[dict]:
+        """entry_id を（入れ子のどこかで）素材にしている項目。"""
+        return [e for e in self._merges if int(e["id"]) != int(entry_id)
+                and int(entry_id) in entry_ref_ids(e)]
+
     def _merge_entry_by_id(self, entry_id: int) -> Optional[dict]:
         for e in self._merges:
             if int(e["id"]) == entry_id:
@@ -1324,6 +1340,7 @@ class MainWindow(QMainWindow):
             self._all_models.get("loras", []), self._lora_family,
             config.models_root() / "loras", None)
         dlg.merge_requested.connect(self._on_merge_requested)
+        dlg.update_requested.connect(self._on_merge_update_requested)
         dlg.save_requested.connect(self._on_save_requested)
         dlg.extract_requested.connect(self._on_extract_requested)
         dlg.delete_requested.connect(self._on_merge_delete)
@@ -1335,6 +1352,17 @@ class MainWindow(QMainWindow):
             dlg.set_merge_running(True)
         dlg.show()
 
+    def _missing_ref_warning(self, models, diffs) -> bool:
+        """素材に削除済みのマージが含まれていたら警告して True。"""
+        missing = self._merge_missing_refs({"models": models, "diffs": diffs})
+        if missing:
+            QMessageBox.warning(
+                self._merge_dlg or self, "削除済みのマージモデル",
+                "素材に削除済みのマージモデルが含まれているため実行できません。"
+                "該当の行を別のモデルに変更してください。")
+            return True
+        return False
+
     def _on_merge_requested(self, entries, loras, diffs, quant: str,
                             low_memory: bool) -> None:
         """マージ button: register a new entry and build it in backend RAM."""
@@ -1342,6 +1370,8 @@ class MainWindow(QMainWindow):
         loras = [(str(n), float(s)) for n, s in loras]
         diffs = [(norm_source(a), norm_source(b), float(s))
                  for a, b, s in diffs]
+        if self._missing_ref_warning(models, diffs):
+            return
         try:
             graph = build_merge_graph(models, quant, low_memory,
                                       merge_loras=loras, merge_diffs=diffs)
@@ -1367,6 +1397,8 @@ class MainWindow(QMainWindow):
         loras = [(str(n), float(s)) for n, s in loras]
         diffs = [(norm_source(a), norm_source(b), float(s))
                  for a, b, s in diffs]
+        if self._missing_ref_warning(models, diffs):
+            return
         try:
             graph = build_merge_graph(models, quant, low_memory,
                                       save_to=filename, merge_loras=loras,
@@ -1375,6 +1407,72 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "入力不足", str(e))
             return
         self._run_merge(graph, saving=True, entry_id=None)
+
+    def _release_entry_pin(self, entry: dict) -> None:
+        """この項目の（現在の設定の）マージ結果をバックエンドから解放する。"""
+        self._merge_built_ids.discard(int(entry["id"]))
+        if not self.backend.is_running():
+            return
+        try:
+            self.backend.release_merge(
+                merge_recipe(entry["models"], entry.get("loras", []),
+                             entry.get("diffs", [])),
+                entry["quant"], entry["low_memory"])
+        except OSError as e:
+            self.append_log(f"メモリ解放に失敗: {e}")
+
+    def _on_merge_update_requested(self, entry_id: int, entries, loras,
+                                   diffs, quant: str,
+                                   low_memory: bool) -> None:
+        """作成済みマージの設定を上書きして作り直す。古い設定のキャッシュは
+        解放し、この項目を素材にしている他の項目の中身（スナップショット）
+        も新しい設定に差し替える（そちらの古いキャッシュも解放）。"""
+        entry = self._merge_entry_by_id(int(entry_id))
+        if entry is None:
+            return
+        models = [(norm_source(n), float(w)) for n, w in entries]
+        loras = [(str(n), float(s)) for n, s in loras]
+        diffs = [(norm_source(a), norm_source(b), float(s))
+                 for a, b, s in diffs]
+        if self._missing_ref_warning(models, diffs):
+            return
+        dependents = self._merge_dependents(entry["id"])
+        refs = entry_ref_ids({"models": models, "diffs": diffs})
+        if int(entry["id"]) in refs or refs & {int(d["id"]) for d in dependents}:
+            QMessageBox.warning(
+                self._merge_dlg or self, "循環参照",
+                "この項目自身、またはこの項目を素材にしているマージモデルは"
+                "素材に指定できません。")
+            return
+        try:
+            graph = build_merge_graph(models, quant, low_memory,
+                                      merge_loras=loras, merge_diffs=diffs)
+        except ValueError as e:
+            QMessageBox.warning(self, "入力不足", str(e))
+            return
+        for e in [entry] + dependents:
+            self._release_entry_pin(e)
+        entry.update({"models": models, "quant": str(quant),
+                      "low_memory": bool(low_memory), "loras": loras,
+                      "diffs": diffs})
+        new_spec = merge_spec_from_entry(entry)
+        for d in dependents:
+            d["models"] = [(replace_merge_spec(n, entry["id"], new_spec), w)
+                           for n, w in d["models"]]
+            d["diffs"] = [(replace_merge_spec(a, entry["id"], new_spec),
+                           replace_merge_spec(b, entry["id"], new_spec), s)
+                          for a, b, s in d.get("diffs", [])]
+        self._schedule_save()
+        self._apply_preset_filter()
+        self._push_merge_state()
+        if self._merge_dlg is not None:
+            self._merge_dlg.select_entry(entry["id"])
+        msg = f"{entry['name']} の設定を更新しました（古いキャッシュは破棄）"
+        if dependents:
+            msg += ("。素材にしている " + "、".join(d["name"] for d in dependents)
+                    + " も新しい設定で作り直されます")
+        self.append_log(msg)
+        self._run_merge(graph, saving=False, entry_id=entry["id"])
 
     def _on_extract_requested(self, model_a, model_b, rank: int,
                               name: str, to_cache: bool) -> None:
@@ -1443,6 +1541,12 @@ class MainWindow(QMainWindow):
         self._push_merge_state()
         name = entry["name"] if entry else f"id={entry_id}"
         self.append_log(f"{name} を一覧から削除し、メモリを解放しました")
+        broken = [e["name"] for e in self._merges if self._merge_broken(e)]
+        if broken:
+            self.append_log(
+                "削除したマージモデルを素材にしている " + "、".join(broken)
+                + " は使用できなくなりました（マージウィンドウで素材を変更"
+                "すれば再び使えます）")
 
     def _on_merge_rename(self, entry_id: int, name: str) -> None:
         e = self._merge_entry_by_id(entry_id)
@@ -2010,7 +2114,8 @@ class MainWindow(QMainWindow):
         dlg.show()
 
     def _xyz_model_choices(self) -> list[str]:
-        return ([MERGE_PREFIX + e["name"] for e in self._merges]
+        return ([MERGE_PREFIX + e["name"] for e in self._merges
+                 if not self._merge_broken(e)]
                 + self._all_models.get("diffusion_models", []))
 
     _XYZ_CACHED_PREFIX = "[キャッシュ]"
@@ -2270,6 +2375,10 @@ class MainWindow(QMainWindow):
                 raise ValueError(
                     f"モデル軸のマージモデル「{name}」が見つかりません"
                     "（削除または名前変更されていませんか）")
+            if self._merge_broken(entry):
+                raise ValueError(
+                    f"モデル軸のマージモデル「{name}」は削除済みのマージ"
+                    "モデルを素材にしているため使用できません")
             p = replace(p, diffusion="", checkpoint=False,
                         merge_models=[(norm_source(n), float(w))
                                       for n, w in entry["models"]],
@@ -2571,7 +2680,9 @@ class MainWindow(QMainWindow):
         # tint to stand out.
         self.cb_diffusion.blockSignals(True)
         shown = [e for e in self._merges
-                 if preset == "all" or self._merge_family(e) in (preset, "shared")]
+                 if not self._merge_broken(e)
+                 and (preset == "all"
+                      or self._merge_family(e) in (preset, "shared"))]
         for i, e in enumerate(shown):
             self.cb_diffusion.insertItem(
                 i, MERGE_PREFIX + e["name"], f"{MERGE_TOKEN}:{e['id']}")
@@ -3078,6 +3189,14 @@ class MainWindow(QMainWindow):
         if self._merge_selected() and self._selected_merge_entry() is None:
             QMessageBox.warning(self, "マージ未設定",
                                 "選択中のマージモデルが見つかりません。")
+            self._open_merge_dialog()
+            return
+        sel = self._selected_merge_entry()
+        if sel is not None and self._merge_broken(sel):
+            QMessageBox.warning(
+                self, "使用できないマージモデル",
+                f"「{sel['name']}」は削除済みのマージモデルを素材にしている"
+                "ため使用できません。マージウィンドウで素材を変更してください。")
             self._open_merge_dialog()
             return
         try:
