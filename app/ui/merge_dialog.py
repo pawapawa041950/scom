@@ -30,6 +30,17 @@ from ..workflow import (
 from .widgets import WideComboBox
 from .window_state import bind_geometry
 
+# モデル欄の項目データ: マージ項目は "merge:<id>"（Windows のファイル名に
+# ":" は使えないのでファイル名と衝突しない）。タプル等の Python オブジェクトは Qt が同一オブジェクトかどうかで
+# 比べるため findData() で見つからず、存在する項目が「削除済み」扱いに
+# なっていた。
+_MERGE_ITEM = "merge:"
+
+
+def _merge_item_data(entry_id) -> str:
+    return f"{_MERGE_ITEM}{int(entry_id)}"
+
+
 # Returns "anima" | "krea2" | "qwen21" | "sdxl" | "unknown" for a diffusion
 # file name.
 FamilyFn = Callable[[str], str]
@@ -330,7 +341,7 @@ class MergeDialog(QDialog):
         excluded = self._excluded_source_ids()
         usable = [e for e in self._entries if int(e["id"]) not in excluded]
         for e in usable:
-            combo.addItem(merge_source_label(e), ("merge", int(e["id"])))
+            combo.addItem(merge_source_label(e), _merge_item_data(e["id"]))
             # メイン画面のモデル欄と同じ色（main_window.MERGE_COLOR）で区別する。
             combo.setItemData(combo.count() - 1, QBrush(QColor("#1a7f37")),
                               Qt.ForegroundRole)
@@ -346,8 +357,8 @@ class MergeDialog(QDialog):
         """選択中のソース: "" | ファイル名 | 入れ子マージの dict（スナップ
         ショット）。削除済み項目のプレースホルダは dict をそのまま持つ。"""
         data = combo.currentData()
-        if isinstance(data, tuple):
-            e = self._entry_by_id(int(data[1]))
+        if isinstance(data, str) and data.startswith(_MERGE_ITEM):
+            e = self._entry_by_id(int(data[len(_MERGE_ITEM):]))
             return merge_spec_from_entry(e) if e is not None else ""
         if isinstance(data, dict):
             return data
@@ -355,7 +366,7 @@ class MergeDialog(QDialog):
 
     def _select_source(self, combo, src) -> None:
         if is_merge_spec(src):
-            idx = combo.findData(("merge", int(src.get("id", 0) or 0)))
+            idx = combo.findData(_merge_item_data(src.get("id", 0) or 0))
             if idx < 0:
                 # 参照先がもう無い（削除済み）: スナップショットをそのまま
                 # 候補に足して表示・再利用できるようにする。
