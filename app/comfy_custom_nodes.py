@@ -83,6 +83,11 @@ def _dequant(patcher, key):
         patcher.model, key)
     if convert_func is not None:
         weight = convert_func(weight, inplace=False)
+    # A source that ComfyUI has (partly) loaded for sampling can have weights
+    # on the GPU while file sources are on the CPU; merging them failed with
+    # "Expected all tensors to be on the same device". Always combine on CPU.
+    if weight.device.type != "cpu":
+        weight = weight.to("cpu")
     return weight
 
 
@@ -106,8 +111,15 @@ def _load_patcher(name):
         recipe = _recipe_string(name.get("models", []),
                                 name.get("loras", []) or [],
                                 name.get("diffs", []) or [])
-        return ScomMergeModel().merge(recipe, name.get("quant", "") or "",
-                                      bool(name.get("low_memory", False)))[0]
+        model = ScomMergeModel().merge(recipe, name.get("quant", "") or "",
+                                       bool(name.get("low_memory", False)))[0]
+        # The pinned merged model may have been used for sampling: then it
+        # can still be (partly) on the GPU, and while loaded with a LoRA its
+        # weights are patched in place. Unload everything first so we read
+        # the plain, unpatched weights from the CPU.
+        comfy.model_management.unload_all_models()
+        comfy.model_management.soft_empty_cache()
+        return model
     path = folder_paths.get_full_path("diffusion_models", name)
     if path is None:
         raise ValueError("モデルが見つかりません: {}".format(name))
