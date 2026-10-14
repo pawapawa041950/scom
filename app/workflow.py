@@ -139,6 +139,32 @@ def norm_source(x):
     }
 
 
+def merge_source_files(models=(), diffs=(), loras=()) -> tuple[set, set]:
+    """Files a merge needs (nested merges expanded): (diffusion model files,
+    LoRA files baked in at any depth)."""
+    mfiles, lfiles = set(), set(str(n) for n, _s in loras)
+
+    def walk(x):
+        if not isinstance(x, dict):
+            if x:
+                mfiles.add(str(x))
+            return
+        for n, _w in x.get("models", []) or []:
+            walk(n)
+        for a, b, _s in x.get("diffs", []) or []:
+            walk(a)
+            walk(b)
+        for n, _s in x.get("loras", []) or []:
+            lfiles.add(str(n))
+
+    for n, _w in models:
+        walk(n)
+    for a, b, _s in diffs:
+        walk(a)
+        walk(b)
+    return mfiles, lfiles
+
+
 def merge_ref_ids(x) -> set:
     """Ids of every nested merge referenced by a source (recursively)."""
     if not isinstance(x, dict):

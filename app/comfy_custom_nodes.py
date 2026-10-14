@@ -100,6 +100,37 @@ def _is_linear(patcher, key):
     return "Linear" in type(mod).__name__
 
 
+def _collect_files(src, models, loras):
+    """Leaf files a merge source needs (nested merges expanded): diffusion
+    model files into ``models``, baked LoRA files into ``loras``."""
+    if not isinstance(src, dict):
+        models.add(str(src))
+        return
+    for n, _w in src.get("models", []) or []:
+        _collect_files(n, models, loras)
+    for a, b, _s in src.get("diffs", []) or []:
+        _collect_files(a, models, loras)
+        _collect_files(b, models, loras)
+    for n, _s in src.get("loras", []) or []:
+        loras.add(str(n))
+
+
+def _check_sources(sources, loras=()):
+    """Raise before any work if a needed model / LoRA file is missing (a
+    merge used to fail only when it reached that source, after loading and
+    combining the others)."""
+    models, lora_files = set(), set(str(n) for n in loras)
+    for s in sources:
+        _collect_files(s, models, lora_files)
+    missing = sorted(m for m in models
+                     if folder_paths.get_full_path("diffusion_models", m) is None)
+    missing += sorted("LoRA: " + l for l in lora_files
+                      if folder_paths.get_full_path("loras", l) is None)
+    if missing:
+        raise ValueError("マージに必要なモデルが見つかりません:\\n"
+                         + "\\n".join("・" + m for m in missing))
+
+
 def _load_patcher(name):
     """Open a merge source. ``name`` is a file in diffusion_models, or a dict
     describing a nested merge ({"name", "models", "loras", "diffs", "quant",
@@ -540,6 +571,9 @@ class ScomMergeModel:
 
     def merge(self, recipe, quantize="", low_memory=False, save_to=""):
         entries, loras, diffs = _parse_recipe(recipe)
+        _check_sources([n for n, _w in entries]
+                       + [x for a, b, _s in diffs for x in (a, b)],
+                       [n for n, _s in loras])
         weights = [float(w) for _n, w in entries]
         if any(w <= 0 for w in weights):
             raise ValueError("マージ比率は正の数値で指定してください")
@@ -761,6 +795,7 @@ class ScomExtractLora:
 
     def extract(self, model_a, model_b, rank=64, save_to="", to_cache=False):
         model_a, model_b = _resolve_source(model_a), _resolve_source(model_b)
+        _check_sources([model_a, model_b])
         if model_a == model_b:
             raise ValueError("同じモデル同士の差分は空です")
         rank = max(1, int(rank))
@@ -826,6 +861,7 @@ class ScomCachedLora:
         with _PIN_LOCK:
             hit = _LORA_CACHE.get(key)
         if hit is None:
+            _check_sources([a, b])
             logging.info("scom lora: not in cache, extracting {} - {}".format(
                 _label(a), _label(b)))
             sd, info = _extract_lora_sd(a, b, int(rank))

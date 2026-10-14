@@ -31,6 +31,7 @@ from ..comfy_backend import ComfyBackend, BackendError, Progress
 from ..workflow import (
     GenParams, build_extract_lora_graph, build_graph, build_merge_graph,
     cached_lora_spec, entry_ref_ids, format_merge_source, is_cached_lora,
+    merge_source_files,
     lora_label, merge_spec_from_entry, replace_merge_spec,
     merge_pin_key, merge_recipe, merge_source_file, merge_source_label,
     norm_source, source_input,
@@ -1352,6 +1353,41 @@ class MainWindow(QMainWindow):
             dlg.set_merge_running(True)
         dlg.show()
 
+    def _missing_merge_files(self, models=(), diffs=(), loras=()) -> list[str]:
+        """マージに必要なファイル（入れ子の中身・差分行・焼き込む LoRA を
+        含む）のうち、models フォルダに無いもの。"""
+        root = config.models_root()
+        mfiles, lfiles = merge_source_files(models, diffs, loras)
+        missing = sorted(f for f in mfiles
+                         if not (root / "diffusion_models" / f).is_file())
+        missing += sorted("LoRA: " + f for f in lfiles
+                          if not (root / "loras" / f).is_file())
+        return missing
+
+    def _params_missing_files(self, p: GenParams) -> list[str]:
+        """生成に使うマージモデル・差分 LoRA（キャッシュ）の元ファイルの
+        うち、見つからないもの。"""
+        missing = []
+        if p.merge_models:
+            missing += self._missing_merge_files(p.merge_models, p.merge_diffs,
+                                                 p.merge_loras)
+        for n, _w in p.loras:
+            if is_cached_lora(n):
+                missing += self._missing_merge_files(
+                    [(n["model_a"], 1.0), (n["model_b"], 1.0)])
+        return sorted(set(missing))
+
+    def _missing_files_error(self, missing: list[str], what: str,
+                             parent=None) -> bool:
+        """見つからないファイルがあればエラーを出して True（呼び出し側は中止）。"""
+        if not missing:
+            return False
+        msg = (f"{what}に必要なモデルが見つからないため中止しました:\n"
+               + "\n".join("・" + m for m in missing))
+        self.append_log("エラー: " + msg.replace("\n", " "))
+        QMessageBox.critical(parent or self, "モデルが見つかりません", msg)
+        return True
+
     def _missing_ref_warning(self, models, diffs) -> bool:
         """素材に削除済みのマージが含まれていたら警告して True。"""
         missing = self._merge_missing_refs({"models": models, "diffs": diffs})
@@ -1371,6 +1407,10 @@ class MainWindow(QMainWindow):
         diffs = [(norm_source(a), norm_source(b), float(s))
                  for a, b, s in diffs]
         if self._missing_ref_warning(models, diffs):
+            return
+        if self._missing_files_error(
+                self._missing_merge_files(models, diffs, loras), "マージ",
+                self._merge_dlg):
             return
         try:
             graph = build_merge_graph(models, quant, low_memory,
@@ -1398,6 +1438,10 @@ class MainWindow(QMainWindow):
         diffs = [(norm_source(a), norm_source(b), float(s))
                  for a, b, s in diffs]
         if self._missing_ref_warning(models, diffs):
+            return
+        if self._missing_files_error(
+                self._missing_merge_files(models, diffs, loras), "マージ",
+                self._merge_dlg):
             return
         try:
             graph = build_merge_graph(models, quant, low_memory,
@@ -1435,6 +1479,10 @@ class MainWindow(QMainWindow):
         diffs = [(norm_source(a), norm_source(b), float(s))
                  for a, b, s in diffs]
         if self._missing_ref_warning(models, diffs):
+            return
+        if self._missing_files_error(
+                self._missing_merge_files(models, diffs, loras), "マージ",
+                self._merge_dlg):
             return
         dependents = self._merge_dependents(entry["id"])
         refs = entry_ref_ids({"models": models, "diffs": diffs})
@@ -1482,6 +1530,10 @@ class MainWindow(QMainWindow):
         models/loras/<name> に保存。model_a / model_b はファイル名か入れ子
         マージの指定（dict）。"""
         a, b = norm_source(model_a), norm_source(model_b)
+        if self._missing_files_error(
+                self._missing_merge_files([(a, 1.0), (b, 1.0)]),
+                "差分 LoRA の作成", self._merge_dlg):
+            return
         try:
             graph = build_extract_lora_graph(a, b, int(rank),
                                              "" if to_cache else name,
@@ -2273,6 +2325,11 @@ class MainWindow(QMainWindow):
         except ValueError as e:
             QMessageBox.warning(self._xyz_parent(), "入力エラー", str(e))
             return None
+        missing = sorted({m for _idx, p in plan
+                          for m in self._params_missing_files(p)})
+        if self._missing_files_error(missing, "XYZ プロット（マージモデル）",
+                                     self._xyz_parent()):
+            return None
         total = len(jobs)
         if total > 64 and not auto:
             res = QMessageBox.question(
@@ -2317,6 +2374,18 @@ class MainWindow(QMainWindow):
         """組み立て済みの XYZ 実行を開始する。"""
         from datetime import datetime
         ctx, jobs = run["ctx"], run["jobs"]
+        # 積んだ後にマージ元のファイルが消えた場合は、この実行と待機中の
+        # XYZ タスクを止める。
+        missing = sorted({m for p in ctx["params"].values()
+                          for m in self._params_missing_files(p)})
+        if self._missing_files_error(missing, "XYZ プロット（マージモデル）",
+                                     self._xyz_parent()):
+            if self._xyz_queue:
+                n = len(self._xyz_queue)
+                self._xyz_queue.clear()
+                self.append_log(f"停止したため待機中の XYZ タスク {n} 件を破棄しました")
+                self._push_xyz_queue()
+            return
         spec, base, total = ctx["spec"], ctx["base"], ctx["total"]
         # ファイル名のタイムスタンプは実際に開始した時刻。
         ctx["stamp"] = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -3209,6 +3278,9 @@ class MainWindow(QMainWindow):
         except ValueError as e:
             QMessageBox.warning(self, "入力不足", str(e))
             return
+        if self._missing_files_error(self._params_missing_files(params),
+                                     "画像生成（マージモデル）"):
+            return
         if self._gen_thread is not None:
             # 生成中: タスクに積む（押した時点の設定・seed を保持）。
             self._gen_queue.append(params)
@@ -3226,6 +3298,16 @@ class MainWindow(QMainWindow):
         except ValueError as e:
             # 積んだ後に前提が消えた場合（マージ削除等）のみ起こり得る。
             QMessageBox.warning(self, "入力不足", str(e))
+            self._update_generate_button()
+            return
+        # 積んだ後にマージ元のファイルが消えた場合も、生成を止めて待機
+        # タスクも破棄する（キャンセルやエラー停止と同じ扱い）。
+        if self._missing_files_error(self._params_missing_files(params),
+                                     "画像生成（マージモデル）"):
+            if self._gen_queue:
+                n = len(self._gen_queue)
+                self._gen_queue.clear()
+                self.append_log(f"停止したため待機中のタスク {n} 件を破棄しました")
             self._update_generate_button()
             return
         self._merge_was_cached = False
