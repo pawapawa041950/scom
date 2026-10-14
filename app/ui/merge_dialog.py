@@ -35,6 +35,8 @@ from .window_state import bind_geometry
 # 比べるため findData() で見つからず、存在する項目が「削除済み」扱いに
 # なっていた。
 _MERGE_ITEM = "merge:"
+# 一覧の差分 LoRA 行の id を入れる item data role（マージ行は Qt.UserRole）。
+_LORA_ROLE = Qt.UserRole + 1
 
 
 def _merge_item_data(entry_id) -> str:
@@ -59,6 +61,10 @@ class MergeDialog(QDialog):
     merge_requested = Signal(object, object, object, str, bool)
     # 作成済み項目の設定を上書き: entry_id + merge_requested と同じ引数
     update_requested = Signal(int, object, object, object, str, bool)
+    # キャッシュ上の差分 LoRA 項目: 上書き (id, model_a, model_b, rank, name)
+    # と削除 (id)
+    lora_update_requested = Signal(int, object, object, int, str)
+    lora_delete_requested = Signal(int)
     save_requested = Signal(object, object, object, str, bool, str)  # + filename
     # 差分から LoRA を作成: model_a, model_b, rank, name, to_cache
     # （model_a / model_b はファイル名、または入れ子マージの dict。name は
@@ -87,6 +93,8 @@ class MergeDialog(QDialog):
         self._lora_rows: list[dict] = []
         self._diff_rows: list[dict] = []
         self._entries: list[dict] = []
+        self._lora_entries: list[dict] = []   # キャッシュ上の差分 LoRA の項目
+        self._lora_built: set[int] = set()
         self._built_ids: set[int] = set()
         self._editable = True
 
@@ -192,6 +200,11 @@ class MergeDialog(QDialog):
         self.lbl_dirty.setStyleSheet("color: #c80;")
         self.lbl_dirty.hide()
         right.addWidget(self.lbl_dirty)
+        self.lbl_lora_info = QLabel("")
+        self.lbl_lora_info.setWordWrap(True)
+        self.lbl_lora_info.setStyleSheet("color: #2a6fb0;")
+        self.lbl_lora_info.hide()
+        right.addWidget(self.lbl_lora_info)
 
         self.lbl_info = QLabel("")
         right.addWidget(self.lbl_info)
@@ -300,11 +313,17 @@ class MergeDialog(QDialog):
         self.set_entries([], set())
 
     # ----- left pane -------------------------------------------------------
-    def set_entries(self, entries: list[dict], built_ids: set[int]) -> None:
-        """Rebuild the entry list (called by the main window on any change)."""
+    def set_entries(self, entries: list[dict], built_ids: set[int],
+                    lora_entries: list[dict] = (),
+                    lora_built: set[int] = ()) -> None:
+        """Rebuild the entry list (called by the main window on any change).
+        マージモデルの下に、キャッシュ上の差分 LoRA の項目も並べる。"""
         self._entries = [dict(e) for e in entries]
         self._built_ids = set(built_ids)
+        self._lora_entries = [dict(e) for e in lora_entries]
+        self._lora_built = set(lora_built)
         selected = self.selected_entry_id()
+        selected_lora = self.selected_lora_id()
         self.lst.blockSignals(True)
         self.lst.clear()
         self.lst.addItem(QListWidgetItem("＋ 新規作成"))
@@ -313,11 +332,18 @@ class MergeDialog(QDialog):
             item.setData(Qt.UserRole, int(e["id"]))
             self.lst.addItem(item)
             self.lst.setItemWidget(item, self._make_row_widget(e))
+        for e in self._lora_entries:
+            item = QListWidgetItem()
+            item.setData(_LORA_ROLE, int(e["id"]))
+            self.lst.addItem(item)
+            self.lst.setItemWidget(item, self._make_lora_row_widget(e))
         row = 0
-        if selected is not None:
-            for i in range(1, self.lst.count()):
-                if self.lst.item(i).data(Qt.UserRole) == selected:
-                    row = i
+        for i in range(1, self.lst.count()):
+            it = self.lst.item(i)
+            if ((selected is not None and it.data(Qt.UserRole) == selected)
+                    or (selected_lora is not None
+                        and it.data(_LORA_ROLE) == selected_lora)):
+                row = i
         self.lst.setCurrentRow(row)
         self.lst.blockSignals(False)
         self._on_row_changed(self.lst.currentRow())
@@ -420,6 +446,58 @@ class MergeDialog(QDialog):
         h.addWidget(lbl, stretch=1)
         return w
 
+    def _make_lora_row_widget(self, entry: dict) -> QWidget:
+        """キャッシュ上の差分 LoRA の行（マージモデルの行と同じ作り）。"""
+        w = QWidget()
+        h = QHBoxLayout(w)
+        h.setContentsMargins(4, 2, 4, 2)
+        trash = QPushButton("🗑")
+        trash.setFixedWidth(28)
+        trash.setToolTip("この差分 LoRA を一覧（LoRA ウィンドウ含む）から削除し、"
+                         "メモリからも解放します")
+        trash.clicked.connect(
+            lambda *_a, lid=int(entry["id"]): self._on_lora_trash(lid))
+        mark = "●" if int(entry["id"]) in self._lora_built else "○"
+        lbl = QLabel(f"{mark} [LoRA] {entry['name']}")
+        lbl.setStyleSheet("color: #2a6fb0;")
+        lbl.setToolTip(
+            f"差分 LoRA（キャッシュ）: {merge_source_label(entry['model_a'])} − "
+            f"{merge_source_label(entry['model_b'])}／ランク {entry['rank']}\n"
+            "● = メモリ上に作成済み / ○ = 未作成（使用時に自動で作成）")
+        h.addWidget(trash)
+        h.addWidget(lbl, stretch=1)
+        return w
+
+    def selected_lora_id(self) -> Optional[int]:
+        """選択中のキャッシュ差分 LoRA 項目の id（それ以外は None）。"""
+        item = self.lst.currentItem()
+        if item is None:
+            return None
+        data = item.data(_LORA_ROLE)
+        return int(data) if data is not None else None
+
+    def select_lora(self, lora_id: int) -> None:
+        for i in range(1, self.lst.count()):
+            if self.lst.item(i).data(_LORA_ROLE) == lora_id:
+                self.lst.setCurrentRow(i)
+                return
+
+    def _lora_by_id(self, lora_id) -> Optional[dict]:
+        for e in getattr(self, "_lora_entries", []):
+            if int(e["id"]) == int(lora_id):
+                return e
+        return None
+
+    def _on_lora_trash(self, lora_id: int) -> None:
+        e = self._lora_by_id(lora_id)
+        name = e["name"] if e else str(lora_id)
+        res = QMessageBox.question(
+            self, "削除の確認",
+            f"差分 LoRA「{name}」を一覧から削除しますか？"
+            "（LoRA ウィンドウからも消えます）")
+        if res == QMessageBox.Yes:
+            self.lora_delete_requested.emit(int(lora_id))
+
     def selected_entry_id(self) -> Optional[int]:
         item = self.lst.currentItem()
         if item is None:
@@ -470,6 +548,21 @@ class MergeDialog(QDialog):
         self._refill_source_combos()
         entry_id = self.selected_entry_id()
         self._set_editable(True)
+        lora = self._lora_by_id(self.selected_lora_id()) \
+            if self.selected_lora_id() is not None else None
+        if lora is not None:
+            # 差分 LoRA の項目: モデル1・モデル2 を表示（編集して「差分を
+            # LoRA 化」で上書き更新）。
+            self._load_recipe([(lora["model_a"], 1.0), (lora["model_b"], 1.0)],
+                              "", False, [], [])
+            self.lbl_lora_info.setText(
+                f"差分 LoRA「{lora['name']}」: モデル1 − モデル2 ／ ランク "
+                f"{lora['rank']}。モデルを変更して「差分を LoRA 化（この項目を"
+                "上書き）」を押すと作り直し、古いキャッシュは破棄されます。")
+            self.lbl_lora_info.show()
+            self._refresh()
+            return
+        self.lbl_lora_info.hide()
         if entry_id is None:
             self._refresh()
             return
@@ -734,6 +827,11 @@ class MergeDialog(QDialog):
             self.btn_merge.setToolTip(
                 "表示中の構成でマージします（出力先は上の選択に従う）")
         self.btn_extract.setEnabled(len(self._displayed_recipe()[0]) == 2)
+        if (self.selected_lora_id() is not None
+                and self.rb_cache.isChecked()):
+            self.btn_extract.setText("差分を LoRA 化（この項目を上書き）")
+        else:
+            self.btn_extract.setText("差分を LoRA 化")
         dirty = entry_sel and self._is_dirty()
         self.lbl_dirty.setVisible(dirty)
 
@@ -876,13 +974,26 @@ class MergeDialog(QDialog):
             QMessageBox.warning(self, "入力不足", "同じモデル同士の差分は空です。")
             return
         la, lb = merge_source_label(a), merge_source_label(b)
-        title = ("差分から LoRA を作成しキャッシュに配置" if to_cache
+        lora = (self._lora_by_id(self.selected_lora_id())
+                if to_cache and self.selected_lora_id() is not None else None)
+        title = ("差分 LoRA を上書き" if lora is not None
+                 else "差分から LoRA を作成しキャッシュに配置" if to_cache
                  else "差分から LoRA を作成しファイルに保存")
         rank, ok = QInputDialog.getInt(
             self, title,
             f"モデル1: {la}\nモデル2: {lb}\n\n「モデル1 − モデル2」を LoRA にします。\n"
-            "ランク（大きいほど忠実、ファイルも大きい）:", 64, 1, 1024, 1)
+            "ランク（大きいほど忠実、ファイルも大きい）:",
+            int(lora["rank"]) if lora else 64, 1, 1024, 1)
         if not ok:
+            return
+        if lora is not None:
+            # 選択中の差分 LoRA 項目を上書き（名前はそのまま、変更も可）。
+            name, ok = QInputDialog.getText(
+                self, title, "LoRA ウィンドウに表示する名前:", text=lora["name"])
+            name = name.strip()
+            if ok and name:
+                self.lora_update_requested.emit(int(lora["id"]), a, b,
+                                                int(rank), name)
             return
 
         def stem(src) -> str:

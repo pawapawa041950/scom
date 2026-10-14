@@ -302,6 +302,8 @@ class MainWindow(QMainWindow):
         self._last_merge_id: Optional[int] = None   # entry used by last gen
         # 差分 LoRA（RAM キャッシュ）: {"id","name","model_a","model_b","rank"}
         self._cached_loras: list[dict] = self._load_cached_loras()
+        # バックエンドの RAM に作成済みの差分 LoRA（マージウィンドウの ●/○）。
+        self._cached_lora_built: set[int] = set()
         self._cached_lora_seq = max(
             [int(self.settings.get("cached_lora_seq", 0) or 0)]
             + [int(e["id"]) for e in self._cached_loras])
@@ -1236,10 +1238,52 @@ class MainWindow(QMainWindow):
                              "削除されています。LoRA を解除してください。")
         return name
 
+    @staticmethod
+    def _cached_lora_key(e: dict) -> str:
+        """バックエンドの差分 LoRA キャッシュのキー（ノードの _lora_key と同じ）。"""
+        return json.dumps([norm_source(e["model_a"]), norm_source(e["model_b"]),
+                           int(e["rank"])], sort_keys=True, ensure_ascii=False)
+
+    def _on_cached_lora_update_requested(self, lora_id: int, model_a, model_b,
+                                         rank: int, name: str) -> None:
+        """マージウィンドウで選んだ差分 LoRA 項目を新しい設定で作り直す。
+        古い設定のキャッシュは解放する（適用中の LoRA は新しい設定で効く）。"""
+        e = next((x for x in self._cached_loras
+                  if int(x["id"]) == int(lora_id)), None)
+        if e is None:
+            return
+        a, b = norm_source(model_a), norm_source(model_b)
+        if self._missing_files_error(
+                self._missing_merge_files([(a, 1.0), (b, 1.0)]),
+                "差分 LoRA の作成", self._merge_dlg):
+            return
+        try:
+            graph = build_extract_lora_graph(a, b, int(rank), to_cache=True)
+        except ValueError as ex:
+            QMessageBox.warning(self, "入力不足", str(ex))
+            return
+        if self.backend.is_running():
+            try:
+                self.backend.release_cached_lora(
+                    source_input(e["model_a"]), source_input(e["model_b"]),
+                    int(e["rank"]))
+            except OSError as ex:
+                self.append_log(f"メモリ解放に失敗: {ex}")
+        self._cached_lora_built.discard(int(e["id"]))
+        e.update({"name": name, "model_a": a, "model_b": b, "rank": int(rank)})
+        self.append_log(f"差分 LoRA「{name}」の設定を更新しました（古いキャッシュは破棄）")
+        self._schedule_save()
+        self._refresh_lora_dialog()
+        self._rebuild_lora_rows()
+        self._push_merge_state()
+        self._run_merge(graph, saving=False, entry_id=int(e["id"]),
+                        kind="extract_cache")
+
     def _on_cached_lora_delete(self, token: str) -> None:
         e = self._cached_lora_by_token(token)
         if e is None:
             return
+        self._cached_lora_built.discard(int(e["id"]))
         self._cached_loras = [x for x in self._cached_loras
                               if int(x["id"]) != int(e["id"])]
         if any(x["name"] == token for x in self._loras):
@@ -1255,6 +1299,7 @@ class MainWindow(QMainWindow):
         self.append_log(f"差分 LoRA「{e['name']}」をキャッシュから削除しました")
         self._schedule_save()
         self._refresh_lora_dialog()
+        self._push_merge_state()
 
     def _refresh_lora_dialog(self) -> None:
         if self._lora_dlg is None:
@@ -1318,7 +1363,9 @@ class MainWindow(QMainWindow):
         if self._merge_dlg is None:
             return
         try:
-            self._merge_dlg.set_entries(self._merges, self._merge_built_ids)
+            self._merge_dlg.set_entries(self._merges, self._merge_built_ids,
+                                        self._cached_loras,
+                                        self._cached_lora_built)
         except RuntimeError:  # underlying Qt object was deleted
             self._merge_dlg = None
 
@@ -1342,6 +1389,10 @@ class MainWindow(QMainWindow):
             config.models_root() / "loras", None)
         dlg.merge_requested.connect(self._on_merge_requested)
         dlg.update_requested.connect(self._on_merge_update_requested)
+        dlg.lora_update_requested.connect(self._on_cached_lora_update_requested)
+        dlg.lora_delete_requested.connect(
+            lambda lid: self._on_cached_lora_delete(
+                f"{CACHED_LORA_TOKEN}:{int(lid)}"))
         dlg.save_requested.connect(self._on_save_requested)
         dlg.extract_requested.connect(self._on_extract_requested)
         dlg.delete_requested.connect(self._on_merge_delete)
@@ -1555,7 +1606,11 @@ class MainWindow(QMainWindow):
                 entry["name"] = name
             self._schedule_save()
             self._refresh_lora_dialog()
-            self._run_merge(graph, saving=False, entry_id=None,
+            # マージモデルと同じく、マージウィンドウの一覧に項目として残す。
+            self._push_merge_state()
+            if self._merge_dlg is not None:
+                self._merge_dlg.select_lora(entry["id"])
+            self._run_merge(graph, saving=False, entry_id=int(entry["id"]),
                             kind="extract_cache")
             return
         self._run_merge(graph, saving=True, entry_id=None, kind="extract")
@@ -1620,6 +1675,7 @@ class MainWindow(QMainWindow):
             self.append_log(f"メモリ解放に失敗: {e}")
             return
         self._merge_built_ids.clear()
+        self._cached_lora_built.clear()
         self._push_merge_state()
         self.append_log("バックエンドのキャッシュとモデル（マージモデル・"
                         "差分 LoRA を含む）をすべて解放しました"
@@ -1638,6 +1694,13 @@ class MainWindow(QMainWindow):
             if merge_pin_key(e["models"], e["quant"], e["low_memory"],
                              e.get("loras", []), e.get("diffs", []))
             in pinned}
+        try:
+            cached = set(self.backend.cached_loras())
+            self._cached_lora_built = {
+                int(e["id"]) for e in self._cached_loras
+                if self._cached_lora_key(e) in cached}
+        except OSError:
+            pass
         self._push_merge_state()
 
     def _run_merge(self, graph: dict, saving: bool,
@@ -1698,6 +1761,9 @@ class MainWindow(QMainWindow):
         saving, entry_id, kind = getattr(self, "_merge_run_ctx",
                                          (False, None, "merge"))
         if kind == "extract_cache":
+            if entry_id is not None:
+                self._cached_lora_built.add(int(entry_id))
+                self._push_merge_state()
             self.status.showMessage("差分 LoRA をキャッシュに配置しました")
             self.append_log(
                 "2 モデルの差分から LoRA を抽出し、バックエンドのキャッシュ"
