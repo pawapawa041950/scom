@@ -737,11 +737,11 @@ class MainWindow(MergeMixin, LoraMixin, XyzMixin, QMainWindow):
                 clip_g = name
         return clip_l, clip_g
 
-    def _select_te_for_family(self, fam: str) -> bool:
-        """Select the first text encoder whose content matches ``fam``."""
+    def _select_te_for_family(self, fams: tuple[str, ...]) -> bool:
+        """Select the first text encoder whose content is one of ``fams``."""
         for i in range(self.cb_te1.count()):
             name = self.cb_te1.itemText(i)
-            if name and self._te_family(name) == fam:
+            if name and self._te_family(name) in fams:
                 self.cb_te1.setCurrentIndex(i)
                 return True
         return False
@@ -820,8 +820,8 @@ class MainWindow(MergeMixin, LoraMixin, XyzMixin, QMainWindow):
                 idx = self.cb_clip_type.findText(fam.clip_type)
                 if idx >= 0:
                     self.cb_clip_type.setCurrentIndex(idx)
-            if self._te_family(self.cb_te1.currentText()) != fam.id:
-                self._select_te_for_family(fam.id)
+            if self._te_family(self.cb_te1.currentText()) not in fam.te_families:
+                self._select_te_for_family(fam.te_families)
         if self._vae_family(self.cb_vae.currentText()) not in fam.vae_families:
             v = self._first_vae(fam.vae_families)
             if v:
@@ -842,7 +842,8 @@ class MainWindow(MergeMixin, LoraMixin, XyzMixin, QMainWindow):
             msgs.append(f"・CLIP type を '{fam.clip_type}' にしてください"
                         f"（現在: {params.clip_type}）")
         if fam.te_warning is not None:
-            matching = [t for t in params.te if self._te_family(t) == fam.id]
+            matching = [t for t in params.te
+                        if self._te_family(t) in fam.te_families]
             if fam.dual_te:
                 bad_te = len(params.te) < 2 or len(matching) < 2
             else:
@@ -876,10 +877,11 @@ class MainWindow(MergeMixin, LoraMixin, XyzMixin, QMainWindow):
     def _filter_for_preset(self, kind: str, files: list[str], preset: str) -> list[str]:
         if preset == "all":
             return files
-        # 共用ファイル（"shared" = anima/krea2 の Qwen-Image VAE）は、それを
-        # 使える系統にだけ出す（app/families.py の shared_vae）。
+        # 共用ファイル（"shared" = anima/krea2 の Qwen-Image VAE、krea2 と
+        # 判定される Qwen3-VL 4B TE）は、それを使える系統にだけ出す
+        # （app/families.py の shared_vae / te_from）。
         fam = families.get(preset)
-        allowed = set(fam.vae_families) if fam else {preset}
+        allowed = set(fam.allowed(kind)) if fam else {preset}
         root = config.models_root() / kind
         return [f for f in files
                 if modelinfo.family(kind, root / f) in allowed]
@@ -1037,13 +1039,12 @@ class MainWindow(MergeMixin, LoraMixin, XyzMixin, QMainWindow):
             self._select_preferred(self.cb_diffusion, fam.prefer)
             if self.cb_vae.count():
                 self.cb_vae.setCurrentIndex(0)
-            if self.cb_te1.count():
-                self.cb_te1.setCurrentIndex(0)
+            self._select_preferred(self.cb_te1, fam.te_prefer)
         idx = self.cb_clip_type.findText(fam.clip_type)
         if idx >= 0:
             self.cb_clip_type.setCurrentIndex(idx)
         # 初めて開いた系統の生成設定（保存値があればそちらが優先される）。
-        d = fam.first_defaults
+        d = fam.defaults_for(self.cb_diffusion.currentText())
         if "steps" in d:
             self.sp_steps.setValue(int(d["steps"]))
         if "cfg" in d:
@@ -1054,10 +1055,13 @@ class MainWindow(MergeMixin, LoraMixin, XyzMixin, QMainWindow):
             self.cb_scheduler.setCurrentText(str(d["scheduler"]))
 
     def _select_preferred(self, combo: QComboBox, prefer: tuple[str, ...]) -> None:
-        for i in range(combo.count()):
-            if any(s in combo.itemText(i).lower() for s in prefer):
-                combo.setCurrentIndex(i)
-                return
+        """First item containing ``prefer[0]``, else ``prefer[1]`` ... ,
+        else the first item."""
+        for s in prefer:
+            for i in range(combo.count()):
+                if s in combo.itemText(i).lower():
+                    combo.setCurrentIndex(i)
+                    return
         if combo.count():
             combo.setCurrentIndex(0)
 

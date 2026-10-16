@@ -4,6 +4,7 @@ from __future__ import annotations
 import hashlib
 import os
 import urllib.error
+import urllib.parse
 import urllib.request
 from pathlib import Path
 from typing import Callable, Optional
@@ -18,8 +19,48 @@ class DownloadError(RuntimeError):
     pass
 
 
+def _hf_token() -> Optional[str]:
+    """Hugging Face のアクセストークン（ゲート付きリポジトリ用）。環境変数
+    HF_TOKEN / HUGGING_FACE_HUB_TOKEN、無ければ huggingface-cli login が
+    保存したファイル（HF_HOME/token、既定 ~/.cache/huggingface/token）。"""
+    for var in ("HF_TOKEN", "HUGGING_FACE_HUB_TOKEN"):
+        tok = (os.environ.get(var) or "").strip()
+        if tok:
+            return tok
+    home = os.environ.get("HF_HOME") or os.path.join(
+        os.path.expanduser("~"), ".cache", "huggingface")
+    try:
+        tok = Path(home, "token").read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+    return tok or None
+
+
+def _request(url: str, headers: dict, method: Optional[str] = None
+             ) -> urllib.request.Request:
+    req = urllib.request.Request(url, headers=headers, method=method)
+    host = (urllib.parse.urlsplit(url).hostname or "").lower()
+    if host == "huggingface.co" or host.endswith(".huggingface.co"):
+        tok = _hf_token()
+        if tok:
+            # unredirected: リダイレクト先（署名付き URL の CDN）には送らない。
+            req.add_unredirected_header("Authorization", f"Bearer {tok}")
+    return req
+
+
+def _http_error_message(url: str, e: urllib.error.HTTPError) -> str:
+    if e.code in (401, 403) and "huggingface.co" in url:
+        repo = "/".join(urllib.parse.urlsplit(url).path.split("/")[1:3])
+        return (f"ダウンロードが拒否されました（HTTP {e.code}）。"
+                f"https://huggingface.co/{repo} は利用規約への同意が必要な"
+                "リポジトリです。ブラウザで同意したうえで、環境変数 HF_TOKEN に"
+                "アクセストークンを設定する（または huggingface-cli login）か、"
+                "手動でダウンロードして models フォルダに置いてください。")
+    return f"failed to download {url}: {e}"
+
+
 def _content_length(url: str) -> Optional[int]:
-    req = urllib.request.Request(url, headers=_UA, method="HEAD")
+    req = _request(url, _UA, method="HEAD")
     try:
         with urllib.request.urlopen(req, timeout=30) as resp:
             cl = resp.headers.get("Content-Length")
@@ -55,7 +96,7 @@ def download(url: str, dest: Path,
         headers["Range"] = f"bytes={have}-"
         mode = "ab"
 
-    req = urllib.request.Request(url, headers=headers)
+    req = _request(url, headers)
     try:
         with urllib.request.urlopen(req, timeout=60) as resp:
             if have and resp.status != 206:
@@ -78,6 +119,8 @@ def download(url: str, dest: Path,
                     f.write(chunk)
                     downloaded += len(chunk)
                     on_progress(downloaded, total)
+    except urllib.error.HTTPError as e:
+        raise DownloadError(_http_error_message(url, e)) from e
     except urllib.error.URLError as e:
         raise DownloadError(f"failed to download {url}: {e}") from e
 

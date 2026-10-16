@@ -368,13 +368,20 @@ class ComfyBackend:
         if sys.platform == "win32":
             creationflags = subprocess.CREATE_NO_WINDOW  # type: ignore[attr-defined]
 
+        # 子の標準出力は UTF-8 に固定して UTF-8 で読む（既定だと双方 cp932
+        # になり、cp932 に無い文字を含むファイル名などのログで子が例外を
+        # 出す／親の読み取りスレッドが落ちる）。
+        env = dict(os.environ, PYTHONIOENCODING="utf-8")
         self._proc = subprocess.Popen(
             cmd,
             cwd=str(comfy),
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             bufsize=1,
+            env=env,
             creationflags=creationflags,
         )
         # scom が死んだら OS にバックエンドを道連れにさせる + 次回起動時の

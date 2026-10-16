@@ -283,6 +283,7 @@ class ModelsDialog(QDialog):
         if not items:
             return
         self._selector.btn_download.setEnabled(False)
+        self._failures: list[str] = []
 
         self._thread = QThread(self)
         self._worker = _DownloadWorker(self._paths, items)
@@ -298,9 +299,16 @@ class ModelsDialog(QDialog):
 
     def _on_file_failed(self, filename: str, msg: str) -> None:
         self._selector.mark_file_failed(filename)
+        if "cancelled" not in msg:
+            self._failures.append(f"{filename}:\n{msg}")
 
     def _on_finished(self) -> None:
         self._selector.btn_download.setEnabled(True)
+        if self._failures:
+            QMessageBox.warning(self, "ダウンロード",
+                                "ダウンロードできなかったファイルがあります:\n\n"
+                                + "\n\n".join(self._failures))
+            self._failures = []
 
     def closeEvent(self, event) -> None:  # noqa: N802
         if self._thread is not None and self._thread.isRunning():

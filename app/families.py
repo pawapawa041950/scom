@@ -1,7 +1,7 @@
 """Model families (表示モデル): everything scom needs to know per family.
 
 A *family* is an image-model architecture scom supports (anima, krea2,
-Qwen-Image 2.1, SDXL ...). Its files are recognised from their safetensors
+Qwen-Image 2.1, FLUX.3, SDXL ...). Its files are recognised from their safetensors
 headers in :mod:`app.modelinfo`; this module is the single table of what each
 family *requires* and *prefers*, so the UI, generation pre-flight checks, XYZ
 cell alignment, LLM prompt style and the download presets all read the same
@@ -40,6 +40,9 @@ class Family:
     dual_te: bool = False
     # True: anima/krea2 共通の Qwen-Image VAE（modelinfo.SHARED）も使える。
     shared_vae: bool = False
+    # 他系統と判定される text encoder も使える（FLUX.3 は krea2 と同じ
+    # Qwen3-VL 4B を使うので、その TE は krea2 と判定される）。
+    te_from: tuple[str, ...] = ()
     # False: 既定の clip_type 以外でも、他の系統専用の type でなければ可
     # （anima: stable_diffusion 等の汎用 type で動く）。
     strict_clip: bool = True
@@ -48,9 +51,15 @@ class Family:
     vae_warning: Optional[str] = None
     # モデル選択の既定: 名前にこれを含む diffusion を優先する。
     prefer: tuple[str, ...] = ()
+    # 同じく text encoder（1 個目）の既定。空なら一覧の先頭。
+    te_prefer: tuple[str, ...] = ()
     # 表示モデルを初めて開いたときの生成設定（steps / cfg / sampler /
     # scheduler）。保存済みの設定があればそちらが優先。
     first_defaults: dict = field(default_factory=dict)
+    # diffusion のファイル名（小文字）に含まれる文字列ごとの上書き:
+    # ((部分文字列, {steps/cfg/...}), ...)。最初に一致したものを使う。
+    # 蒸留版と非蒸留版で steps / cfg が大きく違う系統用（FLUX.3）。
+    variant_defaults: tuple[tuple[str, dict], ...] = ()
     llm_style: str = STYLE_NATURAL
     # 「設定…」の必須モデル一式: (表示名, [ファイル名 ...])。ファイルは
     # bootstrap/models.py のマニフェストにある名前。
@@ -60,6 +69,29 @@ class Family:
     def vae_families(self) -> tuple[str, ...]:
         """VAE として受け付ける判定結果。"""
         return (self.id, SHARED) if self.shared_vae else (self.id,)
+
+    @property
+    def te_families(self) -> tuple[str, ...]:
+        """text encoder として受け付ける判定結果。"""
+        return (self.id,) + self.te_from
+
+    def allowed(self, kind: str) -> tuple[str, ...]:
+        """``kind``（models/ のフォルダ名）のファイルとして受け付ける判定結果。"""
+        if kind == "vae":
+            return self.vae_families
+        if kind == "text_encoders":
+            return self.te_families
+        return (self.id,)
+
+    def defaults_for(self, diffusion: str) -> dict:
+        """first_defaults に、diffusion の名前に合う variant_defaults を重ねたもの。"""
+        d = dict(self.first_defaults)
+        n = (diffusion or "").lower()
+        for sub, over in self.variant_defaults:
+            if sub in n:
+                d.update(over)
+                break
+        return d
 
 
 # 表示モデルのドロップダウンの並び順。先頭が既定（不明時の移行先）。
@@ -104,6 +136,26 @@ FAMILIES: tuple[Family, ...] = (
             "qwen_image_2.1_vae_bf16.safetensors",
             "qwen3vl_8b_int8_convrot.safetensors",
             "taeqi2_1.safetensors",
+        )),),
+    ),
+    Family(
+        id=modelinfo.FLUX3, title="FLUX.3", clip_type="flux3",
+        te_from=(modelinfo.KREA2,),   # Qwen3-VL 4B（krea2 と共通）
+        te_warning=("・Text encoder に FLUX.3 用（Qwen3-VL 4B）を選択して"
+                    "ください（未取得なら「設定…」からダウンロード）"),
+        vae_warning=("・VAE に FLUX.3 用（flux2-vae）を選択してください"),
+        # 蒸留版（_sd_）を優先。公式の既定: 蒸留版 16 steps・ガイダンス無し、
+        # Base 50 steps・CFG 3.5（いずれも euler / simple）。
+        prefer=("_sd_",),
+        te_prefer=("qwen3vl_4b_int8", "qwen3vl_4b"),
+        first_defaults={"steps": 50, "cfg": 3.5, "sampler": "euler",
+                        "scheduler": "simple"},
+        variant_defaults=(("_sd_", {"steps": 16, "cfg": 1.0}),),
+        downloads=(("FLUX.3 Klein 必須モデル int8convrot（要 HF 認証）", (
+            "flux3_image_klein_sd_int8_convrot.safetensors",
+            "qwen3vl_4b_int8_convrot.safetensors",
+            "flux2-vae.safetensors",
+            "taef2.safetensors",
         )),),
     ),
     Family(

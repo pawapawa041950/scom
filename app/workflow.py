@@ -32,6 +32,8 @@ CLIP_TYPES_SINGLE = [
     "ltxv", "pixart", "cosmos", "lumina2", "hidream", "chroma",
     # Qwen-Image family. krea2 = Krea-2 (Qwen3-VL text encoder).
     "qwen_image", "krea2",
+    # FLUX.3（Qwen3-VL 4B text encoder。ComfyUI v0.41 以上）。
+    "flux3",
 ]
 CLIP_TYPES_DUAL = ["sdxl", "sd3", "flux", "hunyuan_video", "hidream"]
 

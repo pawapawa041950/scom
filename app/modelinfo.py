@@ -1,4 +1,4 @@
-"""Identify a model file's family (anima / krea2 / qwen21 / sdxl) from its
+"""Identify a model file's family (anima / krea2 / qwen21 / flux3 / sdxl) from its
 safetensors header.
 
 Files stay where ComfyUI already keeps them (``models/<kind>/``). To decide
@@ -10,12 +10,15 @@ downloaded under any name is still sorted correctly.
 Signatures (confirmed against the real published files):
   * text encoder: a vision tower (``visual``/``vision`` keys) -> Qwen3-VL:
     merger/hidden dim 2560 -> krea2 (4B), 4096 -> qwen21 (8B);
-    hidden dim 1024 -> anima (Qwen3 0.6B).
+    hidden dim 1024 -> anima (Qwen3 0.6B). FLUX.3 uses the same Qwen3-VL 4B
+    as krea2, so its TE is reported as krea2 (families.py lets flux3 use it).
   * diffusion:    top-level keys ``txtfusion``/``tmlp``/``tproj`` -> krea2
     (~12B DiT); ``txt_in.text_norm`` -> qwen21 (Qwen-Image 2.1, 7B);
-    top-level ``net`` -> anima. Param count is the fallback.
+    top-level ``net`` -> anima; ``content_mode_blocks`` +
+    ``single_stream_modulations`` -> flux3. Param count is the fallback.
   * vae:          the Qwen-Image VAE is shared by anima/krea2; Qwen-Image 2.1
-    has its own 64ch/16x RGBA VAE (Wan2.2 layout, temporal kernel 1).
+    has its own 64ch/16x RGBA VAE (Wan2.2 layout, temporal kernel 1);
+    the FLUX.2 VAE (32ch, ``bn`` latent BatchNorm) -> flux3; kl-f8 (4ch) -> sdxl.
 
 Results are cached per (path, size, mtime) so repeated preset switches don't
 re-read headers.
@@ -30,6 +33,7 @@ from typing import Optional
 ANIMA = "anima"
 KREA2 = "krea2"
 QWEN21 = "qwen21"   # Qwen-Image 2.1（7B DiT / Qwen3-VL 8B TE / 専用 64ch VAE）
+FLUX3 = "flux3"     # FLUX.3（DiT / Qwen3-VL 4B TE = krea2 と同じ / FLUX.2 VAE）
 SDXL = "sdxl"
 SHARED = "shared"   # anima/krea2 共通（Qwen-Image VAE）。sdxl には含まれない。
 OTHER = "other"     # アーキテクチャは特定できたが、どのプリセットでも使えない
@@ -46,6 +50,13 @@ _HEADER_MAX = 100_000_000
 _cache: dict[str, tuple[int, float, str]] = {}
 _cache_loaded = False
 _CACHE_NAME = "model_families.json"
+# 判定規則を変えたら上げ、_stale() に「結果が変わり得る判定」を足す
+# （それだけ読み直す。全部捨てると LoRA 数百本の読み直しになるうえ、
+# 判定待ちの間は XYZ の LoRA 候補が絞り込まれない）。
+# 2: FLUX.3 対応（FLUX.2 VAE が sdxl、FLUX.3 本体が unknown、FLUX.3 の
+#    LoRA が other と判定されていた）。
+_CACHE_VERSION = 2
+_VERSION_KEY = "__version__"
 
 
 def _cache_path() -> Optional[Path]:
@@ -70,13 +81,27 @@ def _load_cache() -> None:
         return
     if not isinstance(data, dict):
         return
+    version = data.get(_VERSION_KEY)
     for k, v in data.items():
         if (isinstance(v, list) and len(v) == 3
                 and isinstance(v[2], str)):
+            if version != _CACHE_VERSION and _stale(str(k), v[2], version):
+                continue
             try:
                 _cache[str(k)] = (int(v[0]), float(v[1]), v[2])
             except (TypeError, ValueError):
                 continue
+
+
+def _stale(path: str, fam: str, version) -> bool:
+    """古い版で判定した結果のうち、今の規則だと変わり得るもの。"""
+    if not isinstance(version, int) or version < 2:
+        parts = {s.lower() for s in Path(path).parts}
+        if fam in (UNKNOWN, OTHER):
+            return True
+        if "vae" in parts and fam == SDXL:
+            return True
+    return False
 
 
 def _save_cache() -> None:
@@ -86,8 +111,9 @@ def _save_cache() -> None:
     try:
         p.parent.mkdir(parents=True, exist_ok=True)
         tmp = p.with_suffix(".tmp")
-        tmp.write_text(json.dumps({k: list(v) for k, v in _cache.items()},
-                                  ensure_ascii=False),
+        data: dict = {_VERSION_KEY: _CACHE_VERSION}
+        data.update({k: list(v) for k, v in _cache.items()})
+        tmp.write_text(json.dumps(data, ensure_ascii=False),
                        encoding="utf-8")
         tmp.replace(p)
     except OSError:
@@ -217,6 +243,17 @@ def _classify_lora(h: dict, keys: list[str]) -> str:
             return KREA2
         return UNKNOWN
 
+    # FLUX.3: モード別ブロック（content_mode_blocks / txt_mode_blocks）と
+    # attn_out / mlp_in / mlp_out。FLUX.1/2 の single_blocks は linear1/2。
+    if any(m in norm_all for m in ("content_mode_blocks", "txt_mode_blocks",
+                                   "single_stream_modulations")):
+        return FLUX3
+    for k in keys:
+        norm = k.replace(".", "_")
+        if "single_blocks_" in norm and any(
+                m in norm for m in ("_attn_out_", "_mlp_in_", "_mlp_out_")):
+            return FLUX3
+
     if "double_blocks" in norm_all or "single_blocks" in norm_all:
         return OTHER  # Flux / HunyuanVideo 系（kohya 名）
 
@@ -242,9 +279,16 @@ def _classify_header(kind: str, h: dict) -> str:
         return _classify_lora(h, keys)
 
     if kind == "vae":
-        # kl-f8 (SD/SDXL) VAE: quant_conv / decoder.conv_in が特徴。
-        if "post_quant_conv.weight" in h or "decoder.conv_in.weight" in h:
+        # FLUX.2 VAE: 32ch の潜在 + 潜在を正規化する BatchNorm（bn.*）。
+        conv_in = (h.get("decoder.conv_in.weight") or {}).get("shape") or []
+        if "bn.running_mean" in h or (len(conv_in) == 4 and conv_in[1] == 32):
+            return FLUX3
+        # kl-f8 (SD/SDXL) VAE: 4ch の潜在（quant_conv / decoder.conv_in）。
+        if "post_quant_conv.weight" in h or (len(conv_in) == 4
+                                             and conv_in[1] == 4):
             return SDXL
+        if len(conv_in) == 4:
+            return OTHER  # FLUX.1 / SD3（16ch）などの 2D VAE
         # Qwen-Image 2.1 VAE: Wan2.2 配置（upsamples 二段）で出力ヘッドが
         # 時間カーネル 1 の RGBA（ComfyUI sd.py と同じ判定）。16 倍圧縮・
         # 64ch なので anima/krea2 の Qwen-Image VAE とは互換が無い。
@@ -305,6 +349,9 @@ def _classify_header(kind: str, h: dict) -> str:
         # （20B の Qwen-Image は txt_norm がトップレベル）。
         if "txt_in.text_norm.weight" in h:
             return QWEN21
+        # FLUX.3（ComfyUI model_detection と同じ鍵）。
+        if {"content_mode_blocks", "single_stream_modulations"} <= prefixes:
+            return FLUX3
         if "net" in prefixes:
             return ANIMA
         # SD/SDXL U-Net（単体ファイル / フルチェックポイントの両形式）。
@@ -329,7 +376,10 @@ def _filename_family(kind: str, name: str) -> str:
     n = name.lower()
     q21 = any(s in n for s in ("qwen_image_2.1", "qwen_image_2_1",
                                "qwen-image-2.1", "qwen_image2.1"))
+    flux = "flux3" in n or "flux.3" in n or "flux-3" in n
     if kind == "vae":
+        if "flux2" in n or "flux.2" in n or "flux-2" in n or flux:
+            return FLUX3
         if "sdxl" in n or "sd_xl" in n:
             return SDXL
         if q21:
@@ -339,6 +389,8 @@ def _filename_family(kind: str, name: str) -> str:
         return SDXL
     if q21:
         return QWEN21
+    if flux and kind != "text_encoders":
+        return FLUX3
     if kind == "text_encoders" and ("clip_l" in n or "clip_g" in n):
         return SDXL
     if "krea2" in n or "krea-2" in n:
@@ -417,7 +469,7 @@ def is_checkpoint(path: Path) -> bool:
 
 
 def family(kind: str, path: Path) -> str:
-    """Return 'anima' | 'krea2' | 'qwen21' | 'sdxl' | 'shared' | 'other' |
+    """Return 'anima' | 'krea2' | 'qwen21' | 'flux3' | 'sdxl' | 'shared' | 'other' |
     'unknown' for the model file.
 
     Reads the safetensors header (cached by size+mtime); falls back to the

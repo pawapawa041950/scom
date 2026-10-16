@@ -25,6 +25,13 @@ KREA_BASE = "https://huggingface.co/Comfy-Org/Krea-2/resolve/main"
 # （非商用）。ComfyUI v0.37.0 以上が必要。
 QWEN21_BASE = "https://huggingface.co/Comfy-Org/Qwen-Image-2.1/resolve/main"
 PE_BASE = QWEN21_BASE
+# FLUX.3 Image Klein（Black Forest Labs, ComfyUI 用の再パッケージ）。HF の
+# ゲート付きリポジトリなので、利用規約に同意したアカウントのトークンが要る
+# （downloader が HF_TOKEN / huggingface-cli のトークンを使う）。ライセンスは
+# FLUX Kommunity License（非商用 + 条件付きで出力の商用利用可）。TE（Qwen3-VL
+# 4B）は Apache-2.0。ComfyUI v0.41 以上が必要。
+FLUX3_BASE = ("https://huggingface.co/black-forest-labs/"
+              "flux-3-image-klein-comfy/resolve/main")
 
 
 @dataclass
@@ -41,6 +48,11 @@ _FIELDS = ("kind", "filename", "url", "size", "required")
 
 def _krea(kind: str, filename: str, size: int) -> "ModelFile":
     return ModelFile(kind, filename, f"{KREA_BASE}/{kind}/{filename}",
+                     size, required=False)
+
+
+def _flux3(kind: str, filename: str, size: int) -> "ModelFile":
+    return ModelFile(kind, filename, f"{FLUX3_BASE}/{kind}/{filename}",
                      size, required=False)
 
 
@@ -105,6 +117,32 @@ DEFAULT_MODELS: list[ModelFile] = [
     ModelFile("vae_approx", "taeqi2_1.safetensors",
               "https://huggingface.co/madebyollin/taeqi2_1/resolve/main/"
               "taeqi2_1.safetensors", 30_591_264, required=False),
+
+    # --- FLUX.3 Image Klein (all optional, gated) ----------------------------
+    # _sd_ = 蒸留版（16 steps・ガイダンス無し）、それ以外 = Base（50 steps・
+    # CFG 3.5）。int8 convrot は FP8 の無い RTX 30 系以前でも動く。
+    _flux3("diffusion_models", "flux3_image_klein_sd_int8_convrot.safetensors",
+           5_827_874_779),
+    _flux3("diffusion_models", "flux3_image_klein_sd_bf16.safetensors",
+           11_097_404_512),
+    _flux3("diffusion_models", "flux3_image_klein_int8_convrot.safetensors",
+           5_807_427_339),
+    _flux3("diffusion_models", "flux3_image_klein_bf16.safetensors",
+           11_076_957_072),
+    # Text encoder: Qwen3-VL-4B-Instruct（CLIP type "flux3"）。krea2 の
+    # qwen3vl_4b_* と同じモデルなので、そちらがあればそれも使える。
+    _flux3("text_encoders", "qwen3vl_4b_int8_convrot.safetensors",
+           4_858_559_240),
+    # VAE: FLUX.2 の autoencoder（Comfy-Org 版はゲート無し）。BFL 版とは
+    # ヘッダだけ数 KB 違う同一の重みなので、サイズは確認しない（size=0）。
+    ModelFile("vae", "flux2-vae.safetensors",
+              "https://huggingface.co/Comfy-Org/flux2-dev/resolve/main/"
+              "split_files/vae/flux2-vae.safetensors", 0, required=False),
+    # 生成中プレビュー用の小型 VAE（madebyollin/taef2, MIT）。起動時に
+    # taef2_decoder.safetensors へ変換する（taesd.py）。
+    ModelFile("vae_approx", "taef2.safetensors",
+              "https://huggingface.co/madebyollin/taef2/resolve/main/"
+              "taef2.safetensors", 10_723_524, required=False),
 
     # --- 生成中プレビュー用の小型 VAE（models/vae_approx。任意）-------------
     # ComfyUI（--preview-method taesd）がファイル名の先頭で探す。無い系統は

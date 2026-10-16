@@ -81,6 +81,11 @@ def _dequant(patcher, key):
     """Return the dequantized weight for ``key`` (any source quant format)."""
     weight, _set_func, convert_func = comfy.model_patcher.get_key_weight(
         patcher.model, key)
+    if not isinstance(weight, torch.Tensor):
+        # Module config stored in the file as a uint8 JSON tensor but kept
+        # decoded on the module (FLUX.3 "...comfy_attention.config"): take
+        # the encoded tensor from the state dict; it is copied as-is.
+        return patcher.model_state_dict(key)[key]
     if convert_func is not None:
         weight = convert_func(weight, inplace=False)
     # A source that ComfyUI has (partly) loaded for sampling can have weights
@@ -165,10 +170,11 @@ _INT4_QUANT_GROUP = 64  # scale group of the packed int4 (convrot_w4a4) layout
 # The default int4 mode is a mix: the second/output matmul of each attention
 # and MLP (down/output projections) measured the highest int4 weight error on
 # anima (0.16-0.29 vs 0.15 elsewhere) and stays int8. Names cover anima
-# (output_proj/layer2), krea2 (wo/down) and Qwen-Image 2.1 (img_mlp.out);
-# q/k/v/up/gate go int4. "int4_convrot_full" skips this exemption (smallest
+# (output_proj/layer2), krea2 (wo/down), Qwen-Image 2.1 (img_mlp.out) and
+# FLUX.3 (attn_out/mlp_out); q/k/v/up/gate go int4. "int4_convrot_full" skips this exemption (smallest
 # file; big models only).
-_INT4_KEEP_INT8 = ("output_proj", "o_proj", "layer2", "wo", "down", "out")
+_INT4_KEEP_INT8 = ("output_proj", "o_proj", "layer2", "wo", "down", "out",
+                   "attn_out", "mlp_out")
 
 
 def _int4_output_side(layer):

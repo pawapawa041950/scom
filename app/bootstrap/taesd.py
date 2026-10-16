@@ -2,7 +2,8 @@
 
 ComfyUI (``--preview-method taesd``) decodes the in-progress latents with a
 tiny autoencoder it finds in ``models/vae_approx`` by name prefix, e.g.
-``taeqi2_1_decoder.*`` for Qwen-Image 2.1. When the file for a model family is
+``taeqi2_1_decoder.*`` for Qwen-Image 2.1 and ``taef2_decoder.*`` for FLUX.3
+(FLUX.2 latents). When the file for a model family is
 missing it falls back to the coarse latent2rgb preview, so these files are
 optional.
 
@@ -13,6 +14,10 @@ decoder (``madebyollin/taeqi2_1``: ``taeqi2_1.safetensors``, keys
 to ``N+1`` (verified: all 67 tensors line up by name and shape). The rewrite
 below only renames keys and copies the raw tensor bytes, so it needs neither
 torch nor safetensors (the GUI app bundles neither).
+
+``madebyollin/taef2`` (FLUX.2 / FLUX.3) ships the same combined layout and
+ComfyUI's ``DecoderFlux2`` has the same leading clamp, so the same +1 rename
+applies (verified: all 79 tensors line up).
 """
 from __future__ import annotations
 
@@ -24,6 +29,14 @@ VAE_APPROX = "vae_approx"   # config.MODEL_DIRS のキー（models/vae_approx）
 
 TAEQI21_COMBINED = "taeqi2_1.safetensors"
 TAEQI21_DECODER = "taeqi2_1_decoder.safetensors"
+TAEF2_COMBINED = "taef2.safetensors"
+TAEF2_DECODER = "taef2_decoder.safetensors"
+
+# (combined file, decoder file ComfyUI looks for, label for the log)
+_COMBINED = (
+    (TAEQI21_COMBINED, TAEQI21_DECODER, "Qwen-Image 2.1"),
+    (TAEF2_COMBINED, TAEF2_DECODER, "FLUX.3"),
+)
 
 
 def _read_header(path: Path) -> tuple[dict, int]:
@@ -73,15 +86,16 @@ def ensure_preview_decoders(models_root: Path, log=None) -> None:
     """Create the decoder-only files ComfyUI's previews need from the
     downloaded combined files (cheap no-op once done)."""
     folder = Path(models_root) / VAE_APPROX
-    src, dst = folder / TAEQI21_COMBINED, folder / TAEQI21_DECODER
-    if not src.is_file():
-        return
-    if dst.is_file() and dst.stat().st_mtime >= src.stat().st_mtime:
-        return
-    try:
-        n = extract_taeqi21_decoder(src, dst)
-        if log:
-            log(f"Qwen-Image 2.1 のプレビュー用デコーダを準備しました（{n} テンソル）")
-    except (OSError, ValueError, KeyError) as e:
-        if log:
-            log(f"プレビュー用デコーダの準備に失敗しました: {e}")
+    for combined, decoder, label in _COMBINED:
+        src, dst = folder / combined, folder / decoder
+        if not src.is_file():
+            continue
+        if dst.is_file() and dst.stat().st_mtime >= src.stat().st_mtime:
+            continue
+        try:
+            n = extract_taeqi21_decoder(src, dst)
+            if log:
+                log(f"{label} のプレビュー用デコーダを準備しました（{n} テンソル）")
+        except (OSError, ValueError, KeyError) as e:
+            if log:
+                log(f"{label} のプレビュー用デコーダの準備に失敗しました: {e}")

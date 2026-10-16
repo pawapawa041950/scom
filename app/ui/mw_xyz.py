@@ -399,7 +399,8 @@ class XyzMixin:
             return replace(p, te=[clip_l, clip_g], clip_type=family.clip_type,
                            vae=vae)
 
-        te_ok = (len(p.te) == 1 and self._te_family(p.te[0]) == fam)
+        te_ok = (len(p.te) == 1
+                 and self._te_family(p.te[0]) in family.te_families)
         clip_ok = families.clip_ok(family, p.clip_type)
         vae_ok = self._vae_family(p.vae) in family.vae_families
         if te_ok and clip_ok and vae_ok:
@@ -407,7 +408,7 @@ class XyzMixin:
         te = list(p.te)
         if not te_ok:
             for name in self._all_models.get("text_encoders", []):
-                if self._te_family(name) == fam:
+                if self._te_family(name) in family.te_families:
                     te = [name]
                     break
             else:
