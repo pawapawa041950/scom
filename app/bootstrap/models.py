@@ -100,6 +100,24 @@ DEFAULT_MODELS: list[ModelFile] = [
     _qwen21("text_encoders", "qwen3vl_8b_bf16.safetensors", 17_534_334_616),
     # 専用 VAE（64ch・16 倍圧縮・RGBA）。anima/krea2 の VAE とは非互換。
     _qwen21("vae", "qwen_image_2.1_vae_bf16.safetensors", 675_509_688),
+    # 生成中のプレビュー用の小型 VAE（madebyollin/taeqi2_1, MIT）。起動時に
+    # ComfyUI が読める taeqi2_1_decoder.safetensors へ変換する（taesd.py）。
+    ModelFile("vae_approx", "taeqi2_1.safetensors",
+              "https://huggingface.co/madebyollin/taeqi2_1/resolve/main/"
+              "taeqi2_1.safetensors", 30_591_264, required=False),
+
+    # --- 生成中プレビュー用の小型 VAE（models/vae_approx。任意）-------------
+    # ComfyUI（--preview-method taesd）がファイル名の先頭で探す。無い系統は
+    # 簡易表示（latent2rgb）になるだけ。
+    # anima / krea2: Qwen-Image VAE（Wan 2.1 系の潜在表現）用 LightTAE
+    # （lightx2v/Autoencoders, Apache-2.0）。
+    ModelFile("vae_approx", "lighttaew2_1.safetensors",
+              "https://huggingface.co/lightx2v/Autoencoders/resolve/main/"
+              "lighttaew2_1.safetensors", 45_274_004, required=False),
+    # SDXL: TAESDXL のデコーダ（madebyollin/taesdxl, MIT）。
+    ModelFile("vae_approx", "taesdxl_decoder.safetensors",
+              "https://huggingface.co/madebyollin/taesdxl/resolve/main/"
+              "taesdxl_decoder.safetensors", 4_895_612, required=False),
 
     # --- プロンプト整形 LLM (Qwen-Image 2.1 Prompt Enhancer, T2I) ----------------
     # Qwen3.5-VL 9B の微調整モデル（int8 convrot, Comfy-Org 再パッケージ）。

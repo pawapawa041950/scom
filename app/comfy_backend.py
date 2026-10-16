@@ -196,6 +196,8 @@ def write_extra_model_paths(paths: config.AppPaths) -> Path:
         "    text_encoders/\n"
         "    llm/\n"
         "  loras: loras/\n"
+        # ライブプレビュー用の小型 VAE（--preview-method taesd が参照）。
+        "  vae_approx: vae_approx/\n"
         f"  custom_nodes: {nodes_dir.as_posix()}\n"
     )
     out = paths.user_data / "extra_model_paths.yaml"
@@ -313,6 +315,8 @@ class ComfyBackend:
 
         config.ensure_model_dirs()
         extra_paths = write_extra_model_paths(self.paths)
+        from .bootstrap.taesd import ensure_preview_decoders
+        ensure_preview_decoders(self.paths.models, log)
         self._reap_stale_backend(log)
         self.port = _free_port(self.port)
 
@@ -323,7 +327,10 @@ class ComfyBackend:
             "--port", str(self.port),
             "--extra-model-paths-config", str(extra_paths),
             "--output-directory", str(self.paths.user_data / "output"),
-            "--preview-method", "auto",  # stream latent previews over the ws
+            # 途中経過プレビュー: 小型 VAE（models/vae_approx）があればそれで
+            # 実際の絵に近い表示に、無い系統は従来どおりの簡易表示（auto と
+            # 同じ latent2rgb）にフォールバックする。
+            "--preview-method", "taesd",
             "--disable-auto-launch",
             # ComfyUI v0.36+ は NVMe を検出すると重みをディスク直読み
             # （fast_disk）で扱うが、Windows でこの経路は text encoder の
@@ -335,6 +342,8 @@ class ComfyBackend:
             # ファイルロックが無くなり、残留/多重起動時の「Database is
             # locked」とその待ちが起きない。
             "--database-url", "sqlite:///:memory:",
+            # 有料の API（partner）ノードは使わないので読み込まない（v0.38+）。
+            "--disable-partner-nodes",
         ]
         if self.use_ck_attention:
             # 対応可否は設定を ON にした時点で確認済み（setup.ck_attention_available）。

@@ -543,6 +543,47 @@ except Exception:  # noqa: BLE001 - only int8_rowwise files are affected
     logging.exception("scom: failed to patch int8_rowwise support")
 
 
+def _patch_lighttae_preview():
+    """Live previews with lighttaew2_1 (anima / krea2: Wan 2.1 latents).
+
+    The sampler hands previewers the normalized latent (process_in space),
+    but ComfyUI loads lighttaew2_1 with no latent scaling, i.e. it expects
+    the raw VAE latent: previews came out washed out (measured: mean abs
+    diff 27.9 vs the real VAE decode, 1.9 after converting back). Convert
+    with the model's latent format first, for this decoder only.
+    """
+    import latent_preview
+    orig = latent_preview.get_previewer
+    if getattr(orig, "_scom_lighttae", False):
+        return
+
+    def get_previewer(device, latent_format):
+        previewer = orig(device, latent_format)
+        if (previewer is None
+                or getattr(latent_format, "taesd_decoder_name", None) != "lighttaew2_1"
+                or not isinstance(previewer, latent_preview.TAEHVPreviewerImpl)):
+            return previewer
+        model = getattr(getattr(previewer, "taesd", None), "first_stage_model", None)
+        if getattr(model, "latent_format", "?") is not None:
+            return previewer      # a decoder that already scales (e.g. taew2_1)
+        decode = previewer.decode_latent_to_preview
+
+        def decode_raw(x0):
+            return decode(latent_format.process_out(x0))
+
+        previewer.decode_latent_to_preview = decode_raw
+        return previewer
+
+    get_previewer._scom_lighttae = True
+    latent_preview.get_previewer = get_previewer
+
+
+try:
+    _patch_lighttae_preview()
+except Exception:  # noqa: BLE001 - previews only; generation is unaffected
+    logging.exception("scom: failed to patch lighttae previews")
+
+
 class ScomMergeModel:
     """Materialize a weighted average of N diffusion models in main memory."""
 

@@ -19,26 +19,32 @@ from .. import config
 from ..bootstrap import models as models_mod
 
 # Quick-select presets: which files a button ticks for a given setup.
+# 各プリセットの末尾は生成中プレビュー用の小型 VAE（models/vae_approx）。
 PRESET_ANIMA = [
     "anima-base-v1.0.safetensors",
     "qwen_image_vae.safetensors",
     "qwen_3_06b_base.safetensors",
+    "lighttaew2_1.safetensors",
 ]
 PRESET_KREA2 = [
     "krea2_turbo_int8_convrot.safetensors",
     "qwen_image_vae.safetensors",
     "qwen3vl_4b_fp8_scaled.safetensors",
+    "lighttaew2_1.safetensors",
 ]
-# Qwen-Image 2.1: DiT int8 + Qwen3-VL 8B int8 + 専用 VAE（合計約 17.3 GB）。
+# Qwen-Image 2.1: DiT int8 + Qwen3-VL 8B int8 + 専用 VAE（合計約 17.3 GB）
+# + 生成中プレビュー用の小型 VAE（30 MB）。
 PRESET_QWEN21 = [
     "qwen_image_2.1_int8_convrot.safetensors",
     "qwen_image_2.1_vae_bf16.safetensors",
     "qwen3vl_8b_int8_convrot.safetensors",
+    "taeqi2_1.safetensors",
 ]
-# WAI はフル SDXL チェックポイント（VAE/CLIP 内蔵）なので本体のみ。VAE/CLIP は
-# モデル内蔵を使うため別途ダウンロードしない。
+# WAI はフル SDXL チェックポイント（VAE/CLIP 内蔵）なので本体（+ プレビュー
+# 用の小型 VAE）のみ。VAE/CLIP はモデル内蔵を使うため別途ダウンロードしない。
 PRESET_SDXL = [
     "waiIllustriousSDXL_v170.safetensors",
+    "taesdxl_decoder.safetensors",
 ]
 # プロンプト整形 LLM（任意）。本体 + 公式システムプロンプト。
 PRESET_PROMPT_LLM = [

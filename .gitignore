@@ -29,6 +29,7 @@ models/diffusion_models/*
 models/vae/*
 models/text_encoders/*
 models/llm/*
+models/vae_approx/*
 !models/**/.gitkeep
 *.safetensors
 *.ckpt

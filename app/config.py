@@ -26,7 +26,9 @@ MODEL_EXTENSIONS = (".safetensors", ".sft", ".ckpt", ".pt", ".gguf", ".bin")
 # "llm" はプロンプト整形用の LLM 置き場（app/prompt_llm.py）。ComfyUI には
 # text_encoders の追加パスとして見せる（CLIPLoader で読むため）が、scom の
 # Text encoder 候補には出さない。
-MODEL_DIRS = ("diffusion_models", "vae", "text_encoders", "loras", "llm")
+# vae_approx: ComfyUI のライブプレビュー用の小型 VAE（app/bootstrap/taesd.py）。
+MODEL_DIRS = ("diffusion_models", "vae", "text_encoders", "loras", "llm",
+              "vae_approx")
 
 
 def base_dir() -> Path:

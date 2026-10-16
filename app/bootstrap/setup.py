@@ -27,19 +27,20 @@ LogCb = Callable[[str], None]
 # Pin ComfyUI to a specific release tag for reproducible installs. The short
 # /archive/<ref>.zip form resolves tags, branches, and commit SHAs alike, so
 # SCOM_COMFYUI_REF can be overridden with any of them (e.g. "master").
-# v0.37.0 (2026-09-20): Qwen-Image 2.1（7B DiT / Qwen3-VL 8B / 64ch VAE）の
-# Day-0 対応、comfy-kitchen 0.2.35 / comfy-aimdo 0.5.5。v0.35.1 からの
-# scom 関連の差分は、v0.36 で入った fast_disk（NVMe 検出時のディスク直読み）
-# が Windows で TE 読み込み時に落ちるため --disable-fast-disk を付けたこと
-# （comfy_backend.py）。--use-ck-attention、TextGenerate、量子化 API は同じ。
-COMFYUI_REF = os.environ.get("SCOM_COMFYUI_REF", "v0.37.0")
+# v0.41.1 (2026-10-15): Flux3-image 対応、Qwen-Image 2.1 の安定化・高速化と
+# 小型プレビュー VAE（taeqi2_1）、Qwen3.5 LLM の高速化、comfy-kitchen 0.2.37 /
+# comfy-aimdo 0.5.6。scom が使う起動オプション・量子化レイアウト・LoRA /
+# モデル読み込みの内部 API・TextGenerate の本文出力は v0.37.0 と同じ。
+# fast_disk（v0.36〜。Windows で TE 読み込み時に落ちた）は引き続き無効化
+# （comfy_backend.py の --disable-fast-disk）。
+COMFYUI_REF = os.environ.get("SCOM_COMFYUI_REF", "v0.41.1")
 COMFYUI_ZIP = f"https://github.com/comfyanonymous/ComfyUI/archive/{COMFYUI_REF}.zip"
 
 # Bump when a newer ComfyUI is required (e.g. for a new model architecture such
 # as Krea-2). Changing this re-fetches ComfyUI and reinstalls its deps on
 # machines that were provisioned with an older copy. Tied to the pinned ref so
 # the provisioned version is self-documenting.
-COMFYUI_MARKER = os.environ.get("SCOM_COMFYUI_MARKER", "v0.37.0")
+COMFYUI_MARKER = os.environ.get("SCOM_COMFYUI_MARKER", "v0.41.1")
 
 # Fixed (non-model) steps, in order: (step_id, title).
 # Technical names (uv / PyTorch / ComfyUI) are kept in English by request.
