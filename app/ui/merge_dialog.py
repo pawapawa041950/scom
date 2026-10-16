@@ -23,6 +23,7 @@ from PySide6.QtWidgets import (
     QPushButton, QVBoxLayout, QWidget,
 )
 
+from .. import families
 from ..workflow import (
     entry_ref_ids, is_merge_spec, merge_source_file, merge_source_label,
     merge_spec_from_entry, norm_source,
@@ -907,17 +908,16 @@ class MergeDialog(QDialog):
         # その誤差が乗る（入れ子にする内側は量子化なしが望ましい）。
         self.lbl_nested_warn.setVisible(any(
             is_merge_spec(n) and n.get("quant") for n in sources))
-        self.lbl_warn.setVisible(
-            len(fams & {"anima", "krea2", "qwen21", "sdxl"}) > 1)
+        self.lbl_warn.setVisible(len(fams & set(families.IDS)) > 1)
         # LoRA family check: a LoRA of another family (or of an unsupported
         # architecture, "other") has no keys to fold into this model.
-        known = fams & {"anima", "krea2", "qwen21", "sdxl"}
+        known = fams & set(families.IDS)
         bad = False
         if known:
             for n, _s in self.lora_entries():
                 lf = self._lora_family(n)
-                if lf == "other" or (lf in ("anima", "krea2", "qwen21", "sdxl")
-                                     and lf not in known):
+                if lf == families.OTHER or (families.is_family(lf)
+                                            and lf not in known):
                     bad = True
         self.lbl_lora_warn.setVisible(bad)
 

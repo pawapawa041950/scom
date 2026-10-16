@@ -27,7 +27,7 @@ import re
 from pathlib import Path
 from typing import Callable, Optional
 
-from . import config
+from . import config, families
 
 LLM_KIND = "llm"   # config.MODEL_DIRS のキー（models/llm）
 SUFFIX_NATURAL = ".system_prompt.txt"
@@ -37,13 +37,13 @@ SUFFIX_TAGS = ".system_prompt_tags.txt"
 LLM_SEED = 42
 MAX_LENGTH = 6144   # 思考ブロック込みの上限トークン。PE の答えは通常数百。
 
-STYLE_NATURAL = "natural"
-STYLE_TAGS = "tags"
-_TAG_PRESETS = {"anima", "sdxl"}
+STYLE_NATURAL = families.STYLE_NATURAL
+STYLE_TAGS = families.STYLE_TAGS
 
 
 def style_for_preset(preset: str) -> str:
-    return STYLE_TAGS if preset in _TAG_PRESETS else STYLE_NATURAL
+    """表示モデルの系統ごとの書き方（タグ列 / 自然文。app/families.py）。"""
+    return families.llm_style(preset)
 
 
 def is_pe_model(llm_file: str) -> bool:

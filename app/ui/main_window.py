@@ -3,266 +3,48 @@ from __future__ import annotations
 
 import json
 import random
-import re
 from pathlib import Path
 from typing import Optional
 
 from PySide6.QtCore import (
-    Qt, QThread, Signal, QObject, QRegularExpression, QTimer, QEvent, QPoint,
+    QEvent, QRegularExpression, Qt, QThread, QTimer, QUrl,
 )
-from PySide6.QtCore import QUrl
 from PySide6.QtGui import (
-    QBrush, QColor, QCursor, QDesktopServices, QImage, QPixmap,
-    QRegularExpressionValidator, QTextCharFormat, QTextCursor, QTextFormat,
+    QBrush, QColor, QDesktopServices, QImage, QPixmap,
+    QRegularExpressionValidator,
 )
 from PySide6.QtWidgets import (
-    QApplication, QComboBox, QDoubleSpinBox, QFormLayout, QFrame,
-    QGridLayout, QGroupBox, QHBoxLayout, QLabel, QLineEdit, QMainWindow,
-    QMessageBox, QPlainTextEdit, QProgressBar, QPushButton, QSizePolicy,
-    QSpinBox, QSplitter, QStackedWidget, QVBoxLayout, QWidget, QCheckBox,
+    QCheckBox, QComboBox, QDoubleSpinBox, QFormLayout, QGridLayout,
+    QGroupBox, QHBoxLayout, QLabel, QLineEdit, QMainWindow, QMessageBox,
+    QPlainTextEdit, QProgressBar, QPushButton, QSizePolicy, QSpinBox,
+    QSplitter, QStackedWidget, QVBoxLayout, QWidget,
 )
 
-from .. import (config, settings, metadata, modelinfo, prompt_llm,
-                prompt_presets, xyz)
+from .. import (config, families, settings, metadata, modelinfo, prompt_llm,
+                prompt_presets)
 from .. import lora as lora_meta
 from . import ansi_log
 from .widgets import FlowLayout, GrowingTextEdit, WideComboBox
-from ..comfy_backend import ComfyBackend, BackendError, Progress
+from ..comfy_backend import ComfyBackend, Progress
 from ..workflow import (
-    GenParams, build_extract_lora_graph, build_graph, build_merge_graph,
-    cached_lora_spec, entry_ref_ids, format_merge_source, is_cached_lora,
-    merge_source_files,
-    lora_label, merge_spec_from_entry, replace_merge_spec,
-    merge_pin_key, merge_recipe, merge_source_file, merge_source_label,
-    norm_source, source_input,
-    SAMPLERS, SCHEDULERS, CLIP_TYPES_SINGLE, CLIP_TYPES_DUAL, DEFAULT_NEGATIVE,
+    CLIP_TYPES_DUAL, CLIP_TYPES_SINGLE, DEFAULT_NEGATIVE, SAMPLERS,
+    SCHEDULERS, GenParams, build_graph, format_merge_source, is_cached_lora,
+    lora_label, merge_source_file,
 )
-
-MAX_SEED = 2**63 - 1
-
-# LoRA トリガーワードをプロンプト欄に挿入したときの区別用マーキング。
-# 挿入した文字範囲に専用の文字書式（背景色 + token プロパティ）を付け、
-# 見た目（背景ハイライト）とロジック（token による区間追跡）の両方で
-# 元のプロンプトと区別する。token を持つ区間はユーザーが編集しても書式が
-# 残るので、編集後のワードごとまとめて削除できる。
-_LORA_TOKEN_PROP = QTextFormat.UserProperty + 17
-# プロンプトに貼られた WebUI 形式の LoRA 指定 <lora:名前:強度>（強度は省略可、
-# 名前は拡張子なし・サブフォルダ有無を問わない）。貼られた時点で LoRA 設定に
-# 取り込み、文字列は欄から取り除く（_absorb_lora_tags）。
-_LORA_TAG_RE = re.compile(
-    r"<lora:([^:<>]+?)\s*(?::\s*([-+]?\d*\.?\d+))?\s*>", re.IGNORECASE)
-# 挿入部分の色（LoRA ウィンドウのトリガーワード表示に合わせた明るい配色）。
-# 暗色テーマだと本文の文字色が明るいので、明背景に合わせて文字色も濃色に。
-_LORA_INSERT_BG = QColor("#e7edf5")   # 明るい背景
-_LORA_INSERT_FG = QColor("#22456e")   # 濃い文字色
-
-# XYZ 軸 id -> その軸が支配する GenParams フィールド。モデル軸のプリセット
-# 適用時、軸で振っている値をプリセット設定で上書きしないための対応表。
-_XYZ_AXIS_FIELDS = {
-    "seed": {"seed"}, "steps": {"steps"}, "cfg": {"cfg"},
-    "sampler": {"sampler"}, "scheduler": {"scheduler"},
-    "size": {"width", "height"}, "dtype": {"weight_dtype"},
-}
-
-# Image format option that disables saving generated images to disk.
-NO_SAVE = "保存しない"
-
-# Merge entries in the diffusion combo: shown at the top of the list with a
-# colored prefix; the item data is "__merge__:<id>".
-MERGE_PREFIX = "マージモデル："
-MERGE_TOKEN = "__merge__"
-# 適用中 LoRA の name に使う、キャッシュ上の差分 LoRA の識別子
-# （"__cachedlora__:<id>"）。生成時に workflow.cached_lora_spec に展開する。
-CACHED_LORA_TOKEN = "__cachedlora__"
-# 系統ごとに必要な CLIPLoader の type（無い系統は stable_diffusion で可）。
-# krea2: Qwen3-VL 4B、qwen21: Qwen3-VL 8B（ComfyUI が 8B を検出すると
-# 自動で Qwen-Image 2.1 用のトークナイザ/テンプレートに切り替わる）。
-_FAMILY_CLIP_TYPE = {"krea2": "krea2", "qwen21": "qwen_image"}
-MERGE_COLOR = "#1a7f37"  # green tint for merge entries
+from .mw_common import (
+    MAX_SEED,
+    MERGE_COLOR,
+    MERGE_PREFIX,
+    MERGE_TOKEN,
+    NO_SAVE,
+)
+from .mw_lora import LoraMixin
+from .mw_merge import MergeMixin
+from .mw_xyz import XyzMixin
+from .workers import _GenWorker, _StartWorker, _XyzWorker
 
 
-class _StartWorker(QObject):
-    """Starts the ComfyUI backend off the UI thread."""
-    log = Signal(str)
-    done = Signal()
-    failed = Signal(str)
-
-    def __init__(self, backend: ComfyBackend):
-        super().__init__()
-        self.backend = backend
-
-    def run(self) -> None:
-        try:
-            self.backend.start(log=self.log.emit)
-            self.done.emit()
-        except BackendError as e:
-            self.failed.emit(str(e))
-        except Exception as e:  # pragma: no cover - defensive
-            self.failed.emit(f"unexpected error: {e}")
-
-
-class _GenWorker(QObject):
-    progress = Signal(Progress)
-    preview = Signal(bytes)
-    cached = Signal(list)  # node ids served from the backend output cache
-    timing = Signal(float)  # 純粋な推論(サンプリング)時間 [秒]
-    done = Signal(list)    # list[bytes]
-    failed = Signal(str)
-    status = Signal(str)   # 前処理（プロンプト整形）の状況
-    # LLM 整形: (元プロンプト, 整形後, キャッシュ命中か)
-    rewritten = Signal(str, str, bool)
-    # 整形後に組み直したグラフ（メタデータ保存用に本体へ戻す）
-    prepared = Signal(object, dict)
-
-    def __init__(self, backend: ComfyBackend, graph: dict,
-                 params: Optional[GenParams] = None,
-                 user_data: Optional[Path] = None):
-        super().__init__()
-        self.backend = backend
-        self.graph = graph
-        self.params = params      # None = graph をそのまま実行（マージ等）
-        self.user_data = user_data
-        self._cancel = False
-
-    def cancel(self) -> None:
-        self._cancel = True
-
-    def _prepare(self) -> dict:
-        """LLM 整形が指定されていればプロンプトを書き換えてグラフを組み直す。"""
-        p = self.params
-        if p is None or not p.llm_file:
-            return self.graph
-        self.status.emit(f"プロンプトを LLM で整形中… ({p.llm_file})")
-        text, cached = prompt_llm.rewrite(
-            self.backend, p.llm_file, p.prompt, p.llm_style,
-            self.user_data or config.AppPaths().user_data,
-            cancel=lambda: self._cancel)
-        if text:
-            p.prompt_original = p.prompt
-            p.prompt = text
-        self.rewritten.emit(p.prompt_original, p.prompt, cached)
-        graph = build_graph(p)
-        self.prepared.emit(p, graph)
-        return graph
-
-    def run(self) -> None:
-        try:
-            graph = self._prepare()
-            images = self.backend.generate(
-                graph,
-                on_progress=self.progress.emit,
-                on_preview=self.preview.emit,
-                cancel=lambda: self._cancel,
-                on_cached=self.cached.emit,
-                on_timing=self.timing.emit,
-            )
-            self.done.emit(images)
-        except BackendError as e:
-            self.failed.emit(str(e))
-        except Exception as e:  # pragma: no cover - defensive
-            self.failed.emit(f"unexpected error: {e}")
-
-
-class _XyzWorker(QObject):
-    """Runs the XYZ plot cells sequentially off the UI thread.
-
-    セル単位のエラーは placeholder (None) にして続行するが、最初のセルで
-    失敗した場合は設定不備とみなして全体を中止する。
-    """
-    progress = Signal(Progress)
-    preview = Signal(bytes)
-    timing = Signal(float)          # セルごとの純粋な推論時間 [秒]
-    cell_done = Signal(int, int)    # finished count, total
-    cell_image = Signal(int, bytes)  # grid index, png (直後の逐次保存用)
-    cell_error = Signal(int, str)   # grid index, message
-    done = Signal(object)           # {grid_index: png bytes | None}
-    failed = Signal(str)
-
-    def __init__(self, backend: ComfyBackend, jobs: list):
-        super().__init__()
-        self.backend = backend
-        self.jobs = jobs  # list[(grid_index, graph)]
-        self._cancel = False
-
-    def cancel(self) -> None:
-        self._cancel = True
-
-    def run(self) -> None:
-        results: dict[int, Optional[bytes]] = {}
-        try:
-            for n, (idx, graph) in enumerate(self.jobs):
-                if self._cancel:
-                    raise BackendError("生成をキャンセルしました")
-                try:
-                    images = self.backend.generate(
-                        graph,
-                        on_progress=self.progress.emit,
-                        on_preview=self.preview.emit,
-                        cancel=lambda: self._cancel,
-                        on_timing=self.timing.emit,
-                    )
-                except BackendError as e:
-                    if self._cancel or n == 0:
-                        raise
-                    results[idx] = None
-                    self.cell_error.emit(idx, str(e))
-                else:
-                    results[idx] = images[0] if images else None
-                    if results[idx]:
-                        self.cell_image.emit(idx, results[idx])
-                self.cell_done.emit(n + 1, len(self.jobs))
-            self.done.emit(results)
-        except BackendError as e:
-            self.failed.emit(str(e))
-        except Exception as e:  # pragma: no cover - defensive
-            self.failed.emit(f"unexpected error: {e}")
-
-
-class _XyzComposeWorker(QObject):
-    """XYZ の比較グリッド画像を UI スレッド外で合成・保存する。
-
-    セルの PNG デコード → グリッド描画（QPainter on QImage は非GUIスレッド
-    可）→ PNG エンコード → （指定があれば）メタデータ付き保存、のすべてが
-    大きなグリッドでは数秒かかり、UI スレッドで行うとフリーズして見える。
-    """
-    done = Signal(object)   # {"png": bytes, "w": int, "h": int, "log": [str]}
-
-    def __init__(self, cells: list, nx: int, ny: int, nz: int,
-                 labels: list, legend: bool, margin: int,
-                 save_path, params_text: str, extra: dict, embed: bool):
-        super().__init__()
-        self._cells = cells          # list[bytes | None] (grid order)
-        self._nx, self._ny, self._nz = nx, ny, nz
-        self._labels = labels
-        self._legend = legend
-        self._margin = margin
-        self._save_path = save_path  # Path | None (None = 保存しない)
-        self._params_text = params_text
-        self._extra = extra
-        self._embed = embed
-
-    def run(self) -> None:
-        log: list[str] = []
-        images = [QImage.fromData(b) if b else None for b in self._cells]
-        grid = xyz.compose_grid(
-            images, self._nx, self._ny, self._nz,
-            self._labels[0], self._labels[1], self._labels[2],
-            draw_legend=self._legend, margin=self._margin)
-        png = xyz.qimage_png_bytes(grid)
-        if self._save_path is not None:
-            try:
-                metadata.save_with_metadata(
-                    png, self._save_path, "png", 6, self._params_text,
-                    extra=self._extra, embed=self._embed)
-                note = "メタデータ付き" if self._embed else "メタデータなし"
-                log.append(f"{self._save_path} に保存しました（{note}）")
-            except Exception as e:  # noqa: BLE001
-                log.append(f"グリッド画像の保存に失敗: {e}")
-        self.done.emit({"png": png, "w": grid.width(), "h": grid.height(),
-                        "log": log})
-
-
-class MainWindow(QMainWindow):
+class MainWindow(MergeMixin, LoraMixin, XyzMixin, QMainWindow):
     def __init__(self) -> None:
         super().__init__()
         self.setWindowTitle("scom - 画像生成")
@@ -324,7 +106,7 @@ class MainWindow(QMainWindow):
         # Per-preset (anima/krea2/qwen21/sdxl) memory of the Models + 設定 values;
         # filled from settings in _apply_settings, kept fresh in _do_save.
         self._preset_conf: dict = {}
-        self._active_preset: str = "anima"
+        self._active_preset: str = families.DEFAULT_ID
         # XYZ plot: non-modal dialog + sequential-cell worker state.
         self._xyz_dlg = None
         self._xyz_thread: Optional[QThread] = None
@@ -422,10 +204,8 @@ class MainWindow(QMainWindow):
         # that family. The Models + 設定 values are remembered per preset
         # (settings.toml "preset_conf") and restored on switch.
         self.cb_preset = WideComboBox()
-        self.cb_preset.addItem("anima", "anima")
-        self.cb_preset.addItem("krea2", "krea2")
-        self.cb_preset.addItem("qwen21", "qwen21")
-        self.cb_preset.addItem("sdxl", "sdxl")
+        for fam in families.FAMILIES:
+            self.cb_preset.addItem(fam.id, fam.id)
         self.cb_preset.setToolTip(
             "モデル・VAE・Text encoder をその系統に絞り込みます。"
             "Models と設定カテゴリの内容は系統ごとに記憶され、"
@@ -948,7 +728,7 @@ class MainWindow(QMainWindow):
         root = config.models_root() / "text_encoders"
         clip_l = clip_g = None
         for name in self._all_models.get("text_encoders", []):
-            if self._te_family(name) != "sdxl":
+            if self._te_family(name) != modelinfo.SDXL:
                 continue
             kind = modelinfo.sdxl_te_kind(root / name)
             if kind == "clip_l" and clip_l is None:
@@ -1012,15 +792,20 @@ class MainWindow(QMainWindow):
             return  # the merge recipe decides family; nothing to auto-align
         if self._diffusion_is_checkpoint():
             return  # 内蔵 VAE/CLIP を使うので系統整列(clip_l/clip_g等)は不要
-        fam = self._diffusion_family(name)
-        if fam == "sdxl":
-            # SDXL requires dual TE (clip_l + clip_g) + CLIP type 'sdxl'
-            # + kl-f8 VAE.
-            if (self.cb_clip_type.currentText() == "sdxl"
+        fam = families.get(self._diffusion_family(name))
+        if fam is not None:
+            self._align_ui_to_family(fam)
+
+    def _align_ui_to_family(self, fam: "families.Family") -> None:
+        """Make the TE / CLIP type / VAE selection usable for ``fam``: only
+        the parts that do not fit are changed (the user's other picks stay)."""
+        if fam.dual_te:
+            # SDXL: DualCLIPLoader (clip_l + clip_g) + its CLIP type + VAE.
+            if (self.cb_clip_type.currentText() == fam.clip_type
                     and self.chk_dual_te.isChecked()):
                 return
             self.chk_dual_te.setChecked(True)  # switches the CLIP list to DUAL
-            idx = self.cb_clip_type.findText("sdxl")
+            idx = self.cb_clip_type.findText(fam.clip_type)
             if idx >= 0:
                 self.cb_clip_type.setCurrentIndex(idx)
             clip_l, clip_g = self._sdxl_te_pair()
@@ -1028,109 +813,48 @@ class MainWindow(QMainWindow):
                 self.cb_te1.setCurrentText(clip_l)
             if clip_g:
                 self.cb_te2.setCurrentText(clip_g)
-            if self._vae_family(self.cb_vae.currentText()) != "sdxl":
-                v = self._first_vae(("sdxl",))
-                if v:
-                    self.cb_vae.setCurrentText(v)
-            return
-        if fam == "qwen21":
-            # Qwen-Image 2.1: CLIP type 'qwen_image' + Qwen3-VL 8B + 専用 VAE
-            # （16 倍圧縮・64ch。anima/krea2 の Qwen-Image VAE とは非互換）。
-            self.chk_dual_te.setChecked(False)
-            idx = self.cb_clip_type.findText("qwen_image")
-            if idx >= 0:
-                self.cb_clip_type.setCurrentIndex(idx)
-            self._select_te_for_family("qwen21")
-            if self._vae_family(self.cb_vae.currentText()) != "qwen21":
-                v = self._first_vae(("qwen21",))
-                if v:
-                    self.cb_vae.setCurrentText(v)
-            return
-        # Coming back from an SDXL / qwen21 setup also needs re-aligning
-        # (dual TE, CLIP type 'sdxl' or the 8B encoder would break anima/
-        # krea2 generations).
-        from_sdxl = self.cb_clip_type.currentText() in ("sdxl", "qwen_image")
-        if fam == "krea2" and (from_sdxl or not self.chk_dual_te.isChecked()):
-            # Krea-2 requires CLIP type 'krea2' and a Qwen3-VL text encoder.
-            self.chk_dual_te.setChecked(False)
-            idx = self.cb_clip_type.findText("krea2")
-            if idx >= 0:
-                self.cb_clip_type.setCurrentIndex(idx)
-            self._select_te_for_family("krea2")
-        elif fam == "anima" and from_sdxl:
-            self.chk_dual_te.setChecked(False)
-            idx = self.cb_clip_type.findText("stable_diffusion")
-            if idx >= 0:
-                self.cb_clip_type.setCurrentIndex(idx)
-            self._select_te_for_family("anima")
         else:
-            return
-        if self._vae_family(self.cb_vae.currentText()) not in ("shared", fam):
-            v = self._first_vae(("shared", fam))
+            if self.chk_dual_te.isChecked():
+                self.chk_dual_te.setChecked(False)
+            if not families.clip_ok(fam, self.cb_clip_type.currentText()):
+                idx = self.cb_clip_type.findText(fam.clip_type)
+                if idx >= 0:
+                    self.cb_clip_type.setCurrentIndex(idx)
+            if self._te_family(self.cb_te1.currentText()) != fam.id:
+                self._select_te_for_family(fam.id)
+        if self._vae_family(self.cb_vae.currentText()) not in fam.vae_families:
+            v = self._first_vae(fam.vae_families)
             if v:
                 self.cb_vae.setCurrentText(v)
 
-    def _qwen21_config_warning(self, params: GenParams) -> Optional[str]:
-        """Pre-flight check for Qwen-Image 2.1: CLIP type 'qwen_image' /
-        Qwen3-VL 8B text encoder / 専用 VAE（64ch）。"""
-        name = (merge_source_file(params.merge_models[0][0])
-                if params.merge_models else params.diffusion)
-        if self._diffusion_family(name) != "qwen21":
-            return None
-        msgs = []
-        if params.clip_type != "qwen_image":
-            msgs.append("・CLIP type を 'qwen_image' にしてください"
-                        f"（現在: {params.clip_type}）")
-        if not any(self._te_family(t) == "qwen21" for t in params.te):
-            msgs.append("・Text encoder に Qwen-Image 2.1 用（Qwen3-VL 8B）を"
-                        "選択してください（未取得なら「設定…」からダウンロード）")
-        if self._vae_family(params.vae) != "qwen21":
-            msgs.append("・VAE に Qwen-Image 2.1 用（qwen_image_2.1_vae）を"
-                        "選択してください（anima/krea2 の VAE とは非互換）")
-        if not msgs:
-            return None
-        return ("選択中のモデルは Qwen-Image 2.1 です。次を直してください:\n\n"
-                + "\n".join(msgs))
-
-    def _krea2_config_warning(self, params: GenParams) -> Optional[str]:
+    def _family_config_warning(self, params: GenParams) -> Optional[str]:
         """Pre-flight check: translate the cryptic backend mismatch into a
-        clear, actionable message before a Krea-2 run is even submitted."""
+        clear, actionable message before a run is even submitted (what each
+        family checks is defined in app/families.py)."""
         # For a merge, the family is judged from the first source model.
         name = (merge_source_file(params.merge_models[0][0])
                 if params.merge_models else params.diffusion)
-        if self._diffusion_family(name) != "krea2":
+        fam = families.get(self._diffusion_family(name))
+        if fam is None or (fam.te_warning is None and fam.vae_warning is None):
             return None
         msgs = []
-        if params.clip_type != "krea2":
-            msgs.append(f"・CLIP type を 'krea2' にしてください（現在: {params.clip_type}）")
-        if not any(self._te_family(t) == "krea2" for t in params.te):
-            msgs.append("・Text encoder に Krea-2 用（Qwen3-VL）を選択してください"
-                        "（未取得なら「設定…」からダウンロード）")
+        if fam.strict_clip and params.clip_type != fam.clip_type:
+            msgs.append(f"・CLIP type を '{fam.clip_type}' にしてください"
+                        f"（現在: {params.clip_type}）")
+        if fam.te_warning is not None:
+            matching = [t for t in params.te if self._te_family(t) == fam.id]
+            if fam.dual_te:
+                bad_te = len(params.te) < 2 or len(matching) < 2
+            else:
+                bad_te = not matching
+            if bad_te:
+                msgs.append(fam.te_warning)
+        if (fam.vae_warning is not None
+                and self._vae_family(params.vae) not in fam.vae_families):
+            msgs.append(fam.vae_warning)
         if not msgs:
             return None
-        return ("選択中のモデルは Krea-2 です。次を直してください:\n\n"
-                + "\n".join(msgs))
-
-    def _sdxl_config_warning(self, params: GenParams) -> Optional[str]:
-        """Pre-flight check for SDXL: dual CLIP (clip_l+clip_g) / CLIP type
-        'sdxl' / kl-f8 VAE — どれが欠けても生成は確実に失敗する。"""
-        name = (merge_source_file(params.merge_models[0][0])
-                if params.merge_models else params.diffusion)
-        if self._diffusion_family(name) != "sdxl":
-            return None
-        msgs = []
-        if params.clip_type != "sdxl":
-            msgs.append(f"・CLIP type を 'sdxl' にしてください（現在: {params.clip_type}）")
-        sdxl_tes = [t for t in params.te if self._te_family(t) == "sdxl"]
-        if len(params.te) < 2 or len(sdxl_tes) < 2:
-            msgs.append("・「2つ目の text encoder を使用」を ON にし、"
-                        "Text encoder 1/2 に SDXL 用（clip_l と clip_g）を"
-                        "選択してください")
-        if self._vae_family(params.vae) != "sdxl":
-            msgs.append("・VAE に SDXL 用（sdxl_vae 等）を選択してください")
-        if not msgs:
-            return None
-        return ("選択中のモデルは SDXL です。次を直してください:\n\n"
+        return (f"選択中のモデルは {fam.title} です。次を直してください:\n\n"
                 + "\n".join(msgs))
 
     def _config_warning(self, params: GenParams) -> Optional[str]:
@@ -1139,1653 +863,11 @@ class MainWindow(QMainWindow):
         # フルチェックポイントで内蔵 VAE/CLIP を使う場合は検証不要。
         if params.checkpoint and not params.vae and not params.te:
             return None
-        return (self._krea2_config_warning(params)
-                or self._qwen21_config_warning(params)
-                or self._sdxl_config_warning(params))
-
-    # ----- model merge (マージモデル) ---------------------------------------
-    def _load_merges(self) -> list[dict]:
-        """Load merge entries from settings, migrating the old single-recipe
-        keys (merge_models/merge_quant/merge_fp8/merge_low_memory)."""
-        try:
-            merges = json.loads(str(self.settings.get("merges", "[]")))
-            out = []
-            for e in merges:
-                out.append({
-                    "id": int(e["id"]),
-                    "name": str(e["name"]),
-                    "models": [(norm_source(n), float(w))
-                               for n, w in e["models"]],
-                    "quant": str(e.get("quant", "")),
-                    "low_memory": bool(e.get("low_memory", False)),
-                    "loras": [(str(n), float(s))
-                              for n, s in e.get("loras", []) or []],
-                    "diffs": [(norm_source(a), norm_source(b), float(s))
-                              for a, b, s in e.get("diffs", []) or []],
-                })
-            if out:
-                return out
-        except (ValueError, TypeError, KeyError):
-            pass
-        # Migration: a pre-multi-merge settings file with a single recipe.
-        try:
-            old = [(str(n), float(w)) for n, w in
-                   json.loads(str(self.settings.get("merge_models", "[]")))]
-        except (ValueError, TypeError):
-            old = []
-        if len(old) < 2:
-            return []
-        quant = str(self.settings.get("merge_quant", ""))
-        if not quant and self.settings.get("merge_fp8"):
-            quant = "fp8"
-        return [{"id": 1, "name": "マージモデル1", "models": old,
-                 "quant": quant,
-                 "low_memory": bool(self.settings.get("merge_low_memory", False)),
-                 "loras": [], "diffs": []}]
-
-    # ----- cached difference LoRAs ------------------------------------------
-    def _load_cached_loras(self) -> list[dict]:
-        try:
-            raw = json.loads(str(self.settings.get("cached_loras", "[]")))
-            return [{"id": int(e["id"]), "name": str(e["name"]),
-                     "model_a": norm_source(e["model_a"]),
-                     "model_b": norm_source(e["model_b"]),
-                     "rank": int(e.get("rank", 64))} for e in raw]
-        except (ValueError, TypeError, KeyError):
-            return []
-
-    def _cached_lora_by_token(self, token) -> Optional[dict]:
-        if not (isinstance(token, str)
-                and token.startswith(CACHED_LORA_TOKEN + ":")):
-            return None
-        try:
-            entry_id = int(token.split(":", 1)[1])
-        except ValueError:
-            return None
-        return next((e for e in self._cached_loras
-                     if int(e["id"]) == entry_id), None)
-
-    def _lora_display(self, name: str) -> str:
-        """Short label of an applied LoRA (file stem / cache entry name)."""
-        e = self._cached_lora_by_token(name)
-        if e is not None:
-            return f"[キャッシュ] {e['name']}"
-        if isinstance(name, str) and name.startswith(CACHED_LORA_TOKEN):
-            return "[キャッシュ] (削除済み)"
-        return Path(name).stem
-
-    def _cached_lora_items(self) -> list[dict]:
-        """LoRA ウィンドウに並べる差分 LoRA（系統はモデル1の先頭モデル）。"""
-        out = []
-        for e in self._cached_loras:
-            out.append({
-                "token": f"{CACHED_LORA_TOKEN}:{e['id']}",
-                "name": e["name"],
-                "family": self._diffusion_family(
-                    merge_source_file(e["model_a"])),
-                "desc": (f"差分: {merge_source_label(e['model_a'])} − "
-                         f"{merge_source_label(e['model_b'])}／ランク {e['rank']}"),
-            })
-        return out
-
-    def _lora_param(self, name: str):
-        """GenParams.loras の name: ファイル名、または差分 LoRA の spec。"""
-        e = self._cached_lora_by_token(name)
-        if e is not None:
-            return cached_lora_spec(e)
-        if isinstance(name, str) and name.startswith(CACHED_LORA_TOKEN):
-            raise ValueError("適用中の差分 LoRA がキャッシュ一覧から"
-                             "削除されています。LoRA を解除してください。")
-        return name
-
-    @staticmethod
-    def _cached_lora_key(e: dict) -> str:
-        """バックエンドの差分 LoRA キャッシュのキー（ノードの _lora_key と同じ）。"""
-        return json.dumps([norm_source(e["model_a"]), norm_source(e["model_b"]),
-                           int(e["rank"])], sort_keys=True, ensure_ascii=False)
-
-    def _on_cached_lora_update_requested(self, lora_id: int, model_a, model_b,
-                                         rank: int, name: str) -> None:
-        """マージウィンドウで選んだ差分 LoRA 項目を新しい設定で作り直す。
-        古い設定のキャッシュは解放する（適用中の LoRA は新しい設定で効く）。"""
-        e = next((x for x in self._cached_loras
-                  if int(x["id"]) == int(lora_id)), None)
-        if e is None:
-            return
-        a, b = norm_source(model_a), norm_source(model_b)
-        if self._missing_files_error(
-                self._missing_merge_files([(a, 1.0), (b, 1.0)]),
-                "差分 LoRA の作成", self._merge_dlg):
-            return
-        try:
-            graph = build_extract_lora_graph(a, b, int(rank), to_cache=True)
-        except ValueError as ex:
-            QMessageBox.warning(self, "入力不足", str(ex))
-            return
-        if self.backend.is_running():
-            try:
-                self.backend.release_cached_lora(
-                    source_input(e["model_a"]), source_input(e["model_b"]),
-                    int(e["rank"]))
-            except OSError as ex:
-                self.append_log(f"メモリ解放に失敗: {ex}")
-        self._cached_lora_built.discard(int(e["id"]))
-        e.update({"name": name, "model_a": a, "model_b": b, "rank": int(rank)})
-        self.append_log(f"差分 LoRA「{name}」の設定を更新しました（古いキャッシュは破棄）")
-        self._schedule_save()
-        self._refresh_lora_dialog()
-        self._rebuild_lora_rows()
-        self._push_merge_state()
-        self._run_merge(graph, saving=False, entry_id=int(e["id"]),
-                        kind="extract_cache")
-
-    def _on_cached_lora_delete(self, token: str) -> None:
-        e = self._cached_lora_by_token(token)
-        if e is None:
-            return
-        self._cached_lora_built.discard(int(e["id"]))
-        self._cached_loras = [x for x in self._cached_loras
-                              if int(x["id"]) != int(e["id"])]
-        if any(x["name"] == token for x in self._loras):
-            self._loras = [x for x in self._loras if x["name"] != token]
-            self._rebuild_lora_rows()
-        if self.backend.is_running():
-            try:
-                self.backend.release_cached_lora(
-                    source_input(e["model_a"]), source_input(e["model_b"]),
-                    int(e["rank"]))
-            except OSError as ex:
-                self.append_log(f"メモリ解放に失敗: {ex}")
-        self.append_log(f"差分 LoRA「{e['name']}」をキャッシュから削除しました")
-        self._schedule_save()
-        self._refresh_lora_dialog()
-        self._push_merge_state()
-
-    def _refresh_lora_dialog(self) -> None:
-        if self._lora_dlg is None:
-            return
-        try:
-            self._lora_dlg.rescan()
-            self._push_lora_state()
-        except RuntimeError:
-            self._lora_dlg = None
-
-    def _lora_family(self, relname: str) -> str:
-        if not relname:
-            return modelinfo.UNKNOWN
-        return modelinfo.family(
-            "loras", config.models_root() / "loras" / relname)
-
-    def _merge_family(self, entry: dict) -> str:
-        """Family of a merge entry, judged from its first source model
-        (same convention as _krea2_config_warning)."""
-        if not entry.get("models"):
-            return "unknown"
-        return self._diffusion_family(merge_source_file(entry["models"][0][0]))
-
-    def _merge_selected(self) -> bool:
-        data = self.cb_diffusion.currentData()
-        return isinstance(data, str) and data.startswith(MERGE_TOKEN)
-
-    def _selected_merge_entry(self) -> Optional[dict]:
-        data = self.cb_diffusion.currentData()
-        if not (isinstance(data, str) and data.startswith(MERGE_TOKEN)):
-            return None
-        try:
-            entry_id = int(data.split(":", 1)[1])
-        except (IndexError, ValueError):
-            return None
-        return self._merge_entry_by_id(entry_id)
-
-    def _merge_missing_refs(self, entry: dict) -> set:
-        """Ids of merges this entry uses (at any depth) that no longer exist."""
-        ids = {int(e["id"]) for e in self._merges}
-        return entry_ref_ids(entry) - ids
-
-    def _merge_broken(self, entry: dict) -> bool:
-        """削除済みのマージを（入れ子のどこかで）素材にしている項目は使用
-        不可（モデル一覧に出さず、生成・マージもしない）。"""
-        return bool(self._merge_missing_refs(entry))
-
-    def _merge_dependents(self, entry_id: int) -> list[dict]:
-        """entry_id を（入れ子のどこかで）素材にしている項目。"""
-        return [e for e in self._merges if int(e["id"]) != int(entry_id)
-                and int(entry_id) in entry_ref_ids(e)]
-
-    def _merge_entry_by_id(self, entry_id: int) -> Optional[dict]:
-        for e in self._merges:
-            if int(e["id"]) == entry_id:
-                return e
-        return None
-
-    def _push_merge_state(self) -> None:
-        """Refresh the merge window's entry list (if it is open)."""
-        if self._merge_dlg is None:
-            return
-        try:
-            self._merge_dlg.set_entries(self._merges, self._merge_built_ids,
-                                        self._cached_loras,
-                                        self._cached_lora_built)
-        except RuntimeError:  # underlying Qt object was deleted
-            self._merge_dlg = None
-
-    def _open_merge_dialog(self) -> None:
-        from .merge_dialog import MergeDialog
-        # Non-modal, at most one instance; re-opening replaces it so the model
-        # list is always current.
-        if self._merge_dlg is not None:
-            try:
-                self._merge_dlg.close()
-                self._merge_dlg.deleteLater()
-            except RuntimeError:
-                pass
-        # Parentless on purpose: a QDialog with a parent always stays on top
-        # of it, but this window should be able to go behind the main window.
-        dlg = MergeDialog(
-            self._all_models.get("diffusion_models", []),
-            self._diffusion_family,
-            config.models_root() / "diffusion_models",
-            self._all_models.get("loras", []), self._lora_family,
-            config.models_root() / "loras", None)
-        dlg.merge_requested.connect(self._on_merge_requested)
-        dlg.update_requested.connect(self._on_merge_update_requested)
-        dlg.lora_update_requested.connect(self._on_cached_lora_update_requested)
-        dlg.lora_delete_requested.connect(
-            lambda lid: self._on_cached_lora_delete(
-                f"{CACHED_LORA_TOKEN}:{int(lid)}"))
-        dlg.save_requested.connect(self._on_save_requested)
-        dlg.extract_requested.connect(self._on_extract_requested)
-        dlg.delete_requested.connect(self._on_merge_delete)
-        dlg.rename_requested.connect(self._on_merge_rename)
-        dlg.free_memory_requested.connect(self._on_free_memory)
-        self._merge_dlg = dlg
-        self._push_merge_state()
-        if self._merge_running:
-            dlg.set_merge_running(True)
-        dlg.show()
-
-    def _missing_merge_files(self, models=(), diffs=(), loras=()) -> list[str]:
-        """マージに必要なファイル（入れ子の中身・差分行・焼き込む LoRA を
-        含む）のうち、models フォルダに無いもの。"""
-        root = config.models_root()
-        mfiles, lfiles = merge_source_files(models, diffs, loras)
-        missing = sorted(f for f in mfiles
-                         if not (root / "diffusion_models" / f).is_file())
-        missing += sorted("LoRA: " + f for f in lfiles
-                          if not (root / "loras" / f).is_file())
-        return missing
-
-    def _params_missing_files(self, p: GenParams) -> list[str]:
-        """生成に使うマージモデル・差分 LoRA（キャッシュ）の元ファイルの
-        うち、見つからないもの。"""
-        missing = []
-        if p.merge_models:
-            missing += self._missing_merge_files(p.merge_models, p.merge_diffs,
-                                                 p.merge_loras)
-        for n, _w in p.loras:
-            if is_cached_lora(n):
-                missing += self._missing_merge_files(
-                    [(n["model_a"], 1.0), (n["model_b"], 1.0)])
-        return sorted(set(missing))
-
-    def _missing_files_error(self, missing: list[str], what: str,
-                             parent=None) -> bool:
-        """見つからないファイルがあればエラーを出して True（呼び出し側は中止）。"""
-        if not missing:
-            return False
-        msg = (f"{what}に必要なモデルが見つからないため中止しました:\n"
-               + "\n".join("・" + m for m in missing))
-        self.append_log("エラー: " + msg.replace("\n", " "))
-        QMessageBox.critical(parent or self, "モデルが見つかりません", msg)
-        return True
-
-    def _missing_ref_warning(self, models, diffs) -> bool:
-        """素材に削除済みのマージが含まれていたら警告して True。"""
-        missing = self._merge_missing_refs({"models": models, "diffs": diffs})
-        if missing:
-            QMessageBox.warning(
-                self._merge_dlg or self, "削除済みのマージモデル",
-                "素材に削除済みのマージモデルが含まれているため実行できません。"
-                "該当の行を別のモデルに変更してください。")
-            return True
-        return False
-
-    def _on_merge_requested(self, entries, loras, diffs, quant: str,
-                            low_memory: bool) -> None:
-        """マージ button: register a new entry and build it in backend RAM."""
-        models = [(norm_source(n), float(w)) for n, w in entries]
-        loras = [(str(n), float(s)) for n, s in loras]
-        diffs = [(norm_source(a), norm_source(b), float(s))
-                 for a, b, s in diffs]
-        if self._missing_ref_warning(models, diffs):
-            return
-        if self._missing_files_error(
-                self._missing_merge_files(models, diffs, loras), "マージ",
-                self._merge_dlg):
-            return
-        try:
-            graph = build_merge_graph(models, quant, low_memory,
-                                      merge_loras=loras, merge_diffs=diffs)
-        except ValueError as e:
-            QMessageBox.warning(self, "入力不足", str(e))
-            return
-        self._merge_seq += 1
-        entry = {"id": self._merge_seq, "name": f"マージモデル{self._merge_seq}",
-                 "models": models, "quant": str(quant),
-                 "low_memory": bool(low_memory), "loras": loras,
-                 "diffs": diffs}
-        self._merges.append(entry)
-        self._schedule_save()
-        self._apply_preset_filter()  # the new entry appears in the dropdown
-        self._push_merge_state()
-        if self._merge_dlg is not None:
-            self._merge_dlg.select_entry(entry["id"])
-        self._run_merge(graph, saving=False, entry_id=entry["id"])
-
-    def _on_save_requested(self, entries, loras, diffs, quant: str,
-                           low_memory: bool, filename: str) -> None:
-        models = [(norm_source(n), float(w)) for n, w in entries]
-        loras = [(str(n), float(s)) for n, s in loras]
-        diffs = [(norm_source(a), norm_source(b), float(s))
-                 for a, b, s in diffs]
-        if self._missing_ref_warning(models, diffs):
-            return
-        if self._missing_files_error(
-                self._missing_merge_files(models, diffs, loras), "マージ",
-                self._merge_dlg):
-            return
-        try:
-            graph = build_merge_graph(models, quant, low_memory,
-                                      save_to=filename, merge_loras=loras,
-                                      merge_diffs=diffs)
-        except ValueError as e:
-            QMessageBox.warning(self, "入力不足", str(e))
-            return
-        self._run_merge(graph, saving=True, entry_id=None)
-
-    def _release_entry_pin(self, entry: dict) -> None:
-        """この項目の（現在の設定の）マージ結果をバックエンドから解放する。"""
-        self._merge_built_ids.discard(int(entry["id"]))
-        if not self.backend.is_running():
-            return
-        try:
-            self.backend.release_merge(
-                merge_recipe(entry["models"], entry.get("loras", []),
-                             entry.get("diffs", [])),
-                entry["quant"], entry["low_memory"])
-        except OSError as e:
-            self.append_log(f"メモリ解放に失敗: {e}")
-
-    def _on_merge_update_requested(self, entry_id: int, entries, loras,
-                                   diffs, quant: str,
-                                   low_memory: bool) -> None:
-        """作成済みマージの設定を上書きして作り直す。古い設定のキャッシュは
-        解放し、この項目を素材にしている他の項目の中身（スナップショット）
-        も新しい設定に差し替える（そちらの古いキャッシュも解放）。"""
-        entry = self._merge_entry_by_id(int(entry_id))
-        if entry is None:
-            return
-        models = [(norm_source(n), float(w)) for n, w in entries]
-        loras = [(str(n), float(s)) for n, s in loras]
-        diffs = [(norm_source(a), norm_source(b), float(s))
-                 for a, b, s in diffs]
-        if self._missing_ref_warning(models, diffs):
-            return
-        if self._missing_files_error(
-                self._missing_merge_files(models, diffs, loras), "マージ",
-                self._merge_dlg):
-            return
-        dependents = self._merge_dependents(entry["id"])
-        refs = entry_ref_ids({"models": models, "diffs": diffs})
-        if int(entry["id"]) in refs or refs & {int(d["id"]) for d in dependents}:
-            QMessageBox.warning(
-                self._merge_dlg or self, "循環参照",
-                "この項目自身、またはこの項目を素材にしているマージモデルは"
-                "素材に指定できません。")
-            return
-        try:
-            graph = build_merge_graph(models, quant, low_memory,
-                                      merge_loras=loras, merge_diffs=diffs)
-        except ValueError as e:
-            QMessageBox.warning(self, "入力不足", str(e))
-            return
-        for e in [entry] + dependents:
-            self._release_entry_pin(e)
-        entry.update({"models": models, "quant": str(quant),
-                      "low_memory": bool(low_memory), "loras": loras,
-                      "diffs": diffs})
-        new_spec = merge_spec_from_entry(entry)
-        for d in dependents:
-            d["models"] = [(replace_merge_spec(n, entry["id"], new_spec), w)
-                           for n, w in d["models"]]
-            d["diffs"] = [(replace_merge_spec(a, entry["id"], new_spec),
-                           replace_merge_spec(b, entry["id"], new_spec), s)
-                          for a, b, s in d.get("diffs", [])]
-        self._schedule_save()
-        self._apply_preset_filter()
-        self._push_merge_state()
-        if self._merge_dlg is not None:
-            self._merge_dlg.select_entry(entry["id"])
-        msg = f"{entry['name']} の設定を更新しました（古いキャッシュは破棄）"
-        if dependents:
-            msg += ("。素材にしている " + "、".join(d["name"] for d in dependents)
-                    + " も新しい設定で作り直されます")
-        self.append_log(msg)
-        self._run_merge(graph, saving=False, entry_id=entry["id"])
-
-    def _on_extract_requested(self, model_a, model_b, rank: int,
-                              name: str, to_cache: bool) -> None:
-        """「差分から LoRA を作成」: model_a − model_b を低ランク近似する
-        （バックエンドの ScomExtractLora）。to_cache=True はバックエンドの RAM
-        に置いて LoRA ウィンドウに「キャッシュ」として並べ、False は
-        models/loras/<name> に保存。model_a / model_b はファイル名か入れ子
-        マージの指定（dict）。"""
-        a, b = norm_source(model_a), norm_source(model_b)
-        if self._missing_files_error(
-                self._missing_merge_files([(a, 1.0), (b, 1.0)]),
-                "差分 LoRA の作成", self._merge_dlg):
-            return
-        try:
-            graph = build_extract_lora_graph(a, b, int(rank),
-                                             "" if to_cache else name,
-                                             to_cache=to_cache)
-        except ValueError as e:
-            QMessageBox.warning(self, "入力不足", str(e))
-            return
-        if to_cache:
-            # 同じ (モデル1, モデル2, ランク) の項目は作り直さず名前だけ更新。
-            entry = next((e for e in self._cached_loras
-                          if e["model_a"] == a and e["model_b"] == b
-                          and int(e["rank"]) == int(rank)), None)
-            if entry is None:
-                self._cached_lora_seq += 1
-                entry = {"id": self._cached_lora_seq, "name": name,
-                         "model_a": a, "model_b": b, "rank": int(rank)}
-                self._cached_loras.append(entry)
-            else:
-                entry["name"] = name
-            self._schedule_save()
-            self._refresh_lora_dialog()
-            # マージモデルと同じく、マージウィンドウの一覧に項目として残す。
-            self._push_merge_state()
-            if self._merge_dlg is not None:
-                self._merge_dlg.select_lora(entry["id"])
-            self._run_merge(graph, saving=False, entry_id=int(entry["id"]),
-                            kind="extract_cache")
-            return
-        self._run_merge(graph, saving=True, entry_id=None, kind="extract")
-
-    def _on_merge_delete(self, entry_id: int) -> None:
-        entry = self._merge_entry_by_id(entry_id)
-        self._merges = [e for e in self._merges
-                        if int(e["id"]) != entry_id]
-        self._merge_built_ids.discard(entry_id)
-        # Free its pinned model from backend RAM (per-entry, via our node's
-        # management route).
-        if entry is not None and self.backend.is_running():
-            try:
-                self.backend.release_merge(
-                    merge_recipe(entry["models"], entry.get("loras", []),
-                                 entry.get("diffs", [])),
-                    entry["quant"], entry["low_memory"])
-            except OSError as e:
-                self.append_log(f"メモリ解放に失敗: {e}")
-        was_selected = (self.cb_diffusion.currentData()
-                        == f"{MERGE_TOKEN}:{entry_id}")
-        self._apply_preset_filter()
-        if was_selected:
-            # Fall back to the first regular model (after the merge entries
-            # still shown under the current preset).
-            first_regular = 0
-            for i in range(self.cb_diffusion.count()):
-                data = self.cb_diffusion.itemData(i)
-                if not (isinstance(data, str) and data.startswith(MERGE_TOKEN)):
-                    first_regular = i
-                    break
-            self.cb_diffusion.setCurrentIndex(
-                min(first_regular, self.cb_diffusion.count() - 1))
-        self._schedule_save()
-        self._push_merge_state()
-        name = entry["name"] if entry else f"id={entry_id}"
-        self.append_log(f"{name} を一覧から削除し、メモリを解放しました")
-        broken = [e["name"] for e in self._merges if self._merge_broken(e)]
-        if broken:
-            self.append_log(
-                "削除したマージモデルを素材にしている " + "、".join(broken)
-                + " は使用できなくなりました（マージウィンドウで素材を変更"
-                "すれば再び使えます）")
-
-    def _on_merge_rename(self, entry_id: int, name: str) -> None:
-        e = self._merge_entry_by_id(entry_id)
-        if e is None or not name.strip():
-            return
-        e["name"] = name.strip()
-        self._apply_preset_filter()  # dropdown labels follow the new name
-        self._schedule_save()
-        self._push_merge_state()
-
-    def _on_free_memory(self) -> None:
-        if not self._backend_ready():
-            QMessageBox.warning(self, "未準備", "バックエンドが起動していません。")
-            return
-        try:
-            self.backend.release_all_merges()
-            self.backend.free_memory()
-        except OSError as e:
-            self.append_log(f"メモリ解放に失敗: {e}")
-            return
-        self._merge_built_ids.clear()
-        self._cached_lora_built.clear()
-        self._push_merge_state()
-        self.append_log("バックエンドのキャッシュとモデル（マージモデル・"
-                        "差分 LoRA を含む）をすべて解放しました"
-                        "（次回使用時に自動で再構築されます）")
-
-    def _sync_merge_states(self) -> None:
-        """Refresh ●/○ from the backend's pin cache (the source of truth)."""
-        if not self.backend.is_running():
-            return
-        try:
-            pinned = set(self.backend.merge_pinned())
-        except OSError:
-            return
-        self._merge_built_ids = {
-            int(e["id"]) for e in self._merges
-            if merge_pin_key(e["models"], e["quant"], e["low_memory"],
-                             e.get("loras", []), e.get("diffs", []))
-            in pinned}
-        try:
-            cached = set(self.backend.cached_loras())
-            self._cached_lora_built = {
-                int(e["id"]) for e in self._cached_loras
-                if self._cached_lora_key(e) in cached}
-        except OSError:
-            pass
-        self._push_merge_state()
-
-    def _run_merge(self, graph: dict, saving: bool,
-                   entry_id: Optional[int], kind: str = "merge") -> None:
-        """Run a merge-only prompt (build in RAM / save to file / extract a
-        LoRA: ``kind`` = "merge" | "extract") off-thread."""
-        if not self._backend_ready():
-            QMessageBox.warning(
-                self, "未準備",
-                "バックエンドがまだ起動していません。起動完了後、"
-                "生成時に自動でマージされます。")
-            return
-        if self._gen_thread is not None or self._xyz_thread is not None:
-            QMessageBox.information(
-                self, "実行中",
-                "生成の完了後に実行してください（生成時に自動でマージされます）。")
-            return
-        self._last_gen_ok = False  # keep continuous mode from chaining a merge
-        self.btn_generate.setEnabled(False)
-        self.btn_cancel.setEnabled(True)
-        self.progress.setValue(0)
-        if kind in ("extract", "extract_cache"):
-            note = "2 モデルの差分から LoRA を抽出中…"
-        else:
-            note = ("マージモデルを保存中…" if saving
-                    else "マージモデルをメインメモリ上に構築中…")
-        self.status.showMessage(note)
-        self.append_log(note)
-
-        self._gen_thread = QThread(self)
-        self._gen_worker = _GenWorker(self.backend, graph)
-        self._gen_worker.moveToThread(self._gen_thread)
-        self._gen_thread.started.connect(self._gen_worker.run)
-        self._gen_worker.progress.connect(self._on_progress)
-        # NOTE: must be a bound method, not a lambda. Signals connected to a
-        # plain callable run in the EMITTING (worker) thread; only QObject
-        # bound methods get queued to the GUI thread. A lambda here executed
-        # _on_merge_done -> dialog widget updates off the GUI thread
-        # ("Cannot set parent ... different thread" warnings).
-        self._merge_run_ctx = (saving, entry_id, kind)
-        self._merge_running = True
-        self._gen_worker.progress.connect(self._on_merge_progress)
-        self._gen_worker.done.connect(self._on_merge_worker_done)
-        self._gen_worker.failed.connect(self._on_gen_failed)
-        self._gen_worker.done.connect(self._end_merge_progress)
-        self._gen_worker.failed.connect(self._end_merge_progress)
-        self._gen_worker.done.connect(self._gen_thread.quit)
-        self._gen_worker.failed.connect(self._gen_thread.quit)
-        self._gen_thread.finished.connect(self._cleanup_gen_thread)
-        self._gen_thread.start()
-        if self._merge_dlg is not None:
-            try:
-                self._merge_dlg.set_merge_running(True)
-            except RuntimeError:
-                self._merge_dlg = None
-
-    def _on_merge_worker_done(self, _images: list) -> None:
-        saving, entry_id, kind = getattr(self, "_merge_run_ctx",
-                                         (False, None, "merge"))
-        if kind == "extract_cache":
-            if entry_id is not None:
-                self._cached_lora_built.add(int(entry_id))
-                self._push_merge_state()
-            self.status.showMessage("差分 LoRA をキャッシュに配置しました")
-            self.append_log(
-                "2 モデルの差分から LoRA を抽出し、バックエンドのキャッシュ"
-                "（メインメモリ）に配置しました。LoRA ウィンドウに「キャッシュ」"
-                "として表示されます（キャッシュから消えても使用時に自動で"
-                "再作成されます）")
-            self._refresh_lora_dialog()
-            return
-        if kind == "extract":
-            self.status.showMessage("差分 LoRA を保存しました")
-            self.append_log(
-                "2 モデルの差分から LoRA を抽出し、models/loras に保存しました"
-                "（捉えた差分の割合はバックエンドのログ「scom extract」を参照）")
-            self.refresh_models()  # the new LoRA appears in the LoRA window
-            self._refresh_lora_dialog()
-            return
-        self._on_merge_done(saving, entry_id)
-
-    # NOTE: どちらも bound method で接続すること（_run_merge の NOTE 参照）。
-    def _on_merge_progress(self, p: Progress) -> None:
-        """Mirror merge progress onto the merge window's progress bar."""
-        if self._merge_dlg is None:
-            return
-        try:
-            self._merge_dlg.set_merge_progress(p.value, p.maximum, p.note)
-        except RuntimeError:
-            self._merge_dlg = None
-
-    def _end_merge_progress(self, *_a) -> None:
-        self._merge_running = False
-        if self._merge_dlg is None:
-            return
-        try:
-            self._merge_dlg.set_merge_running(False)
-        except RuntimeError:
-            self._merge_dlg = None
-
-    def _on_merge_done(self, saved: bool, entry_id: Optional[int]) -> None:
-        if entry_id is not None:
-            self._merge_built_ids.add(entry_id)
-        self._sync_merge_states()
-        if saved:
-            self.status.showMessage("マージモデルを保存しました")
-            self.append_log("マージモデルを models/diffusion_models に保存しました")
-            self.refresh_models()  # the new file appears in the dropdowns
-        else:
-            e = self._merge_entry_by_id(entry_id) if entry_id else None
-            name = e["name"] if e else "マージモデル"
-            self.status.showMessage(f"{name} を構築しました")
-            self.append_log(
-                f"{name} をメインメモリ上に構築しました"
-                "（同じ構成での生成はこのモデルを再利用します）")
-            # Building it means the user intends to generate with it.
-            idx = self.cb_diffusion.findData(f"{MERGE_TOKEN}:{entry_id}")
-            if idx >= 0:
-                self.cb_diffusion.setCurrentIndex(idx)
-        self._push_merge_state()
-
-    # ----- LoRA -------------------------------------------------------------
-    def _open_lora_dialog(self) -> None:
-        from .lora_dialog import LoraDialog
-        # Non-modal, at most one instance; re-opening replaces it so the file
-        # list is always current (parentless so it can go behind us).
-        if self._lora_dlg is not None:
-            try:
-                self._lora_dlg.close()
-                self._lora_dlg.deleteLater()
-            except RuntimeError:
-                pass
-        dlg = LoraDialog(config.models_root() / "loras",
-                         self.paths.user_data / "lora_cache",
-                         self._current_preset, None,
-                         cached_fn=self._cached_lora_items)
-        dlg.cached_delete_requested.connect(self._on_cached_lora_delete)
-        dlg.apply_requested.connect(self._on_lora_apply)
-        dlg.remove_requested.connect(self._on_lora_remove)
-        dlg.toggle_prompt_requested.connect(self._on_lora_toggle_prompt)
-        self._lora_dlg = dlg
-        self._push_lora_state()
-        self._push_lora_inserted()
-        dlg.show()
-
-    def _push_lora_state(self) -> None:
-        """Refresh the LoRA window's applied marks (if it is open)."""
-        if self._lora_dlg is None:
-            return
-        try:
-            self._lora_dlg.set_applied(
-                {e["name"]: float(e["strength"]) for e in self._loras})
-        except RuntimeError:
-            self._lora_dlg = None
-
-    def _on_lora_apply(self, name: str, strength: float) -> None:
-        for e in self._loras:
-            if e["name"] == name:
-                e["strength"] = float(strength)
-                break
-        else:
-            self._loras.append({"name": name, "strength": float(strength)})
-            self.append_log(
-                f"LoRA を適用: {self._lora_display(name)} ×{strength:g}")
-        self._rebuild_lora_rows()
-        self._push_lora_state()
-        self._schedule_save()
-
-    def _on_lora_remove(self, name: str) -> None:
-        before = len(self._loras)
-        self._loras = [e for e in self._loras if e["name"] != name]
-        if len(self._loras) != before:
-            self.append_log(f"LoRA を解除: {self._lora_display(name)}")
-        self._rebuild_lora_rows()
-        self._push_lora_state()
-        self._schedule_save()
-
-    def _on_lora_strength_changed(self, name: str, value: float) -> None:
-        for e in self._loras:
-            if e["name"] == name:
-                e["strength"] = float(value)
-        self._push_lora_state()
-        self._schedule_save()
-
-    def _on_lora_toggle_prompt(self, token: str, negative: bool,
-                               text: str) -> None:
-        """LoRA のトリガーワードをトグルする。未挿入なら挿入（区別マーク付き）、
-        挿入済みなら（ユーザー編集後でも）その区間ごと削除する。"""
-        field = self.txt_negative if negative else self.txt_prompt
-        regions = self._find_token_regions(field, token)
-        if regions:
-            self._remove_token_regions(field, regions)
-        else:
-            self._insert_token_words(field, token, text)
-        self._push_lora_inserted()
-
-    @staticmethod
-    def _plain_char_format() -> QTextCharFormat:
-        """token を持たない通常書式（区切りや以降の入力がハイライトされない
-        ようにするため）。"""
-        fmt = QTextCharFormat()
-        fmt.clearBackground()
-        return fmt
-
-    def _token_char_format(self, token: str) -> QTextCharFormat:
-        fmt = QTextCharFormat()
-        fmt.setBackground(_LORA_INSERT_BG)
-        fmt.setForeground(_LORA_INSERT_FG)
-        fmt.setProperty(_LORA_TOKEN_PROP, token)
-        return fmt
-
-    @staticmethod
-    def _find_token_regions(field, token: str) -> list[tuple[int, int]]:
-        """指定 token の文字書式を持つ連続区間 (start, end) を左から順に返す。
-        内部編集でフラグメントが分割されていても隣接分は1区間に統合する。"""
-        doc = field.document()
-        frags: list[tuple[int, int]] = []
-        block = doc.begin()
-        while block != doc.end():
-            it = block.begin()
-            while not it.atEnd():
-                frag = it.fragment()
-                if frag.isValid() and \
-                        frag.charFormat().property(_LORA_TOKEN_PROP) == token:
-                    start = frag.position()
-                    frags.append((start, start + frag.length()))
-                it += 1
-            block = block.next()
-        frags.sort()
-        regions: list[tuple[int, int]] = []
-        for s, e in frags:
-            if regions and s <= regions[-1][1]:
-                regions[-1] = (regions[-1][0], max(regions[-1][1], e))
-            else:
-                regions.append((s, e))
-        return regions
-
-    def _remove_token_regions(self, field,
-                              regions: list[tuple[int, int]]) -> None:
-        """token 区間を削除する。挿入時に付けた直後の色なしスペースと、
-        隣接する区切り ", " も1つ巻き込んで取り除き、", ," や余分な空白が
-        残らないようにする。位置ズレを避けるため右端の区間から削除する。"""
-        text = field.toPlainText()
-        cursor = field.textCursor()
-        for start, end in sorted(regions, reverse=True):
-            s, e = start, end
-            lead = text[s - 2:s] == ", "
-            # 挿入時の色なし後続スペースを巻き込む。ただし前側の区切りも
-            # 取る場合、スペースの先にユーザーの追記があるなら残す
-            # （両方消すと前後のテキストが癒着するため）。
-            if text[e:e + 1] == " " and (not lead or not text[e + 1:].strip()):
-                e += 1
-            if lead:                        # 直前の区切りを巻き込む
-                s -= 2
-            elif text[e:e + 2] == ", ":     # 先頭要素なら直後の区切りを
-                e += 2
-            cursor.setPosition(s)
-            cursor.setPosition(e, QTextCursor.KeepAnchor)
-            cursor.removeSelectedText()
-        field.setCurrentCharFormat(self._plain_char_format())
-
-    def _insert_token_words(self, field, token: str, text: str) -> None:
-        """欄末尾に、区別マーク付きでワードを追記する。
-
-        色付き区間の直後に入力すると Qt は左隣の書式（=色）を引き継ぐため、
-        区間の直後に色なしスペースを1つ置く。前側は色なしの ", " 区切りが
-        同じ役割を果たす。これで続けて追記しても色は付かない。
-        """
-        words = [w.strip() for w in text.split(",") if w.strip()]
-        if not words:
-            return
-        joined = ", ".join(words)
-        full = field.toPlainText()
-        stripped = full.rstrip()
-        cursor = field.textCursor()
-        # 末尾の余分な空白を除いてから追記する。
-        cursor.setPosition(len(stripped))
-        cursor.movePosition(QTextCursor.End, QTextCursor.KeepAnchor)
-        cursor.removeSelectedText()
-        if stripped:
-            cursor.insertText(", ", self._plain_char_format())
-        cursor.insertText(joined, self._token_char_format(token))
-        cursor.insertText(" ", self._plain_char_format())
-        field.setTextCursor(cursor)
-        # 続けて入力してもハイライトされないよう書式を通常へ戻す。
-        field.setCurrentCharFormat(self._plain_char_format())
-
-    def _active_lora_tokens(self) -> set[str]:
-        """両プロンプト欄に現在挿入されている LoRA トリガーワードの token 集合。"""
-        tokens: set[str] = set()
-        for field in (self.txt_prompt, self.txt_negative):
-            doc = field.document()
-            block = doc.begin()
-            while block != doc.end():
-                it = block.begin()
-                while not it.atEnd():
-                    frag = it.fragment()
-                    if frag.isValid():
-                        tok = frag.charFormat().property(_LORA_TOKEN_PROP)
-                        if tok:
-                            tokens.add(str(tok))
-                    it += 1
-                block = block.next()
-        return tokens
-
-    def _resolve_lora_name(self, name: str) -> Optional[str]:
-        """<lora:名前> の名前を models/loras の相対パスに解決する。拡張子や
-        サブフォルダの有無、大文字小文字、区切り文字の向きは問わない。"""
-        want = name.strip().replace("/", "\\").lower()
-        if not want:
-            return None
-        for rel in self._all_models.get("loras", []):
-            p = Path(rel)
-            if want in (rel.lower(), str(p.with_suffix("")).lower(),
-                        p.name.lower(), p.stem.lower()):
-                return rel
-        return None
-
-    def _absorb_lora_tags(self, field) -> None:
-        """欄内の <lora:名前:強度> を LoRA 設定に取り込み、文字列を取り除く
-        （WebUI の記法をそのまま貼れるように）。該当ファイルが無いものは
-        そのまま残し、一度だけログに出す。"""
-        if getattr(self, "_loading", False) or self._absorbing_lora_tags:
-            return
-        text = field.toPlainText()
-        if "<lora:" not in text.lower():
-            return
-        regions: list[tuple[int, int]] = []
-        for m in _LORA_TAG_RE.finditer(text):
-            name = m.group(1).strip()
-            rel = self._resolve_lora_name(name)
-            if rel is None:
-                if name not in self._lora_tag_warned:
-                    self._lora_tag_warned.add(name)
-                    self.append_log(
-                        f"<lora:{name}> に該当する LoRA が models/loras に"
-                        "見つかりません（文字列はそのまま残します）")
-                continue
-            try:
-                strength = float(m.group(2)) if m.group(2) else 1.0
-            except ValueError:
-                strength = 1.0
-            self.append_log(
-                f"プロンプトの <lora:{name}> を LoRA 設定に取り込みます")
-            self._on_lora_apply(rel, strength)
-            regions.append((m.start(), m.end()))
-        if not regions:
-            return
-        self._absorbing_lora_tags = True
-        try:
-            self._remove_token_regions(field, regions)
-        finally:
-            self._absorbing_lora_tags = False
-
-    def _push_lora_inserted(self) -> None:
-        """挿入済み token を LoRA ウィンドウ・カードのポップアップへ通知
-        （リンクの挿入済みハイライト更新用）。"""
-        tokens = self._active_lora_tokens()
-        if self._lora_dlg is not None:
-            try:
-                self._lora_dlg.set_inserted(tokens)
-            except RuntimeError:
-                self._lora_dlg = None
-        if self._lora_popup is not None and self._lora_popup.isVisible():
-            self._lora_popup.set_active(tokens)
-
-    # ----- LoRA card hover popup -------------------------------------------
-    def _ensure_lora_popup(self):
-        if self._lora_popup is None:
-            from .lora_dialog import TriggerWordsPopup
-            self._lora_popup = TriggerWordsPopup(self)
-            self._lora_popup.toggle_requested.connect(self._on_lora_toggle_prompt)
-            self._lora_popup.hover_changed.connect(self._on_lora_popup_hover)
-        return self._lora_popup
-
-    def _show_lora_popup(self, relname: str, anchor) -> None:
-        # 差分 LoRA のトリガーワードも LoRA ウィンドウで編集でき、token を
-        # キーに保存される（ファイルが無いので civitai の初期値は無い）。
-        pos, neg = lora_meta.effective_trigger_words(
-            relname, config.models_root() / "loras",
-            self.paths.user_data / "lora_cache")
-        popup = self._ensure_lora_popup()
-        popup.set_content(relname, pos, neg, self._active_lora_tokens())
-        if not popup.has_words():        # トリガーワードが無ければ出さない
-            popup.hide()
-            return
-        self._lora_pop_timer.stop()
-        self._lora_pop_anchor = anchor
-        # サイズは set_content で確定済み。画面内に収まる位置へクランプする
-        # （はみ出すと OS 側で再配置され、setGeometry 警告の原因になる）。
-        below = anchor.mapToGlobal(QPoint(0, anchor.height() + 2))
-        screen = (anchor.screen() or self.screen()).availableGeometry()
-        y = below.y()
-        if y + popup.height() - 1 > screen.bottom():
-            # 下にはみ出すならアンカーの上側へ回す。
-            y = anchor.mapToGlobal(QPoint(0, 0)).y() - popup.height() - 2
-        # 最終的に画面内へ確実に収める（上下・左右とも）。
-        x = max(screen.left(),
-                min(below.x(), screen.right() - popup.width() + 1))
-        y = max(screen.top(), min(y, screen.bottom() - popup.height() + 1))
-        popup.move(x, y)
-        popup.show()
-        popup.raise_()
-
-    def _on_lora_popup_hover(self, over: bool) -> None:
-        # ポップアップ上にマウスがある間は閉じない。離れたら猶予後に閉じる。
-        if over:
-            self._lora_pop_timer.stop()
-        else:
-            self._lora_pop_timer.start()
-
-    def _hide_lora_popup(self, force: bool = False) -> None:
-        """カーソルがまだカード or ポップアップ上にあれば閉じない（チップの
-        子ウィジェット＝強度スピン等の上でも Leave が飛ぶため、実際の位置で
-        判定する）。force=True は無条件で閉じる（チップ再構築時など）。"""
-        if self._lora_popup is None or not self._lora_popup.isVisible():
-            return
-        if not force:
-            gp = QCursor.pos()
-            for w in (self._lora_popup, getattr(self, "_lora_pop_anchor", None)):
-                try:
-                    if (w is not None and w.isVisible()
-                            and w.rect().contains(w.mapFromGlobal(gp))):
-                        self._lora_pop_timer.start()   # まだ上にある → 保持
-                        return
-                except RuntimeError:
-                    pass                               # チップが破棄済み
-        self._lora_popup.hide()
-        self._lora_pop_anchor = None
-
-    def _rebuild_lora_rows(self) -> None:
-        """Rebuild the applied-LoRA chips after the LoRA button (flow layout;
-        index 0 is the button itself)."""
-        self._hide_lora_popup(force=True)
-        while self._lora_flow.count() > 1:
-            item = self._lora_flow.takeAt(1)
-            w = item.widget()
-            if w is not None:
-                w.deleteLater()
-        for e in self._loras:
-            name = e["name"]
-            chip = QFrame()
-            chip.setObjectName("loraChip")
-            chip.setStyleSheet(
-                "#loraChip { border: 1px solid #666; border-radius: 4px; }")
-            # ホバーでトリガーワードのポップアップを出す（Enter/Leave を監視）。
-            # _lora_chip は常にポップアップの位置基準（子から入っても同じ場所）。
-            chip._lora_name = name
-            chip._lora_chip = chip
-            chip.installEventFilter(self)
-            h = QHBoxLayout(chip)
-            h.setContentsMargins(6, 1, 4, 1)
-            h.setSpacing(4)
-            trash = QPushButton("🗑")
-            trash.setFixedWidth(24)
-            trash.setFlat(True)
-            trash.setToolTip("この LoRA を解除")
-            trash.clicked.connect(
-                lambda *_a, n=name: self._on_lora_remove(n))
-            lbl = QLabel(self._lora_display(name))
-            cached = self._cached_lora_by_token(name)
-            lbl.setToolTip(
-                name if cached is None else
-                f"差分 LoRA（キャッシュ）: {merge_source_label(cached['model_a'])}"
-                f" − {merge_source_label(cached['model_b'])}／"
-                f"ランク {cached['rank']}")
-            spin = QDoubleSpinBox()
-            spin.setRange(-4.0, 4.0)
-            spin.setDecimals(2)
-            spin.setSingleStep(0.05)
-            spin.setValue(float(e["strength"]))
-            spin.setFixedWidth(64)
-            spin.setToolTip("LoRA の適用強度（model / clip 共通）")
-            spin.valueChanged.connect(
-                lambda v, n=name: self._on_lora_strength_changed(n, v))
-            h.addWidget(trash)
-            h.addWidget(lbl)
-            h.addWidget(spin)
-            # 子ウィジェットに直接カーソルが入ってもポップアップが出るように
-            # 同じ監視をぶら下げる（Enter はカーソル直下のウィジェットに届く）。
-            for child in (trash, lbl, spin):
-                child._lora_name = name
-                child._lora_chip = chip
-                child.installEventFilter(self)
-            self._lora_flow.addWidget(chip)
-
-    # ----- XYZ plot ---------------------------------------------------------
-    def _open_xyz_dialog(self) -> None:
-        from .xyz_dialog import XyzDialog
-        # 実行中は既存ウィンドウを前面に出すだけ（作り直すと進捗表示が切れる）。
-        if self._xyz_thread is not None and self._xyz_dlg is not None:
-            try:
-                self._xyz_dlg.show()
-                self._xyz_dlg.raise_()
-                self._xyz_dlg.activateWindow()
-                return
-            except RuntimeError:
-                self._xyz_dlg = None
-        if self._xyz_dlg is not None:
-            try:
-                self._xyz_dlg.close()
-                self._xyz_dlg.deleteLater()
-            except RuntimeError:
-                pass
-        try:
-            state = json.loads(str(self.settings.get("xyz", "{}")))
-        except (ValueError, TypeError):
-            state = {}
-        # Parentless on purpose: same as the merge window, so it can go
-        # behind the main window. Model-axis choices list merge entries
-        # first (as "マージモデル：<name>" tokens), like the main dropdown.
-        dlg = XyzDialog(self._xyz_model_choices(), state, None,
-                        rescan_fn=self._rescan_xyz_model_choices,
-                        lora_choices_fn=self._xyz_lora_choices)
-        dlg.run_requested.connect(self._on_xyz_requested)
-        dlg.cancel_requested.connect(self._on_xyz_cancel_requested)
-        # チェック状態は実行しなくても記憶する（次回開いたとき再現）。
-        # コンストラクタでの復元後に接続するので、復元自体では発火しない。
-        dlg.chk_save_cells.toggled.connect(
-            lambda c: self._persist_xyz_flag("save_cells", c))
-        dlg.chk_show_grid.toggled.connect(
-            lambda c: self._persist_xyz_flag("show_grid", c))
-        dlg.chk_save_grid.toggled.connect(
-            lambda c: self._persist_xyz_flag("save_grid", c))
-        self._xyz_dlg = dlg
-        if self._xyz_thread is not None and self._xyz_ctx is not None:
-            dlg.set_running(True, int(self._xyz_ctx.get("total", 0)))
-        dlg.set_queue(len(self._xyz_queue))
-        dlg.show()
-
-    def _xyz_model_choices(self) -> list[str]:
-        return ([MERGE_PREFIX + e["name"] for e in self._merges
-                 if not self._merge_broken(e)]
-                + self._all_models.get("diffusion_models", []))
-
-    _XYZ_CACHED_PREFIX = "[キャッシュ]"
-
-    def _xyz_lora_choices(self) -> list[str]:
-        """XYZ の LoRA 軸の候補: 表示モデルの系統に合う LoRA（判定不能も
-        含む）と差分 LoRA（キャッシュ）を "名前:1" の形で。"""
-        preset = self._current_preset()
-        root = config.models_root() / "loras"
-        out = []
-        for rel in self._all_models.get("loras", []):
-            fam = modelinfo.cached_family(root / rel)
-            if fam in (None, modelinfo.UNKNOWN, preset):
-                out.append(f"{Path(rel).with_suffix('')}:1")
-        for c in self._cached_lora_items():
-            if c["family"] in (modelinfo.UNKNOWN, preset):
-                out.append(f"{self._XYZ_CACHED_PREFIX}{c['name']}:1")
-        return out
-
-    def _resolve_xyz_lora(self, value: str):
-        """LoRA 軸の値 1 つを (GenParams.loras の name, 強度) に解決する
-        （「なし」は None）。見つからなければ ValueError。"""
-        parsed = xyz.parse_lora_value(value)
-        if parsed is None:
-            return None
-        name, strength = parsed
-        if name.startswith(self._XYZ_CACHED_PREFIX):
-            want = name[len(self._XYZ_CACHED_PREFIX):].strip()
-            for e in self._cached_loras:
-                if e["name"] == want:
-                    return cached_lora_spec(e), strength
-            raise ValueError(f"LoRA 軸: 差分 LoRA「{want}」がキャッシュ一覧に"
-                             "見つかりません")
-        rel = self._resolve_lora_name(name)
-        if rel is None:
-            raise ValueError(f"LoRA 軸: 「{name}」に該当する LoRA が "
-                             "models/loras に見つかりません")
-        return rel, strength
-
-    def _rescan_xyz_model_choices(self) -> list[str]:
-        """XYZ ウィンドウの「再スキャン」: モデルを読み直して候補を返す
-        （メイン画面のドロップダウンも同時に最新になる）。"""
-        self.refresh_models()
-        self.append_log("モデルを再スキャンしました（XYZ ウィンドウ）")
-        return self._xyz_model_choices()
-
-    def _persist_xyz_flag(self, key: str, checked: bool) -> None:
-        """XYZ ウィンドウのチェック状態だけを即座に永続化する（他の入力欄は
-        実行時にまとめて保存されるので、途中入力を上書きしないよう merge）。"""
-        try:
-            st = json.loads(str(self.settings.get("xyz", "{}")))
-            if not isinstance(st, dict):
-                st = {}
-        except (ValueError, TypeError):
-            st = {}
-        st[key] = bool(checked)
-        self.settings["xyz"] = json.dumps(st, ensure_ascii=False)
-        self._schedule_save()
-
-    def _xyz_parent(self):
-        """Message-box parent: the XYZ window if alive, else the main window."""
-        if self._xyz_dlg is not None:
-            try:
-                if self._xyz_dlg.isVisible():
-                    return self._xyz_dlg
-            except RuntimeError:
-                self._xyz_dlg = None
-        return self
-
-    def _push_xyz_running(self, running: bool, total: int = 0) -> None:
-        if self._xyz_dlg is None:
-            return
-        try:
-            self._xyz_dlg.set_running(running, total)
-            self._xyz_dlg.set_queue(len(self._xyz_queue))
-        except RuntimeError:
-            self._xyz_dlg = None
-
-    def _push_xyz_queue(self) -> None:
-        if self._xyz_dlg is None:
-            return
-        try:
-            self._xyz_dlg.set_queue(len(self._xyz_queue))
-        except RuntimeError:
-            self._xyz_dlg = None
-
-    def _on_xyz_requested(self, spec: dict, auto: bool = False) -> None:
-        """XYZ ウィンドウの「実行」。アイドルなら即開始、XYZ 実行中なら
-        押した時点の設定で組んだ実行を待機タスクとして積む（メイン画面の
-        生成ボタンと同じ流儀）。``auto`` は連続モードの自動実行（多セル
-        確認を出さずにループを続ける）。"""
-        if not self._backend_ready():
-            QMessageBox.warning(self._xyz_parent(), "未準備",
-                                "ComfyUI の準備がまだ完了していません。")
-            return
-        if self._gen_thread is not None:
-            QMessageBox.information(self._xyz_parent(), "実行中",
-                                    "生成の完了後に実行してください。")
-            return
-        run = self._prepare_xyz_run(spec, auto)
-        if run is None:
-            return
-        if self._xyz_thread is not None:
-            self._xyz_queue.append(run)
-            self.append_log(
-                f"XYZ プロットをタスクに積みました（待機 {len(self._xyz_queue)} 件, "
-                f"{run['ctx']['total']} セル, seed={run['ctx']['base'].seed}）")
-            self._push_xyz_queue()
-            return
-        self._start_xyz_run(run)
-
-    def _prepare_xyz_run(self, spec: dict, auto: bool = False
-                         ) -> Optional[dict]:
-        """押した時点のメイン画面の値と XYZ の軸から実行を組み立てる
-        （{"ctx", "jobs"}）。入力エラー・確認キャンセル時は None。"""
-        try:
-            base = self._collect_params()
-            base.batch_size = 1  # 1セル = 1枚
-            base.llm_file = ""   # XYZ は LLM 整形の対象外（セルごとに回さない）
-            if base.hires_enabled:
-                self.append_log(
-                    "XYZ: Hires fix 有効（各セルが2段生成になります）")
-            axes = [xyz.axis_by_id(a["id"]) for a in spec["axes"]]
-            values = [a["values"] for a in spec["axes"]]
-            # LoRA 軸の値（"名前:強度"）はここでファイル / 差分 LoRA に解決
-            # する（凡例ラベルは入力どおりの文字列のまま）。
-            values = [[self._resolve_xyz_lora(v) for v in vals]
-                      if a.id == "lora" else vals
-                      for a, vals in zip(axes, values)]
-            has_model_axis = any(a.id == "model" for a in axes)
-            if not has_model_axis:
-                # モデル軸があるときは全セルでモデルが差し替わるので、ベース
-                # 選択に対する系統チェックは意味を持たない（整合は下で
-                # セルごとに取る）。
-                warn = self._config_warning(base)
-                if warn:
-                    QMessageBox.warning(self._xyz_parent(),
-                                        "モデル設定を確認してください", warn)
-                    return
-            plan = xyz.plan_cells(base, axes, values)
-            if has_model_axis:
-                self._xyz_align_logged = set()
-                # 系統ごとのプリセット設定（メモリ上）。アクティブな表示モデル
-                # は現在の UI 値、他は切り替え時に退避した値を使う（設定
-                # ファイルからは読まない）。
-                confs = dict(self._preset_conf)
-                confs[self._current_preset()] = self._collect_preset_conf()
-                # 軸で振っているパラメータはプリセット値で上書きしない。
-                locked = set()
-                for a in axes:
-                    locked |= _XYZ_AXIS_FIELDS.get(a.id, set())
-                plan = [(idx, self._resolve_xyz_model_cell(p, confs, locked))
-                        for idx, p in plan]
-            jobs = [(idx, build_graph(p)) for idx, p in plan]
-        except ValueError as e:
-            QMessageBox.warning(self._xyz_parent(), "入力エラー", str(e))
-            return None
-        missing = sorted({m for _idx, p in plan
-                          for m in self._params_missing_files(p)})
-        if self._missing_files_error(missing, "XYZ プロット（マージモデル）",
-                                     self._xyz_parent()):
-            return None
-        total = len(jobs)
-        if total > 64 and not auto:
-            res = QMessageBox.question(
-                self._xyz_parent(), "確認",
-                f"{total} 枚の画像を生成します。実行しますか？")
-            if res != QMessageBox.Yes:
-                return None
-        # ウィンドウの入力状態を保存（次回開いたとき復元される）。
-        if self._xyz_dlg is not None:
-            try:
-                self.settings["xyz"] = json.dumps(
-                    self._xyz_dlg.state(), ensure_ascii=False)
-                self._schedule_save()
-            except RuntimeError:
-                self._xyz_dlg = None
-
-        # 個別保存はセル完成のたびに行う（キャンセルしても済んだ分は残る）。
-        # フォーマットは押した時点の設定で run 全体を通して固定する。
-        cell_fmt = None
-        if spec.get("save_cells"):
-            fmt = self.cb_img_format.currentText()
-            if fmt == NO_SAVE:
-                self.append_log("Format = 保存しない のため個別画像は保存しません")
-            else:
-                cell_fmt = (fmt, *self._encode_params(fmt))
-        ctx = {
-            "spec": spec,
-            "base": base,
-            "params": dict(plan),
-            # セルごとの ComfyUI グラフ（個別保存の画像に埋め込む。通常の
-            # 生成画像と同じく、そのセルを再現できるワークフローになる）。
-            "graphs": dict(jobs),
-            "nx": len(values[0]), "ny": len(values[1]), "nz": len(values[2]),
-            "total": total,
-            "cell_fmt": cell_fmt,   # (fmt, ext, quality) | None
-            "cells_saved": 0,
-            "embed": self.chk_embed_meta.isChecked(),  # run 全体で固定
-        }
-        return {"ctx": ctx, "jobs": jobs}
-
-    def _start_xyz_run(self, run: dict) -> None:
-        """組み立て済みの XYZ 実行を開始する。"""
-        from datetime import datetime
-        ctx, jobs = run["ctx"], run["jobs"]
-        # 積んだ後にマージ元のファイルが消えた場合は、この実行と待機中の
-        # XYZ タスクを止める。
-        missing = sorted({m for p in ctx["params"].values()
-                          for m in self._params_missing_files(p)})
-        if self._missing_files_error(missing, "XYZ プロット（マージモデル）",
-                                     self._xyz_parent()):
-            if self._xyz_queue:
-                n = len(self._xyz_queue)
-                self._xyz_queue.clear()
-                self.append_log(f"停止したため待機中の XYZ タスク {n} 件を破棄しました")
-                self._push_xyz_queue()
-            return
-        spec, base, total = ctx["spec"], ctx["base"], ctx["total"]
-        # ファイル名のタイムスタンプは実際に開始した時刻。
-        ctx["stamp"] = datetime.now().strftime("%Y%m%d_%H%M%S")
-        self._xyz_ctx = ctx
-        self._xyz_last_spec = spec   # 連続モードの次回実行用
-        self._xyz_last_ok = False
-        self._last_seed = base.seed
-        self._last_params = base
-        self._last_graph = None
-        self._last_gen_ok = False  # 連続モードに拾わせない
-        self.btn_generate.setEnabled(False)
-        self.btn_cancel.setEnabled(True)
-        self.progress.setValue(0)
-        self.status.showMessage(f"XYZ プロット生成中… (0/{total})")
-        self.append_log(
-            f"XYZ プロット開始: {total} セル "
-            f"({self._xyz_ctx['nx']}x{self._xyz_ctx['ny']}x"
-            f"{self._xyz_ctx['nz']}) seed={base.seed}")
-        self._push_xyz_running(True, total)
-
-        self._xyz_thread = QThread(self)
-        self._xyz_worker = _XyzWorker(self.backend, jobs)
-        self._xyz_worker.moveToThread(self._xyz_thread)
-        self._xyz_thread.started.connect(self._xyz_worker.run)
-        self._xyz_worker.progress.connect(self._on_progress)
-        self._xyz_worker.preview.connect(self._on_preview_frame)
-        self._xyz_worker.timing.connect(self._on_gen_timing)
-        self._xyz_worker.cell_done.connect(self._on_xyz_cell_done)
-        self._xyz_worker.cell_image.connect(self._on_xyz_cell_image)
-        self._xyz_worker.cell_error.connect(self._on_xyz_cell_error)
-        self._xyz_worker.done.connect(self._on_xyz_done)
-        self._xyz_worker.failed.connect(self._on_xyz_failed)
-        self._xyz_worker.done.connect(self._xyz_thread.quit)
-        self._xyz_worker.failed.connect(self._xyz_thread.quit)
-        self._xyz_thread.finished.connect(self._cleanup_xyz_thread)
-        self._xyz_thread.start()
-
-    def _resolve_xyz_model_cell(self, p: GenParams, confs: dict,
-                                locked: set) -> GenParams:
-        """モデル軸のセルを解決する: マージ展開 + プリセット適用 + 系統整合。
-
-        値が「マージモデル：<名前>」なら登録済みマージエントリのレシピに
-        展開する。次に、そのモデルの系統に対応する表示モデル（プリセット）
-        の Models + 設定値（``confs`` = メモリ上の記憶。アクティブな系統は
-        現在の UI 値）をセルへ適用する — ただし軸で振っている ``locked``
-        フィールドと seed（比較可能性のため全セル共通）は上書きしない。
-        最後に TE / CLIP / VAE の系統整合を検証し、食い違いは補正する
-        （整合が取れないと conditioning の次元不一致でバックエンドが
-        "mat1 and mat2 shapes cannot be multiplied" を出す）。
-        """
-        from dataclasses import replace
-        if p.diffusion.startswith(MERGE_PREFIX):
-            name = p.diffusion[len(MERGE_PREFIX):]
-            entry = next((e for e in self._merges if e["name"] == name), None)
-            if entry is None:
-                raise ValueError(
-                    f"モデル軸のマージモデル「{name}」が見つかりません"
-                    "（削除または名前変更されていませんか）")
-            if self._merge_broken(entry):
-                raise ValueError(
-                    f"モデル軸のマージモデル「{name}」は削除済みのマージ"
-                    "モデルを素材にしているため使用できません")
-            p = replace(p, diffusion="", checkpoint=False,
-                        merge_models=[(norm_source(n), float(w))
-                                      for n, w in entry["models"]],
-                        merge_quant=str(entry["quant"]),
-                        merge_low_memory=bool(entry["low_memory"]),
-                        merge_name=str(entry["name"]),
-                        merge_loras=[(str(n), float(s))
-                                     for n, s in entry.get("loras", [])],
-                        merge_diffs=[(norm_source(a), norm_source(b), float(s))
-                                     for a, b, s in entry.get("diffs", [])])
-            fam = self._merge_family(entry)
-        else:
-            fam = self._diffusion_family(p.diffusion)
-            # フルチェックポイント（VAE/CLIP 内蔵）はセルでも内蔵を使う。
-            # TE/VAE の系統整列は不要（むしろ内蔵を上書きしてしまう）。
-            if p.diffusion and modelinfo.is_checkpoint(
-                    config.models_root() / "diffusion_models" / p.diffusion):
-                return replace(p, checkpoint=True, vae="", te=[])
-            # 非チェックポイントのセルは内蔵フラグを必ず落とす（基準 p が
-            # チェックポイントでも、このセルは分割ロードで整列する）。
-            p = replace(p, checkpoint=False)
-
-        conf = confs.get(fam) if fam in ("anima", "krea2", "qwen21", "sdxl") else None
-        if conf:
-            p = self._apply_preset_conf_to_cell(p, conf, locked)
-            note = ("preset", fam)
-            if note not in self._xyz_align_logged:
-                self._xyz_align_logged.add(note)
-                self.append_log(
-                    f"XYZ: {fam} 系セルには表示モデル {fam} の設定を適用します")
-
-        if fam == "sdxl":
-            te_ok = (p.clip_type == "sdxl" and len(p.te) == 2
-                     and all(self._te_family(t) == "sdxl" for t in p.te))
-            vae_ok = self._vae_family(p.vae) == "sdxl"
-            if te_ok and vae_ok:
-                return p
-            clip_l, clip_g = self._sdxl_te_pair()
-            if clip_l is None or clip_g is None:
-                raise ValueError(
-                    "モデル軸に SDXL 系がありますが、SDXL 用 text encoder"
-                    "（clip_l / clip_g）が text_encoders に見つかりません。")
-            vae = p.vae if vae_ok else self._first_vae(("sdxl",))
-            if vae is None:
-                raise ValueError(
-                    "モデル軸に SDXL 系がありますが、SDXL 用 VAE が vae に"
-                    "見つかりません。")
-            self._log_xyz_align(fam, f"{clip_l} + {clip_g}", "sdxl", vae)
-            return replace(p, te=[clip_l, clip_g], clip_type="sdxl", vae=vae)
-
-        if fam not in ("anima", "krea2", "qwen21"):
-            return p
-        te_ok = (len(p.te) == 1 and self._te_family(p.te[0]) == fam)
-        want_clip = _FAMILY_CLIP_TYPE.get(fam)
-        if want_clip:
-            clip_ok = p.clip_type == want_clip
-        else:  # anima: 他系統専用の type でなければ可
-            clip_ok = p.clip_type not in ("sdxl", "krea2", "qwen_image")
-        # qwen21 は専用 VAE のみ。anima/krea2 は共通の Qwen-Image VAE。
-        vae_fams = ("qwen21",) if fam == "qwen21" else (fam, "shared")
-        vae_ok = self._vae_family(p.vae) in vae_fams
-        if te_ok and clip_ok and vae_ok:
-            return p
-        te = list(p.te)
-        if not te_ok:
-            for name in self._all_models.get("text_encoders", []):
-                if self._te_family(name) == fam:
-                    te = [name]
-                    break
-            else:
-                raise ValueError(
-                    f"モデル軸の {p.diffusion} は {fam} 系ですが、対応する "
-                    "text encoder が見つかりません。「設定…」から"
-                    "ダウンロードしてください。")
-        clip = p.clip_type if clip_ok else (want_clip or "stable_diffusion")
-        vae = p.vae if vae_ok else self._first_vae(vae_fams)
-        if vae is None:
-            raise ValueError(f"{fam} 用の VAE が見つかりません。")
-        self._log_xyz_align(fam, te[0], clip, vae)
-        return replace(p, te=te, clip_type=clip, vae=vae)
-
-    def _apply_preset_conf_to_cell(self, p: GenParams, conf: dict,
-                                   locked: set) -> GenParams:
-        """Apply a preset's remembered Models/設定 values to one XYZ cell.
-
-        モデル（diffusion / マージ指定）は軸の値、seed はベース値のまま。
-        ``locked`` のフィールド（軸で振っているもの）も触らない。ここで
-        入った値は続く系統整合チェックで検証される（古いファイル名等は
-        そこで補正される）。
-        """
-        from dataclasses import replace
-        kw = {}
-        te = [str(conf.get("te1", ""))]
-        if conf.get("dual_te") and str(conf.get("te2", "")).strip():
-            te.append(str(conf.get("te2")).strip())
-        te = [t for t in te if t]
-        if te:
-            kw["te"] = te
-        if str(conf.get("clip_type", "")):
-            kw["clip_type"] = str(conf["clip_type"])
-        if str(conf.get("vae", "")):
-            kw["vae"] = str(conf["vae"])
-        try:
-            fields = (("width", "width", int), ("height", "height", int),
-                      ("steps", "steps", int), ("cfg", "cfg", float),
-                      ("sampler", "sampler", str),
-                      ("scheduler", "scheduler", str),
-                      ("weight_dtype", "dtype", str),
-                      ("hires_enabled", "hires_enabled", bool),
-                      ("hires_scale", "hires_scale", float),
-                      ("hires_denoise", "hires_denoise", float),
-                      ("hires_steps", "hires_steps", int),
-                      ("hires_method", "hires_method", str))
-            for field, key, cast in fields:
-                if field not in locked and key in conf:
-                    kw[field] = cast(conf[key])
-        except (TypeError, ValueError):
-            pass  # 壊れた保存値: 適用できた分だけ使う
-        return replace(p, **kw)
-
-    def _log_xyz_align(self, fam: str, te_desc: str, clip: str,
-                       vae: str) -> None:
-        note = (fam, te_desc, clip, vae)
-        if note not in self._xyz_align_logged:
-            self._xyz_align_logged.add(note)
-            self.append_log(
-                f"XYZ: {fam} 系モデルには text encoder {te_desc} / "
-                f"CLIP type {clip} / VAE {vae} を使用します")
-
-    def _on_xyz_cell_done(self, done: int, total: int) -> None:
-        self.status.showMessage(f"XYZ プロット生成中… ({done}/{total})")
-        if self._xyz_dlg is not None:
-            try:
-                self._xyz_dlg.set_progress(done)
-            except RuntimeError:
-                self._xyz_dlg = None
-
-    def _on_xyz_cell_image(self, idx: int, data: bytes) -> None:
-        """個別保存 ON のとき、セルが出来た直後にその画像を保存する。"""
-        ctx = self._xyz_ctx
-        if not ctx or not ctx.get("cell_fmt") or not metadata.AVAILABLE:
-            return
-        fmt, ext, quality = ctx["cell_fmt"]
-        path = (self.paths.output_dir
-                / f"xyz_{ctx['stamp']}_c{idx:03d}.{ext}")
-        cell_text, cell_extra = self._build_metadata(
-            ctx.get("params", {}).get(idx))
-        try:
-            metadata.save_with_metadata(
-                data, path, fmt, quality, cell_text, extra=cell_extra,
-                comfy_prompt=ctx.get("graphs", {}).get(idx),
-                embed=bool(ctx.get("embed", True)))
-            ctx["cells_saved"] += 1
-        except Exception as e:  # noqa: BLE001
-            self.append_log(f"保存に失敗: {e}")
-
-    def _on_xyz_cell_error(self, idx: int, msg: str) -> None:
-        self.append_log(f"XYZ セル {idx} でエラー（グレーで継続）: {msg}")
-
-    def _on_xyz_done(self, results: dict) -> None:
-        ctx = self._xyz_ctx or {}
-        spec = ctx.get("spec", {})
-        nx, ny, nz = ctx.get("nx", 1), ctx.get("ny", 1), ctx.get("nz", 1)
-        n_cells = nx * ny * nz
-        ok = sum(1 for v in results.values() if v)
-        self.status.showMessage(f"XYZ プロット完了（{ok}/{n_cells} セル）")
-        self.append_log(f"XYZ プロット完了: {ok}/{n_cells} セル成功")
-        if ctx.get("cell_fmt"):
-            self.append_log(f"個別画像を {ctx.get('cells_saved', 0)} 枚"
-                            "保存しました（各セル生成直後に保存）")
-        self._xyz_last_ok = ok > 0  # 連続モードは成功時のみ続行
-        # モデル軸でマージモデルを使ったならピン状態 ●/○ を最新化。
-        if any(p.merge_models for p in ctx.get("params", {}).values()):
-            self._sync_merge_states()
-        # 比較グリッドの合成/保存はワーカースレッドで行う（大きなグリッド
-        # では数秒かかり、UI スレッドで行うとフリーズして見えるため）。
-        # 表示 OFF なら合成自体をスキップ（保存も表示が前提）。
-        if not spec.get("show_grid", True):
-            return
-        cells: list = [None] * n_cells
-        for idx, data in results.items():
-            cells[idx] = data or None
-        labels = [a["labels"] for a in spec.get("axes", [])] or [[""]] * 3
-        save_path = None
-        if spec.get("save_grid", True):
-            if metadata.AVAILABLE:
-                from datetime import datetime
-                stamp = (ctx.get("stamp")
-                         or datetime.now().strftime("%Y%m%d_%H%M%S"))
-                # グリッドは本機能の成果物なので Format 設定に関わらず PNG。
-                save_path = (self.paths.output_dir
-                             / f"xyz_{stamp}_{self._last_seed}.png")
-            else:
-                self.append_log("警告: Pillow/piexif が無いため保存できません")
-        # メタデータ文字列は UI の値を読むためここ（UIスレッド）で組み立てる。
-        params_text, extra = self._build_metadata(ctx.get("base"))
-        for name, a in zip(("x", "y", "z"), spec.get("axes", [])):
-            if a["id"] != "none":
-                extra[f"xyz_{name}_type"] = a["id"]
-                extra[f"xyz_{name}_values"] = ", ".join(a["labels"])
-        self._start_xyz_compose(
-            cells, nx, ny, nz, labels, int(spec.get("margin", 0)),
-            save_path, params_text, extra, bool(ctx.get("embed", True)))
-
-    def _start_xyz_compose(self, cells, nx, ny, nz, labels, margin,
-                           save_path, params_text, extra, embed) -> None:
-        thread = QThread(self)
-        worker = _XyzComposeWorker(cells, nx, ny, nz, labels, True, margin,
-                                   save_path, params_text, extra, embed)
-        worker.moveToThread(thread)
-        thread.started.connect(worker.run)
-        worker.done.connect(self._on_xyz_grid_ready)
-        worker.done.connect(thread.quit)
-        # 参照を保持（GC 防止）。連続モードで次の実行と重なっても互いに独立。
-        self._xyz_compose_jobs.append((thread, worker))
-        thread.finished.connect(
-            lambda t=thread, w=worker: self._xyz_compose_jobs.remove((t, w)))
-        thread.start()
-
-    def _on_xyz_grid_ready(self, res: dict) -> None:
-        self.append_log(f"比較画像を合成しました（{res['w']}x{res['h']}px）")
-        for line in res.get("log", []):
-            self.append_log(line)
-        self._last_images = [res["png"]]
-        self._show_image(res["png"])
-
-    def _on_xyz_failed(self, msg: str) -> None:
-        self.status.showMessage("XYZ プロット失敗")
-        self.append_log("エラー: " + msg)
-        if "キャンセル" not in msg:
-            QMessageBox.critical(self._xyz_parent(), "XYZ プロットエラー", msg)
-
-    def _cleanup_xyz_thread(self) -> None:
-        self._xyz_thread = None
-        self._xyz_worker = None
-        self._xyz_ctx = None
-        self.btn_generate.setEnabled(True)
-        self.btn_cancel.setEnabled(False)
-        self._push_xyz_running(False)
-        # 成功（またはスキップによる中断）で終わったら、待機タスクを最優先
-        # で消費し、無ければ XYZ 連続モード（同じ設定で次の実行）へ。
-        skip = self._xyz_skip
-        self._xyz_skip = False
-        proceed = getattr(self, "_xyz_last_ok", False) or skip
-        if proceed and self._xyz_queue:
-            run = self._xyz_queue.pop(0)
-            self.append_log(
-                f"待機中の XYZ プロットを開始します（残り {len(self._xyz_queue)} 件）")
-            self._push_xyz_queue()
-            QTimer.singleShot(0, lambda r=run: self._start_xyz_run(r))
-            return
-        if not proceed and self._xyz_queue:
-            # キャンセル/エラーで停止したときは待機タスクも破棄する。
-            n = len(self._xyz_queue)
-            self._xyz_queue.clear()
-            self.append_log(f"停止したため待機中の XYZ タスク {n} 件を破棄しました")
-            self._push_xyz_queue()
-        spec = getattr(self, "_xyz_last_spec", None)
-        if not (proceed and spec is not None and self._xyz_dlg is not None):
-            return
-        try:
-            chained = self._xyz_dlg.chk_continuous.isChecked()
-        except RuntimeError:
-            self._xyz_dlg = None
-            return
-        if chained:
-            QTimer.singleShot(
-                0, lambda: self._on_xyz_requested(spec, auto=True))
+        return self._family_config_warning(params)
 
     # ----- preset filtering (family judged from file content) -------------
     def _current_preset(self) -> str:
-        return self.cb_preset.currentData() or "anima"
+        return self.cb_preset.currentData() or families.DEFAULT_ID
 
     def _set_preset(self, token: str) -> None:
         i = self.cb_preset.findData(token)
@@ -2794,10 +876,10 @@ class MainWindow(QMainWindow):
     def _filter_for_preset(self, kind: str, files: list[str], preset: str) -> list[str]:
         if preset == "all":
             return files
-        # "shared" は anima/krea2 の共通ファイル（Qwen-Image VAE）を指す。
-        # sdxl プリセットには含めない。
-        allowed = {preset, "shared"} if preset in ("anima", "krea2") \
-            else {preset}
+        # 共用ファイル（"shared" = anima/krea2 の Qwen-Image VAE）は、それを
+        # 使える系統にだけ出す（app/families.py の shared_vae）。
+        fam = families.get(preset)
+        allowed = set(fam.vae_families) if fam else {preset}
         root = config.models_root() / kind
         return [f for f in files
                 if modelinfo.family(kind, root / f) in allowed]
@@ -2938,10 +1020,11 @@ class MainWindow(QMainWindow):
         The combos are already content-filtered to this family, so the text
         encoder and VAE simply default to the first entry; the diffusion model
         prefers a turbo/base variant by name when several are present."""
-        if preset == "sdxl":
-            # SDXL は dual TE (clip_l + clip_g) + CLIP type 'sdxl'。
+        fam = families.get(preset) or families.get(families.DEFAULT_ID)
+        if fam.dual_te:
+            # SDXL は dual TE (clip_l + clip_g) + その CLIP type。
             self.chk_dual_te.setChecked(True)
-            self._select_preferred(self.cb_diffusion, ())
+            self._select_preferred(self.cb_diffusion, fam.prefer)
             if self.cb_vae.count():
                 self.cb_vae.setCurrentIndex(0)
             clip_l, clip_g = self._sdxl_te_pair()
@@ -2949,28 +1032,26 @@ class MainWindow(QMainWindow):
                 self.cb_te1.setCurrentText(clip_l)
             if clip_g:
                 self.cb_te2.setCurrentText(clip_g)
-            idx = self.cb_clip_type.findText("sdxl")
-            if idx >= 0:
-                self.cb_clip_type.setCurrentIndex(idx)
-            return
-        self.chk_dual_te.setChecked(False)  # anima/krea2/qwen21: single CLIPLoader
-        prefer = {"anima": ("base",), "qwen21": ("int8",)}.get(preset, ("turbo",))
-        self._select_preferred(self.cb_diffusion, prefer)
-        if self.cb_vae.count():
-            self.cb_vae.setCurrentIndex(0)
-        if self.cb_te1.count():
-            self.cb_te1.setCurrentIndex(0)
-        clip = _FAMILY_CLIP_TYPE.get(preset, "stable_diffusion")
-        idx = self.cb_clip_type.findText(clip)
+        else:
+            self.chk_dual_te.setChecked(False)  # single CLIPLoader
+            self._select_preferred(self.cb_diffusion, fam.prefer)
+            if self.cb_vae.count():
+                self.cb_vae.setCurrentIndex(0)
+            if self.cb_te1.count():
+                self.cb_te1.setCurrentIndex(0)
+        idx = self.cb_clip_type.findText(fam.clip_type)
         if idx >= 0:
             self.cb_clip_type.setCurrentIndex(idx)
-        if preset == "qwen21":
-            # ComfyUI 公式テンプレの既定（euler / simple / 25 steps / cfg 1）。
-            # このプリセットを初めて開いたときだけ（保存値があれば復元）。
-            self.sp_steps.setValue(25)
-            self.sp_cfg.setValue(1.0)
-            self.cb_sampler.setCurrentText("euler")
-            self.cb_scheduler.setCurrentText("simple")
+        # 初めて開いた系統の生成設定（保存値があればそちらが優先される）。
+        d = fam.first_defaults
+        if "steps" in d:
+            self.sp_steps.setValue(int(d["steps"]))
+        if "cfg" in d:
+            self.sp_cfg.setValue(float(d["cfg"]))
+        if "sampler" in d:
+            self.cb_sampler.setCurrentText(str(d["sampler"]))
+        if "scheduler" in d:
+            self.cb_scheduler.setCurrentText(str(d["scheduler"]))
 
     def _select_preferred(self, combo: QComboBox, prefer: tuple[str, ...]) -> None:
         for i in range(combo.count()):
@@ -2987,7 +1068,7 @@ class MainWindow(QMainWindow):
         # Preset first: it filters the model dropdowns before we restore picks.
         # 旧バージョンの「すべて」("all") は保存されていたモデルの系統に移行。
         preset = str(s.get("preset", ""))
-        if preset not in ("anima", "krea2", "qwen21", "sdxl"):
+        if not families.is_family(preset):
             saved_diffusion = str(s.get("diffusion", ""))
             if saved_diffusion.startswith(MERGE_TOKEN):
                 try:
@@ -2998,7 +1079,7 @@ class MainWindow(QMainWindow):
                 fam = self._merge_family(entry) if entry else "unknown"
             else:
                 fam = self._diffusion_family(saved_diffusion)
-            preset = fam if fam in ("anima", "krea2", "qwen21", "sdxl") else "anima"
+            preset = fam if families.is_family(fam) else families.DEFAULT_ID
         self._set_preset(preset)
         # Merge selections are stored as their data token ("__merge__:<id>");
         # they are restorable because unbuilt entries auto-merge at generation.
@@ -3450,27 +1531,6 @@ class MainWindow(QMainWindow):
                     self._xyz_dlg = None
             self._xyz_worker.cancel()
             self.append_log("XYZ プロットのキャンセルを要求しました")
-
-    def _on_xyz_cancel_requested(self) -> None:
-        """XYZ ウィンドウのキャンセル/スキップボタン。
-
-        XYZ の連続 ON、またはタスクが積まれているときは「スキップ」: 現在の
-        実行だけ中断し、待機タスク/連続はそのまま次へ進む。どちらでもない
-        ときだけ従来どおりのキャンセル。"""
-        if not self._xyz_worker:
-            return
-        xyz_cont = False
-        if self._xyz_dlg is not None:
-            try:
-                xyz_cont = self._xyz_dlg.chk_continuous.isChecked()
-            except RuntimeError:
-                self._xyz_dlg = None
-        if xyz_cont or self._xyz_queue:
-            self._xyz_skip = True
-            self.append_log("スキップ: 現在の XYZ 実行を中断して次へ進みます")
-        else:
-            self.append_log("XYZ プロットのキャンセルを要求しました")
-        self._xyz_worker.cancel()
 
     def _update_cancel_button(self, *_a) -> None:
         """連続 ON かタスクが積まれているときは「スキップ」表示にする。

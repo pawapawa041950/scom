@@ -29,17 +29,10 @@ from PySide6.QtWidgets import (
 )
 
 from .window_state import bind_geometry, load_value, save_value
-from .. import config, lora, modelinfo
+from .. import config, families, lora, modelinfo
 
-# ヘッダ判定の系統 → 一覧/詳細ペインでの表示名
-_FAMILY_LABELS = {
-    modelinfo.ANIMA: "anima",
-    modelinfo.KREA2: "krea2",
-    modelinfo.QWEN21: "qwen21",
-    modelinfo.SDXL: "sdxl",
-    modelinfo.OTHER: "対応外",
-    modelinfo.UNKNOWN: "不明",
-}
+# ヘッダ判定の系統 → 一覧/詳細ペインでの表示名（app/families.py）
+_family_label = families.label
 
 _ICON_SIZE = 144
 _GRID_SIZE = QSize(168, 196)
@@ -540,7 +533,7 @@ class LoraDialog(QDialog):
     def _set_item_tooltip(self, item: QListWidgetItem, relname: str) -> None:
         item.setToolTip(
             f"{relname}\n系統: "
-            f"{_FAMILY_LABELS.get(self._fams.get(relname), '不明')}")
+            f"{_family_label(self._fams.get(relname))}")
 
     def _on_family(self, relname: str, fam: str) -> None:
         self._fams[relname] = fam
@@ -651,7 +644,7 @@ class LoraDialog(QDialog):
         info = self._meta.get(relname) or {}
         meta = info.get("meta") or {}
         fam = self._fams.get(relname, modelinfo.UNKNOWN)
-        fam_text = f"系統: {_FAMILY_LABELS.get(fam, '不明')}"
+        fam_text = f"系統: {_family_label(fam)}"
         if meta.get("found"):
             title = meta.get("name") or relname
             if meta.get("version"):
