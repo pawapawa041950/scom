@@ -1,4 +1,4 @@
-"""Identify a model file's family (anima / krea2 / qwen21 / flux3 / sdxl) from its
+"""Identify a model file's family (anima / krea2 / qwen21 / flux3 / moss / sdxl) from its
 safetensors header.
 
 Files stay where ComfyUI already keeps them (``models/<kind>/``). To decide
@@ -15,7 +15,9 @@ Signatures (confirmed against the real published files):
   * diffusion:    top-level keys ``txtfusion``/``tmlp``/``tproj`` -> krea2
     (~12B DiT); ``txt_in.text_norm`` -> qwen21 (Qwen-Image 2.1, 7B);
     top-level ``net`` -> anima; ``content_mode_blocks`` +
-    ``single_stream_modulations`` -> flux3. Param count is the fallback.
+    ``single_stream_modulations`` -> flux3; ``shared_block_modulation`` +
+    ``layers.N.proj.ffn_up_gate`` -> moss (MOSS-Image). Param count is the
+    fallback.
   * vae:          the Qwen-Image VAE is shared by anima/krea2; Qwen-Image 2.1
     has its own 64ch/16x RGBA VAE (Wan2.2 layout, temporal kernel 1);
     the FLUX.2 VAE (32ch, ``bn`` latent BatchNorm) -> flux3; kl-f8 (4ch) -> sdxl.
@@ -34,6 +36,7 @@ ANIMA = "anima"
 KREA2 = "krea2"
 QWEN21 = "qwen21"   # Qwen-Image 2.1（7B DiT / Qwen3-VL 8B TE / 専用 64ch VAE）
 FLUX3 = "flux3"     # FLUX.3（DiT / Qwen3-VL 4B TE = krea2 と同じ / FLUX.2 VAE）
+MOSS = "moss"       # MOSS-Image（DiT / Qwen3.5 9B TE / FLUX.2 VAE = flux3 と同じ）
 SDXL = "sdxl"
 SHARED = "shared"   # anima/krea2 共通（Qwen-Image VAE）。sdxl には含まれない。
 OTHER = "other"     # アーキテクチャは特定できたが、どのプリセットでも使えない
@@ -55,7 +58,10 @@ _CACHE_NAME = "model_families.json"
 # 判定待ちの間は XYZ の LoRA 候補が絞り込まれない）。
 # 2: FLUX.3 対応（FLUX.2 VAE が sdxl、FLUX.3 本体が unknown、FLUX.3 の
 #    LoRA が other と判定されていた）。
-_CACHE_VERSION = 2
+# 3: MOSS-Image 対応（本体が unknown、Qwen3.5 9B TE が qwen21 だった）。
+# 4: lm_head 付きの Qwen3.5 9B（Comfy-Org の MOSS-Image TE）も moss に
+#    （v3 までは other）。
+_CACHE_VERSION = 4
 _VERSION_KEY = "__version__"
 
 
@@ -95,12 +101,19 @@ def _load_cache() -> None:
 
 def _stale(path: str, fam: str, version) -> bool:
     """古い版で判定した結果のうち、今の規則だと変わり得るもの。"""
-    if not isinstance(version, int) or version < 2:
-        parts = {s.lower() for s in Path(path).parts}
-        if fam in (UNKNOWN, OTHER):
-            return True
-        if "vae" in parts and fam == SDXL:
-            return True
+    if not isinstance(version, int):
+        version = 1
+    if version < 3 and fam in (UNKNOWN, OTHER):
+        return True
+    if version < 4 and fam == OTHER and "text_encoders" in {
+            s.lower() for s in Path(path).parts}:
+        return True
+    if version < 3 and fam == QWEN21 and "text_encoders" in {
+            s.lower() for s in Path(path).parts}:
+        return True  # MOSS-Image の Qwen3.5 TE が qwen21 と誤判定されていた
+    if version < 2 and fam == SDXL and "vae" in {
+            s.lower() for s in Path(path).parts}:
+        return True
     return False
 
 
@@ -254,20 +267,30 @@ def _classify_lora(h: dict, keys: list[str]) -> str:
                 m in norm for m in ("_attn_out_", "_mlp_in_", "_mlp_out_")):
             return FLUX3
 
+    # MOSS-Image: layers.N.proj.{q,k,v,o,ffn_up_gate,ffn_down}（ffn_up_gate は
+    # 固有）と shared_block_modulation。
+    if any(m in norm_all for m in ("_proj_ffn_up_gate", "shared_block_modulation",
+                                   "text_embedder_blocks")):
+        return MOSS
+
     if "double_blocks" in norm_all or "single_blocks" in norm_all:
         return OTHER  # Flux / HunyuanVideo 系（kohya 名）
 
     return UNKNOWN
 
 
-# Qwen3.5 系（線形 attention 層を持つ）= 文章生成用 LLM（Qwen-Image 2.1 の
-# プロンプト整形モデル PE もこれ）。置き場は models/llm だが、間違えて
-# text_encoders に置かれても TE 候補には出さない。
-_QWEN35_KEY = "model.language_model.layers.0.linear_attn.A_log"
+# Qwen3.5 系（線形 attention 層を持つ）。接頭辞は配布元で違う
+# （"model.language_model." / "language_model."）。text_encoders にある
+# 9B は MOSS-Image の TE（素の Qwen3.5 9B。Comfy-Org 版は lm_head 付き、
+# 旧 int8 再パッケージ版は lm_head 無し）。それ以外のサイズは文章生成用
+# LLM（置き場は models/llm）なので TE 候補には出さない。プロンプト整形用の
+# 9B 微調整版（Qwen-Image PE / FLUX.3 upsampler）とはヘッダで区別できない
+# ので、それらは models/llm に置く前提。
+_QWEN35_SUFFIX = "language_model.layers.0.linear_attn.A_log"
 
 
-def _is_text_llm_header(keys) -> bool:
-    return _QWEN35_KEY in keys
+def _is_qwen35(keys) -> bool:
+    return any(k.endswith(_QWEN35_SUFFIX) for k in keys)
 
 
 def _classify_header(kind: str, h: dict) -> str:
@@ -299,8 +322,13 @@ def _classify_header(kind: str, h: dict) -> str:
         return SHARED  # Qwen-Image VAE (anima/krea2 共通) ほか
 
     if kind == "text_encoders":
-        if _is_text_llm_header(keys):
-            return OTHER   # プロンプト整形用 LLM（TE の候補には出さない）
+        if _is_qwen35(keys):
+            for k in keys:
+                if k.endswith("embed_tokens.weight"):
+                    shape = h[k].get("shape") or []
+                    # 9B (hidden 4096) = MOSS-Image。他のサイズは LLM。
+                    return MOSS if len(shape) == 2 and shape[1] == 4096 else OTHER
+            return OTHER
         if any("visual" in k or "vision" in k for k in keys):
             # Qwen3-VL: 4B (2560) = krea2、8B (4096) = Qwen-Image 2.1。
             # ComfyUI と同じく merger の出力次元で見る（無ければ embed）。
@@ -352,6 +380,10 @@ def _classify_header(kind: str, h: dict) -> str:
         # FLUX.3（ComfyUI model_detection と同じ鍵）。
         if {"content_mode_blocks", "single_stream_modulations"} <= prefixes:
             return FLUX3
+        # MOSS-Image（ComfyUI model_detection と同じ鍵）。
+        if ("shared_block_modulation.weight" in h
+                and "layers.0.proj.ffn_up_gate.weight" in h):
+            return MOSS
         if "net" in prefixes:
             return ANIMA
         # SD/SDXL U-Net（単体ファイル / フルチェックポイントの両形式）。
@@ -377,6 +409,8 @@ def _filename_family(kind: str, name: str) -> str:
     q21 = any(s in n for s in ("qwen_image_2.1", "qwen_image_2_1",
                                "qwen-image-2.1", "qwen_image2.1"))
     flux = "flux3" in n or "flux.3" in n or "flux-3" in n
+    if "moss" in n and kind != "vae":
+        return MOSS
     if kind == "vae":
         if "flux2" in n or "flux.2" in n or "flux-2" in n or flux:
             return FLUX3
@@ -469,7 +503,7 @@ def is_checkpoint(path: Path) -> bool:
 
 
 def family(kind: str, path: Path) -> str:
-    """Return 'anima' | 'krea2' | 'qwen21' | 'flux3' | 'sdxl' | 'shared' | 'other' |
+    """Return 'anima' | 'krea2' | 'qwen21' | 'flux3' | 'moss' | 'sdxl' | 'shared' | 'other' |
     'unknown' for the model file.
 
     Reads the safetensors header (cached by size+mtime); falls back to the

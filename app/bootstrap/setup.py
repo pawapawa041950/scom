@@ -33,14 +33,19 @@ LogCb = Callable[[str], None]
 # モデル読み込みの内部 API・TextGenerate の本文出力は v0.37.0 と同じ。
 # fast_disk（v0.36〜。Windows で TE 読み込み時に落ちた）は引き続き無効化
 # （comfy_backend.py の --disable-fast-disk）。
-COMFYUI_REF = os.environ.get("SCOM_COMFYUI_REF", "v0.41.1")
+# master e087d8f (2026-10-16, v0.41.1 の後): MOSS-Image 対応（DiT・Qwen3.5
+# TE・FLUX.2 VAE）。リリースタグ前なのでコミットで固定する。v0.41.1 との差は
+# MOSS-Image と workflow templates 0.11.86 のみ（v0.41.1 側だけにある変更は
+# partner の Krea ノードとバージョン表記で、scom は使わない）。
+COMFYUI_REF = os.environ.get("SCOM_COMFYUI_REF",
+                             "e087d8f6cb7c6cdb11b59dc7c9bf17c79f8d877d")
 COMFYUI_ZIP = f"https://github.com/comfyanonymous/ComfyUI/archive/{COMFYUI_REF}.zip"
 
 # Bump when a newer ComfyUI is required (e.g. for a new model architecture such
 # as Krea-2). Changing this re-fetches ComfyUI and reinstalls its deps on
 # machines that were provisioned with an older copy. Tied to the pinned ref so
 # the provisioned version is self-documenting.
-COMFYUI_MARKER = os.environ.get("SCOM_COMFYUI_MARKER", "v0.41.1")
+COMFYUI_MARKER = os.environ.get("SCOM_COMFYUI_MARKER", "master-e087d8f")
 
 # Fixed (non-model) steps, in order: (step_id, title).
 # Technical names (uv / PyTorch / ComfyUI) are kept in English by request.

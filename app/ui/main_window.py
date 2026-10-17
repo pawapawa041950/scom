@@ -302,9 +302,9 @@ class MainWindow(MergeMixin, LoraMixin, XyzMixin, QMainWindow):
     def _build_prompt_box(self) -> QGroupBox:
         box = QGroupBox("Prompt")
         layout = QVBoxLayout(box)
-        self.txt_prompt = GrowingTextEdit(min_lines=4)
+        self.txt_prompt = GrowingTextEdit(min_lines=4, max_lines=15)
         self.txt_prompt.setPlaceholderText("positive prompt…")
-        self.txt_negative = GrowingTextEdit(min_lines=3)
+        self.txt_negative = GrowingTextEdit(min_lines=3, max_lines=8)
         self.txt_negative.setPlaceholderText("negative prompt…")
         self.txt_negative.setPlainText(DEFAULT_NEGATIVE)
         # プロンプトの LLM 整形（app/prompt_llm.py）。候補は models/llm 内の

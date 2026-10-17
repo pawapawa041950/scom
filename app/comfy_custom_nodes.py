@@ -171,10 +171,11 @@ _INT4_QUANT_GROUP = 64  # scale group of the packed int4 (convrot_w4a4) layout
 # and MLP (down/output projections) measured the highest int4 weight error on
 # anima (0.16-0.29 vs 0.15 elsewhere) and stays int8. Names cover anima
 # (output_proj/layer2), krea2 (wo/down), Qwen-Image 2.1 (img_mlp.out) and
-# FLUX.3 (attn_out/mlp_out); q/k/v/up/gate go int4. "int4_convrot_full" skips this exemption (smallest
+# FLUX.3 (attn_out/mlp_out) and MOSS-Image (proj.o/proj.ffn_down); q/k/v/
+# up/gate go int4. "int4_convrot_full" skips this exemption (smallest
 # file; big models only).
 _INT4_KEEP_INT8 = ("output_proj", "o_proj", "layer2", "wo", "down", "out",
-                   "attn_out", "mlp_out")
+                   "attn_out", "mlp_out", "o", "ffn_down")
 
 
 def _int4_output_side(layer):
@@ -184,6 +185,23 @@ def _int4_output_side(layer):
     # SDXL naming: attention output = "...attn.to_out.0",
     # feed-forward second matmul = "...ff.net.2".
     return ".to_out." in layer + "." or layer.endswith("ff.net.2")
+
+
+def _quantizable_keys(patcher, keys):
+    """Linear weights that may be quantized (_quant_eligible decides per
+    mode). MOSS-Image's first and last DiT layer stay high precision like the
+    public int8 file."""
+    out = {k for k in keys if k.endswith(".weight") and _is_linear(patcher, k)}
+    pre = _PREFIX + "layers."
+    idx = {int(k[len(pre):].split(".", 1)[0]) for k in out
+           if k.startswith(pre) and k[len(pre):].split(".", 1)[0].isdigit()}
+    if idx:
+        edge = {min(idx), max(idx)}
+        out = {k for k in out
+               if not (k.startswith(pre)
+                       and k[len(pre):].split(".", 1)[0].isdigit()
+                       and int(k[len(pre):].split(".", 1)[0]) in edge)}
+    return out
 
 
 def _quant_eligible(mode, key, bare, quantizable, ndim, in_features):
@@ -200,13 +218,19 @@ def _quant_eligible(mode, key, bare, quantizable, ndim, in_features):
         # sensitive embed/final/txt layers stay high precision. The Hadamard
         # rotation also needs in_features divisible by the group size (256,
         # a multiple of the int4 scale group 64).
-        if "blocks." not in bare or in_features % _CONVROT_GROUP != 0:
+        # MOSS-Image names its DiT blocks "layers.N.proj.*" (the public int8
+        # file quantizes exactly those, minus the first/last layer which
+        # _quantizable_keys drops).
+        moss = bare.startswith("layers.") and ".proj." in bare
+        if (("blocks." not in bare and not moss)
+                or in_features % _CONVROT_GROUP != 0):
             return False
         # Text-conditioning paths stay high precision like the official
         # checkpoints (Comfy-Org's krea2 int8 leaves all 32 txtfusion
         # linears at bf16; anima's llm_adapter is its equivalent). Their
         # names contain "blocks." too, hence the explicit exclusion.
-        if "txtfusion" in bare or bare.startswith("llm_adapter."):
+        if ("txtfusion" in bare or bare.startswith("llm_adapter.")
+                or bare.startswith("text_embedder.")):
             return False
         if mode.startswith("int4_convrot"):
             # int4 is far less forgiving than int8 (verified: quantizing
@@ -590,6 +614,43 @@ except Exception:  # noqa: BLE001 - previews only; generation is unaffected
     logging.exception("scom: failed to patch lighttae previews")
 
 
+_QWEN35_BARE = "language_model.layers.0.linear_attn.A_log"
+
+
+def _patch_qwen35_prefix():
+    """Load Qwen3.5 text encoders saved without the "model." prefix.
+
+    ComfyUI recognizes Qwen3.5 only as "model.language_model.*" (+
+    "model.visual.*"), but the MOSS-Image int8 repackage ships the stock
+    Qwen3.5 9B as "language_model.*" / "visual.*", which ComfyUI then
+    mistakes for CLIP ("Cannot copy out of meta tensor"). Add the prefix
+    before detection. Old-style quantization metadata has already been turned
+    into "<layer>.comfy_quant" keys under the same names by then, so they
+    move along with their weights.
+    """
+    import comfy.sd
+    orig = comfy.sd.load_text_encoder_state_dicts
+    if getattr(orig, "_scom_qwen35", False):
+        return
+
+    def load_text_encoder_state_dicts(state_dicts=[], *args, **kwargs):
+        for i, sd in enumerate(state_dicts):
+            if _QWEN35_BARE in sd and "model." + _QWEN35_BARE not in sd:
+                state_dicts[i] = comfy.utils.state_dict_prefix_replace(
+                    sd, {"language_model.": "model.language_model.",
+                         "visual.": "model.visual."})
+        return orig(state_dicts, *args, **kwargs)
+
+    load_text_encoder_state_dicts._scom_qwen35 = True
+    comfy.sd.load_text_encoder_state_dicts = load_text_encoder_state_dicts
+
+
+try:
+    _patch_qwen35_prefix()
+except Exception:  # noqa: BLE001 - only affects such repackaged files
+    logging.exception("scom: failed to patch Qwen3.5 text encoder loading")
+
+
 class ScomMergeModel:
     """Materialize a weighted average of N diffusion models in main memory."""
 
@@ -676,9 +737,7 @@ class ScomMergeModel:
                 raise _arch_error(entries[0][0], name)
         quantizable = set()
         if quantize:
-            quantizable = {k for k in keys
-                           if k.endswith(".weight")
-                           and _is_linear(patchers[0], k)}
+            quantizable = _quantizable_keys(patchers[0], keys)
 
         out_sd = {}
         quant_layers = {}
@@ -739,9 +798,7 @@ class ScomMergeModel:
                 lora_patches = _load_lora_patches(patcher, loras)
                 pbar = comfy.utils.ProgressBar(len(keys) * len(entries))
                 if quantize:
-                    quantizable = {k for k in keys
-                                   if k.endswith(".weight")
-                                   and _is_linear(patcher, k)}
+                    quantizable = _quantizable_keys(patcher, keys)
             elif k_set != keys:
                 raise _arch_error(entries[0][0], name)
 

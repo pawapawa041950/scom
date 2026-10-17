@@ -130,13 +130,17 @@ class CompactSpinStyle(QProxyStyle):
 class GrowingTextEdit(QTextEdit):
     """A plain-text edit that grows its height to fit its content.
 
-    The vertical scrollbar is disabled — the widget resizes instead, so the
-    full prompt is always visible without scrolling.
+    Up to ``max_lines`` the widget resizes instead of scrolling, so the full
+    prompt is visible; beyond that the height stays put and a vertical
+    scrollbar appears (a huge prompt must not stretch the window without
+    limit). The scrollbar narrows the text, which only makes the document
+    taller, so switching it on/off at the limit cannot oscillate.
     """
 
-    def __init__(self, parent=None, min_lines: int = 3):
+    def __init__(self, parent=None, min_lines: int = 3, max_lines: int = 15):
         super().__init__(parent)
         self._min_lines = min_lines
+        self._max_lines = max(max_lines, min_lines)
         self.setAcceptRichText(False)
         self.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
@@ -149,9 +153,15 @@ class GrowingTextEdit(QTextEdit):
 
     def _fit(self, *args) -> None:
         doc_h = self.document().documentLayout().documentSize().height()
-        min_h = self.fontMetrics().lineSpacing() * self._min_lines
+        line = self.fontMetrics().lineSpacing()
+        min_h = line * self._min_lines
+        max_h = line * self._max_lines
+        overflow = doc_h > max_h
+        policy = Qt.ScrollBarAsNeeded if overflow else Qt.ScrollBarAlwaysOff
+        if self.verticalScrollBarPolicy() != policy:
+            self.setVerticalScrollBarPolicy(policy)
         m = self.contentsMargins()
-        height = int(max(doc_h, min_h)) + m.top() + m.bottom() \
+        height = int(min(max(doc_h, min_h), max_h)) + m.top() + m.bottom() \
             + 2 * self.frameWidth() + 4
         if height != self.height():
             self.setFixedHeight(height)

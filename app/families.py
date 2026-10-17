@@ -1,7 +1,7 @@
 """Model families (表示モデル): everything scom needs to know per family.
 
 A *family* is an image-model architecture scom supports (anima, krea2,
-Qwen-Image 2.1, FLUX.3, SDXL ...). Its files are recognised from their safetensors
+Qwen-Image 2.1, FLUX.3, MOSS-Image, SDXL ...). Its files are recognised from their safetensors
 headers in :mod:`app.modelinfo`; this module is the single table of what each
 family *requires* and *prefers*, so the UI, generation pre-flight checks, XYZ
 cell alignment, LLM prompt style and the download presets all read the same
@@ -43,6 +43,9 @@ class Family:
     # 他系統と判定される text encoder も使える（FLUX.3 は krea2 と同じ
     # Qwen3-VL 4B を使うので、その TE は krea2 と判定される）。
     te_from: tuple[str, ...] = ()
+    # 同じく VAE（MOSS-Image は FLUX.3 と同じ FLUX.2 VAE を使い、その VAE は
+    # flux3 と判定される）。
+    vae_from: tuple[str, ...] = ()
     # False: 既定の clip_type 以外でも、他の系統専用の type でなければ可
     # （anima: stable_diffusion 等の汎用 type で動く）。
     strict_clip: bool = True
@@ -68,7 +71,8 @@ class Family:
     @property
     def vae_families(self) -> tuple[str, ...]:
         """VAE として受け付ける判定結果。"""
-        return (self.id, SHARED) if self.shared_vae else (self.id,)
+        own = (self.id, SHARED) if self.shared_vae else (self.id,)
+        return own + self.vae_from
 
     @property
     def te_families(self) -> tuple[str, ...]:
@@ -154,6 +158,23 @@ FAMILIES: tuple[Family, ...] = (
         downloads=(("FLUX.3 Klein 必須モデル int8convrot（要 HF 認証）", (
             "flux3_image_klein_sd_int8_convrot.safetensors",
             "qwen3vl_4b_int8_convrot.safetensors",
+            "flux2-vae.safetensors",
+            "taef2.safetensors",
+        )),),
+    ),
+    Family(
+        id=modelinfo.MOSS, title="MOSS-Image", clip_type="moss_image",
+        vae_from=(modelinfo.FLUX3,),  # FLUX.2 VAE（FLUX.3 と共通）
+        te_warning=("・Text encoder に MOSS-Image 用（Qwen3.5 9B）を選択して"
+                    "ください（未取得なら「設定…」からダウンロード）"),
+        vae_warning="・VAE に FLUX.2 VAE（flux2-vae）を選択してください",
+        # 推奨: euler / sgm_uniform / 50 steps（30〜50）/ CFG 3.0（2.5〜3.5）。
+        # shift 5.0 は ComfyUI のモデル既定に入っている。
+        first_defaults={"steps": 50, "cfg": 3.0, "sampler": "euler",
+                        "scheduler": "sgm_uniform"},
+        downloads=(("MOSS-Image SFT 必須モデル int8convrot", (
+            "moss_image_sft_int8_convrot.safetensors",
+            "qwen3.5_9b_int8_convrot.safetensors",
             "flux2-vae.safetensors",
             "taef2.safetensors",
         )),),

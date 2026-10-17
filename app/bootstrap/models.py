@@ -32,6 +32,14 @@ PE_BASE = QWEN21_BASE
 # 4B）は Apache-2.0。ComfyUI v0.41 以上が必要。
 FLUX3_BASE = ("https://huggingface.co/black-forest-labs/"
               "flux-3-image-klein-comfy/resolve/main")
+# MOSS-Image（OpenMOSS, Apache-2.0）。Comfy-Org の ComfyUI 用再パッケージ。
+# ComfyUI master e087d8f 以降が必要。
+MOSS_BASE = "https://huggingface.co/Comfy-Org/MOSS-Image/resolve/main"
+# 以前の暫定配布元。models.json に残ったこの URL の項目は load_manifest が
+# 既定値へ置き換える（同名の既定が無いものは削除）。
+_RETIRED_URL_PREFIXES = (
+    "https://huggingface.co/XCEED123/MOSS-Image-SFT-INT8-ComfyUI/",
+)
 
 
 @dataclass
@@ -48,6 +56,11 @@ _FIELDS = ("kind", "filename", "url", "size", "required")
 
 def _krea(kind: str, filename: str, size: int) -> "ModelFile":
     return ModelFile(kind, filename, f"{KREA_BASE}/{kind}/{filename}",
+                     size, required=False)
+
+
+def _moss(kind: str, filename: str, size: int) -> "ModelFile":
+    return ModelFile(kind, filename, f"{MOSS_BASE}/{kind}/{filename}",
                      size, required=False)
 
 
@@ -144,6 +157,19 @@ DEFAULT_MODELS: list[ModelFile] = [
               "https://huggingface.co/madebyollin/taef2/resolve/main/"
               "taef2.safetensors", 10_723_524, required=False),
 
+    # --- MOSS-Image (all optional) -------------------------------------------
+    # 5.6B の単一ストリーム DiT。SFT = 生成用、Base = 微調整・学習用。
+    _moss("diffusion_models", "moss_image_sft_int8_convrot.safetensors",
+          5_413_698_958),
+    _moss("diffusion_models", "moss_image_sft_bf16.safetensors",
+          10_164_655_808),
+    _moss("diffusion_models", "moss_image_base_int8_convrot.safetensors",
+          5_413_698_958),
+    # Text encoder: 素の Qwen3.5 9B（CLIP type "moss_image"）。VAE は FLUX.3 と
+    # 共通の flux2-vae.safetensors（上の FLUX.3 の項目）。
+    _moss("text_encoders", "qwen3.5_9b_int8_convrot.safetensors",
+          9_748_121_532),
+
     # --- 生成中プレビュー用の小型 VAE（models/vae_approx。任意）-------------
     # ComfyUI（--preview-method taesd）がファイル名の先頭で探す。無い系統は
     # 簡易表示（latent2rgb）になるだけ。
@@ -214,10 +240,19 @@ def load_manifest(paths: config.AppPaths) -> list[ModelFile]:
         return manifest
     data = json.loads(mf.read_text(encoding="utf-8"))
     manifest = [ModelFile(**{k: d[k] for k in _FIELDS if k in d}) for d in data]
+    # 配布元が変わった項目: 同名の既定があればそれに置き換え、無ければ削除。
+    defaults = {(m.kind, m.filename): m for m in DEFAULT_MODELS}
+    retired = [m for m in manifest if m.url.startswith(_RETIRED_URL_PREFIXES)]
+    if retired:
+        manifest = [defaults.get((m.kind, m.filename))
+                    if m.url.startswith(_RETIRED_URL_PREFIXES) else m
+                    for m in manifest]
+        manifest = [m for m in manifest if m is not None]
     have = {(m.kind, m.filename) for m in manifest}
     added = [m for m in DEFAULT_MODELS if (m.kind, m.filename) not in have]
     if added:
         manifest.extend(added)
+    if added or retired:
         _write_manifest(mf, manifest)
     return manifest
 

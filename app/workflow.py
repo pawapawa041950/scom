@@ -34,6 +34,8 @@ CLIP_TYPES_SINGLE = [
     "qwen_image", "krea2",
     # FLUX.3（Qwen3-VL 4B text encoder。ComfyUI v0.41 以上）。
     "flux3",
+    # MOSS-Image（Qwen3.5 9B text encoder。ComfyUI master e087d8f 以降）。
+    "moss_image",
 ]
 CLIP_TYPES_DUAL = ["sdxl", "sd3", "flux", "hunyuan_video", "hidream"]
 
