@@ -15,18 +15,19 @@ from pathlib import Path
 from typing import Callable, Optional
 
 from PySide6.QtCore import Qt, Signal
-from PySide6.QtGui import QAction, QBrush, QColor
+from PySide6.QtGui import QAction, QBrush, QColor, QIntValidator
 from PySide6.QtWidgets import (
     QButtonGroup, QCheckBox, QComboBox, QDialog, QDoubleSpinBox, QHBoxLayout,
-    QInputDialog, QRadioButton,
+    QDialogButtonBox, QInputDialog, QLineEdit, QRadioButton,
     QLabel, QListWidget, QListWidgetItem, QMenu, QMessageBox, QProgressBar,
     QPushButton, QVBoxLayout, QWidget,
 )
 
 from .. import families
 from ..workflow import (
-    entry_ref_ids, is_merge_spec, merge_source_file, merge_source_label,
-    merge_spec_from_entry, norm_source,
+    FULL_RANK, entry_ref_ids, is_merge_spec, lora_size_label,
+    lora_size_suffix, merge_source_file, merge_source_label,
+    merge_spec_from_entry, norm_source, size_mb_rank,
 )
 from .widgets import WideComboBox
 from .window_state import bind_geometry
@@ -463,7 +464,7 @@ class MergeDialog(QDialog):
         lbl.setStyleSheet("color: #2a6fb0;")
         lbl.setToolTip(
             f"差分 LoRA（キャッシュ）: {merge_source_label(entry['model_a'])} − "
-            f"{merge_source_label(entry['model_b'])}／ランク {entry['rank']}\n"
+            f"{merge_source_label(entry['model_b'])}／{lora_size_label(entry['rank'])}\n"
             "● = メモリ上に作成済み / ○ = 未作成（使用時に自動で作成）")
         h.addWidget(trash)
         h.addWidget(lbl, stretch=1)
@@ -557,8 +558,8 @@ class MergeDialog(QDialog):
             self._load_recipe([(lora["model_a"], 1.0), (lora["model_b"], 1.0)],
                               "", False, [], [])
             self.lbl_lora_info.setText(
-                f"差分 LoRA「{lora['name']}」: モデル1 − モデル2 ／ ランク "
-                f"{lora['rank']}。モデルを変更して「差分を LoRA 化（この項目を"
+                f"差分 LoRA「{lora['name']}」: モデル1 − モデル2 ／ "
+                f"{lora_size_label(lora['rank'])}。モデルを変更して「差分を LoRA 化（この項目を"
                 "上書き）」を押すと作り直し、古いキャッシュは破棄されます。")
             self.lbl_lora_info.show()
             self._refresh()
@@ -961,6 +962,71 @@ class MergeDialog(QDialog):
                                   self.diff_entries(), self.quant_value(),
                                   self.chk_lowmem.isChecked())
 
+    _DEFAULT_SIZE_MB = 100
+
+    def _ask_rank(self, title: str, la: str, lb: str,
+                  current: int) -> Optional[int]:
+        """差分 LoRA の大きさを選ばせる: 「完全」か「指定」（容量 MB）。
+        戻り値は項目の "rank" の値（workflow.FULL_RANK / size_mb_rank）。
+        キャンセルは None。"""
+        dlg = QDialog(self)
+        dlg.setWindowTitle(title)
+        v = QVBoxLayout(dlg)
+        v.addWidget(QLabel(
+            f"モデル1: {la}\nモデル2: {lb}\n\n「モデル1 − モデル2」を LoRA にします。"))
+        rb_full = QRadioButton("完全（差分をそのまま・劣化なし）")
+        rb_size = QRadioButton("指定")
+        ed_size = QLineEdit()
+        ed_size.setValidator(QIntValidator(1, 1_000_000, ed_size))
+        ed_size.setFixedWidth(90)
+        ed_size.setAlignment(Qt.AlignRight)
+        group = QButtonGroup(dlg)
+        group.addButton(rb_full)
+        group.addButton(rb_size)
+        row = QHBoxLayout()
+        row.addWidget(rb_size)
+        row.addWidget(ed_size)
+        row.addWidget(QLabel("MB"))
+        row.addStretch(1)
+        v.addWidget(rb_full)
+        v.addLayout(row)
+        note = QLabel(
+            "完全: モデル2 に強度 1 で適用するとモデル1 とほぼ同じ絵になります"
+            "（容量はモデル本体と同程度）。\n"
+            "指定: その容量に収まる最大のランクで作ります。小さいほど軽く、"
+            "画風など大まかな違いだけが移ります。")
+        note.setWordWrap(True)
+        note.setStyleSheet("color: #666;")
+        v.addWidget(note)
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(dlg.accept)
+        buttons.rejected.connect(dlg.reject)
+        v.addWidget(buttons)
+        rb_size.toggled.connect(ed_size.setEnabled)
+        if current >= FULL_RANK:
+            rb_full.setChecked(True)
+            ed_size.setText(str(self._DEFAULT_SIZE_MB))
+        else:
+            rb_size.setChecked(True)
+            ed_size.setText(str(-current if current < 0
+                                else self._DEFAULT_SIZE_MB))
+        ed_size.setEnabled(rb_size.isChecked())
+
+        def ok_clicked():
+            if rb_size.isChecked() and not ed_size.hasAcceptableInput():
+                QMessageBox.warning(dlg, title,
+                                    "容量は 1 以上の整数（MB）で指定してください。")
+                return
+            dlg.accept()
+
+        buttons.accepted.disconnect()
+        buttons.accepted.connect(ok_clicked)
+        if dlg.exec() != QDialog.Accepted:
+            return None
+        if rb_full.isChecked():
+            return FULL_RANK
+        return size_mb_rank(int(ed_size.text()))
+
     def _on_extract(self, to_cache: bool = False) -> None:
         """差分から LoRA を作成: モデル1 − モデル2（表示中の 2 行）。
         to_cache=True はキャッシュ（メインメモリ）、False はファイルに保存。"""
@@ -979,12 +1045,9 @@ class MergeDialog(QDialog):
         title = ("差分 LoRA を上書き" if lora is not None
                  else "差分から LoRA を作成しキャッシュに配置" if to_cache
                  else "差分から LoRA を作成しファイルに保存")
-        rank, ok = QInputDialog.getInt(
-            self, title,
-            f"モデル1: {la}\nモデル2: {lb}\n\n「モデル1 − モデル2」を LoRA にします。\n"
-            "ランク（大きいほど忠実、ファイルも大きい）:",
-            int(lora["rank"]) if lora else 64, 1, 1024, 1)
-        if not ok:
+        rank = self._ask_rank(title, la, lb,
+                              int(lora["rank"]) if lora else 64)
+        if rank is None:
             return
         if lora is not None:
             # 選択中の差分 LoRA 項目を上書き（名前はそのまま、変更も可）。
@@ -996,6 +1059,8 @@ class MergeDialog(QDialog):
                                                 int(rank), name)
             return
 
+        suffix = lora_size_suffix(rank)
+
         def stem(src) -> str:
             if is_merge_spec(src):
                 return "".join(ch if ch not in "\\/:*?\"<>|" else "_"
@@ -1005,12 +1070,12 @@ class MergeDialog(QDialog):
         if to_cache:
             name, ok = QInputDialog.getText(
                 self, title, "LoRA ウィンドウに表示する名前:",
-                text=f"{stem(a)}-{stem(b)}_r{rank}")
+                text=f"{stem(a)}-{stem(b)}_{suffix}")
             name = name.strip()
             if ok and name:
                 self.extract_requested.emit(a, b, int(rank), name, True)
             return
-        default = f"{stem(a)}-{stem(b)}_r{rank}.safetensors"
+        default = f"{stem(a)}-{stem(b)}_{suffix}.safetensors"
         name, ok = QInputDialog.getText(
             self, title,
             "保存ファイル名（models/loras 内）:", text=default)

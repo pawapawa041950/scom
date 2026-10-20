@@ -868,11 +868,13 @@ class ScomMergeModel:
 class ScomExtractLora:
     """Extract a LoRA from the difference of two models (model_a - model_b).
 
-    For every Linear weight the difference is approximated by a rank-r SVD
-    (torch.svd_lowrank on the GPU) and stored kohya-style (lora_unet_* keys,
-    alpha = rank, so strength 1.0 reproduces "model_b + LoRA ~= model_a").
-    Norms / biases / non-matrix tensors are not part of a LoRA and are
-    dropped; the captured share of the difference energy is logged.
+    Every 2-D weight's difference is approximated by a rank-r SVD and stored
+    kohya-style (lora_unet_* keys, alpha = rank, so strength 1.0 reproduces
+    "model_b + LoRA ~= model_a"); ``rank`` may also be a size budget or
+    "full" (see _extract_lora_sd). Every other float tensor that differs
+    (norms, biases) is stored exactly as a ".diff" / ".diff_b" patch
+    (ComfyUI's LoRA loader adds those as-is). The captured share of the
+    difference energy is logged.
     """
 
     @classmethod
@@ -880,7 +882,7 @@ class ScomExtractLora:
         return {"required": {
             "model_a": ("STRING", {"default": ""}),
             "model_b": ("STRING", {"default": ""}),
-            "rank": ("INT", {"default": 64, "min": 1, "max": 1024}),
+            "rank": ("INT", {"default": 64, "min": -1000000, "max": 8192}),
             "save_to": ("STRING", {"default": ""}),  # file name in models/loras
             # True: keep the LoRA in RAM (_LORA_CACHE) instead of a file.
             "to_cache": ("BOOLEAN", {"default": False}),
@@ -902,7 +904,9 @@ class ScomExtractLora:
         _check_sources([model_a, model_b])
         if model_a == model_b:
             raise ValueError("同じモデル同士の差分は空です")
-        rank = max(1, int(rank))
+        rank = int(rank)
+        if rank == 0:
+            raise ValueError("ランク（容量）の指定が不正です")
         if to_cache:
             key = _lora_key(model_a, model_b, rank)
             with _PIN_LOCK:
@@ -928,8 +932,12 @@ class ScomExtractLora:
         meta = {
             "format": "pt",
             "ss_network_module": "networks.lora",
-            "ss_network_dim": str(rank),
-            "ss_network_alpha": str(rank),
+            # per-layer ranks (size budget / full): "Dynamic" like kohya's
+            # resize_lora; each layer carries its own alpha (= its rank).
+            "ss_network_dim": (str(rank) if 0 < rank < _FULL_RANK
+                               else "Dynamic"),
+            "ss_network_alpha": (str(rank) if 0 < rank < _FULL_RANK
+                                 else "Dynamic"),
             "scom_extract": json.dumps({
                 "model_a": _label(model_a), "model_b": _label(model_b),
                 "rank": rank, "info": info}, ensure_ascii=False),
@@ -950,7 +958,7 @@ class ScomCachedLora:
             "clip": ("CLIP",),
             "model_a": ("STRING", {"default": ""}),
             "model_b": ("STRING", {"default": ""}),
-            "rank": ("INT", {"default": 64, "min": 1, "max": 1024}),
+            "rank": ("INT", {"default": 64, "min": -1000000, "max": 8192}),
             "strength": ("FLOAT", {"default": 1.0, "min": -10.0, "max": 10.0,
                                    "step": 0.01}),
         }}
@@ -981,74 +989,205 @@ class ScomCachedLora:
         return (m, c)
 
 
-def _extract_lora_sd(model_a, model_b, rank):
-    """Rank-``rank`` kohya LoRA approximating model_a - model_b. Returns
-    (state dict, human-readable stats)."""
+_FULL_RANK = 8192       # app/workflow.py FULL_RANK: every layer exact
+_MB = 1024 * 1024       # size budgets (rank < 0 means -rank MB)
+# full-LoRA cache key -> LoRA base names of its matrix weights, so smaller
+# LoRAs can be derived from a cached full one without reloading the models.
+_FULL_LINEAR = {}
+
+
+def _lora_base(k):
+    return "lora_unet_" + k[len(_PREFIX):-len(".weight")].replace(".", "_")
+
+
+def _exact_name(k, keys):
+    """LoRA key of an exact difference patch for model key ``k``."""
+    bare = k[len(_PREFIX):]
+    if k.endswith(".bias") and (k[:-len(".bias")] + ".weight") in keys:
+        return "lora_unet_" + bare[:-len(".bias")].replace(".", "_") + ".diff_b"
+    if k.endswith(".weight"):
+        return "lora_unet_" + bare[:-len(".weight")].replace(".", "_") + ".diff"
+    return k + ".diff"
+
+
+def _model_diffs(model_a, model_b):
+    """model_a - model_b, re-iterable: iterate() yields (name, is_matrix,
+    delta fp32 on CPU). A 2-D weight (Linear, also e.g. an Embedding table:
+    ComfyUI applies lora_up @ lora_down to any weight of that shape) is
+    approximated by low rank under its LoRA base name; anything else is an
+    exact patch under its patch key."""
     pa, pb = _load_patcher(model_a), _load_patcher(model_b)
     keys = _canonical_keys(pa)
     if _canonical_keys(pb) != keys:
         raise _arch_error(model_a, model_b)
+
+    def iterate():
+        for k in sorted(keys):
+            comfy.model_management.throw_exception_if_processing_interrupted()
+            wa = _dequant(pa, k)
+            if not wa.dtype.is_floating_point:
+                continue
+            wb = _dequant(pb, k)
+            if wb.shape != wa.shape:
+                raise ValueError("形状が一致しません: {}".format(k))
+            delta = wa.to(torch.float32) - wb.to(torch.float32)
+            if (k.endswith(".weight") and delta.ndim == 2
+                    and min(delta.shape) > 1):
+                yield _lora_base(k), True, delta
+            else:
+                yield _exact_name(k, keys), False, delta
+
+    return iterate
+
+
+def _full_diffs(sd, matrix_bases):
+    """The same source read from a cached full LoRA (all patches exact)."""
+    def iterate():
+        for name in sorted(sd):
+            comfy.model_management.throw_exception_if_processing_interrupted()
+            t = sd[name].to(torch.float32)
+            base = name[:-len(".diff")] if name.endswith(".diff") else None
+            if base in matrix_bases and t.ndim == 2:
+                yield base, True, t
+            else:
+                yield name, False, t
+    return iterate
+
+
+def _rank_for_budget(iterate, budget):
+    """The largest uniform rank whose LoRA fits ``budget`` bytes (fp16).
+
+    Same rank for every Linear layer, like sd-scripts'
+    extract_lora_from_models: per-layer allocations (by difference energy,
+    by each layer's share as resize_lora's sv_fro, ...) captured more of the
+    difference numerically but came out visibly further from model_a at the
+    same size (anima, 8 prompts). Exact patches are paid first; a layer whose
+    rank reaches break-even costs its full matrix. Returns (rank, fixed)."""
+    fixed = 0
+    shapes = []
+    for _name, is_lin, delta in iterate():
+        if float(delta.pow(2).sum()) <= 1e-12:
+            continue
+        if is_lin:
+            shapes.append(delta.shape)
+        else:
+            fixed += delta.numel() * 2
+
+    def size(r):
+        return fixed + sum(min(r * (m + n), m * n) * 2 + 2 for m, n in shapes)
+
+    lo, hi = 1, _FULL_RANK - 1
+    if size(lo) > budget:
+        return lo, fixed
+    while lo < hi:
+        mid = (lo + hi + 1) // 2
+        if size(mid) <= budget:
+            lo = mid
+        else:
+            hi = mid - 1
+    return lo, fixed
+
+
+def _lowrank(delta, r, name):
+    """(up [out, r], down [r, in], kept energy) of the best rank-r
+    approximation of ``delta``."""
+    rows, cols = delta.shape
+    if r * 4 >= min(rows, cols):
+        U, S, Vh = torch.linalg.svd(delta, full_matrices=False)
+        V = Vh.T
+    else:
+        q = min(r + 16, min(rows, cols))
+        # svd_lowrank is randomized: seed it per layer so the same request
+        # always yields the same LoRA (a cached LoRA re-extracted after a
+        # release must match the original).
+        devs = [delta.device] if delta.device.type == "cuda" else []
+        with torch.random.fork_rng(devices=devs):
+            torch.manual_seed(comfy.utils.string_to_seed(name) or 1)
+            U, S, V = torch.svd_lowrank(delta, q=q, niter=4)
+    U, S, V = U[:, :r], S[:r], V[:, :r]
+    sq = S.sqrt()
+    up = (U * sq).contiguous().to(torch.float16).cpu()
+    down = (V * sq).T.contiguous().to(torch.float16).cpu()
+    return up, down, float(S.pow(2).sum())
+
+
+def _extract_lora_sd(model_a, model_b, rank):
+    """kohya-style LoRA approximating model_a - model_b. Returns (state dict,
+    human-readable stats).
+
+    ``rank``: > 0 the same rank for every matrix weight (_FULL_RANK and up:
+    every layer exact); < 0 a size budget of -rank MB: the largest uniform
+    rank that fits (_rank_for_budget). A matrix whose rank reaches the
+    break-even point rank * (rows + cols) >= rows * cols is stored as its
+    exact difference instead (no larger, lossless). Every other float tensor
+    that differs (norms, biases, conv kernels) is always stored exactly.
+    """
+    rank = int(rank)
+    full_key = _lora_key(model_a, model_b, _FULL_RANK)
+    with _PIN_LOCK:
+        full = _LORA_CACHE.get(full_key)
+    matrices = _FULL_LINEAR.get(full_key)
+    if rank < _FULL_RANK and full is not None and matrices is not None:
+        # Mathematically the same LoRA, without reloading both models.
+        logging.info("scom extract: deriving from the cached full difference")
+        iterate = _full_diffs(full["sd"], matrices)
+    else:
+        iterate = _model_diffs(model_a, model_b)
+    matrix_bases = set()
     device = comfy.model_management.get_torch_device()
-    targets = sorted(k for k in keys
-                     if k.endswith(".weight") and _is_linear(pa, k))
+    budget_mb = -rank if rank < 0 else 0
+    if budget_mb:
+        rank, fixed = _rank_for_budget(iterate, budget_mb * _MB)
+        if fixed > budget_mb * _MB:
+            logging.warning("scom extract: the exact patches alone take {:.0f} "
+                            "MB (> {} MB)".format(fixed / _MB, budget_mb))
     out = {}
     energy_total = energy_kept = 0.0
-    n_layers = 0
+    n_low = n_exact = 0
     worst = (1.0, "")
-    pbar = comfy.utils.ProgressBar(len(targets))
-    for k in targets:
-        comfy.model_management.throw_exception_if_processing_interrupted()
-        pbar.update(1)
-        wa = _dequant(pa, k)
-        if not wa.dtype.is_floating_point or wa.ndim != 2:
-            continue
-        wb = _dequant(pb, k)
-        if wb.shape != wa.shape:
-            raise ValueError("形状が一致しません: {}".format(k))
-        delta = (wa.to(device=device, dtype=torch.float32)
-                 - wb.to(device=device, dtype=torch.float32))
+    for name, is_lin, delta in iterate():
+        delta = delta.to(device)
         total = float(delta.pow(2).sum())
         if total <= 1e-12:
-            continue  # identical layer: nothing to extract
-        r = min(rank, min(delta.shape))
-        if r >= min(delta.shape):
-            # small layer: exact SVD (the LoRA is then lossless here)
-            U, S, Vh = torch.linalg.svd(delta, full_matrices=False)
-            V = Vh.T
-        else:
-            q = min(r + 16, min(delta.shape))
-            # svd_lowrank is randomized: seed it per layer so the same
-            # (model_a, model_b, rank) always yields the same LoRA (a cached
-            # LoRA re-extracted after a release must match the original).
-            devs = [device] if device.type == "cuda" else []
-            with torch.random.fork_rng(devices=devs):
-                torch.manual_seed(comfy.utils.string_to_seed(k) or 1)
-                U, S, V = torch.svd_lowrank(delta, q=q, niter=4)
-        U, S, V = U[:, :r], S[:r], V[:, :r]
-        kept = min(float(S.pow(2).sum()), total)
+            continue  # identical tensor: nothing to extract
         energy_total += total
+        if not is_lin:
+            out[name] = delta.to(torch.float16).cpu().contiguous()
+            energy_kept += total
+            n_exact += 1
+            continue
+        matrix_bases.add(name)
+        rows, cols = delta.shape
+        r = min(rank, rows, cols)
+        if r * (rows + cols) >= rows * cols:
+            out[name + ".diff"] = delta.to(torch.float16).cpu().contiguous()
+            energy_kept += total
+            n_exact += 1
+            continue
+        up, down, kept = _lowrank(delta, r, name)
+        kept = min(kept, total)
         energy_kept += kept
-        n_layers += 1
-        ratio = kept / total
-        if ratio < worst[0]:
-            worst = (ratio, k)
-        sq = S.sqrt()
-        up = (U * sq).contiguous().to(torch.float16).cpu()      # [out, r]
-        down = (V * sq).T.contiguous().to(torch.float16).cpu()  # [r, in]
-        base = "lora_unet_" + k[len(_PREFIX):-len(".weight")].replace(".", "_")
-        out[base + ".lora_up.weight"] = up
-        out[base + ".lora_down.weight"] = down
-        out[base + ".alpha"] = torch.tensor(float(r), dtype=torch.float16)
-        del delta, U, S, V
-    del pa, pb
+        n_low += 1
+        if kept / total < worst[0]:
+            worst = (kept / total, name)
+        out[name + ".lora_up.weight"] = up
+        out[name + ".lora_down.weight"] = down
+        out[name + ".alpha"] = torch.tensor(float(r), dtype=torch.float16)
+        del delta
     if not out:
         raise ValueError("2 つのモデルに差分がありません（同一の重みです）")
+    if rank >= _FULL_RANK:
+        _FULL_LINEAR[_lora_key(model_a, model_b, rank)] = matrix_bases
+    size = sum(t.numel() * t.element_size() for t in out.values())
     captured = energy_kept / energy_total if energy_total else 1.0
-    info = ("{} layers, rank {}, captured {:.1%} of the difference, worst "
-            "layer {:.1%} at {}".format(n_layers, rank, captured, worst[0],
-                                        worst[1]))
+    mode = ("full" if rank >= _FULL_RANK else
+            "{} MB budget -> rank {}".format(budget_mb, rank) if budget_mb
+            else "rank {}".format(rank))
+    info = ("{}: {:.0f} MB, {} low-rank + {} exact tensors, captured {:.1%} "
+            "of the difference, worst {:.1%} at {}".format(
+                mode, size / _MB, n_low, n_exact, captured, worst[0],
+                worst[1]))
     return out, info
-
 
 NODE_CLASS_MAPPINGS = {"ScomMergeModel": ScomMergeModel,
                        "ScomExtractLora": ScomExtractLora,

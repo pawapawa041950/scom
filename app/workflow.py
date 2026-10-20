@@ -237,6 +237,38 @@ def is_cached_lora(x) -> bool:
     return isinstance(x, dict) and "cached_lora" in x
 
 
+# 差分 LoRA の大きさの指定（項目の "rank" に 1 つの整数で持つ。ScomExtractLora
+# の rank 入力と同じ意味）:
+#   FULL_RANK 以上: 「完全」。どの層も差分をそのまま持つ（モデル1 をほぼ
+#                   再現。容量はモデル本体と同程度）。
+#   負の値 -N:      容量 N MB 以内に収まる最大のランク（全層同じランク）。
+#   1〜FULL_RANK-1: 全層同じランク（以前の作り方。既存の項目用）。
+FULL_RANK = 8192
+
+
+def size_mb_rank(mb: int) -> int:
+    """容量指定（MB）を rank の値にする。"""
+    return -max(1, int(mb))
+
+
+def lora_size_label(rank) -> str:
+    """差分 LoRA の大きさの表示: 「完全」/「100MB」/「ランク 64」。"""
+    rank = int(rank)
+    if rank >= FULL_RANK:
+        return "完全"
+    if rank < 0:
+        return f"{-rank}MB"
+    return f"ランク {rank}"
+
+
+def lora_size_suffix(rank) -> str:
+    """既定のファイル名・項目名の末尾: full / 100MB / r64。"""
+    rank = int(rank)
+    if rank >= FULL_RANK:
+        return "full"
+    return f"{-rank}MB" if rank < 0 else f"r{rank}"
+
+
 def cached_lora_spec(entry: dict) -> dict:
     return {"cached_lora": str(entry.get("name", "")),
             "id": int(entry.get("id", 0) or 0),

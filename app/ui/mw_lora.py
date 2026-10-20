@@ -23,6 +23,7 @@ from ..workflow import (
     merge_source_file,
     merge_source_label,
     norm_source,
+    lora_size_label,
     source_input,
 )
 from .mw_common import CACHED_LORA_TOKEN, _LORA_INSERT_BG, _LORA_INSERT_FG, _LORA_TAG_RE, _LORA_TOKEN_PROP
@@ -72,7 +73,7 @@ class LoraMixin:
                 "family": self._diffusion_family(
                     merge_source_file(e["model_a"])),
                 "desc": (f"差分: {merge_source_label(e['model_a'])} − "
-                         f"{merge_source_label(e['model_b'])}／ランク {e['rank']}"),
+                         f"{merge_source_label(e['model_b'])}／{lora_size_label(e['rank'])}"),
             })
         return out
 
@@ -502,7 +503,7 @@ class LoraMixin:
                 name if cached is None else
                 f"差分 LoRA（キャッシュ）: {merge_source_label(cached['model_a'])}"
                 f" − {merge_source_label(cached['model_b'])}／"
-                f"ランク {cached['rank']}")
+                f"{lora_size_label(cached['rank'])}")
             spin = QDoubleSpinBox()
             spin.setRange(-4.0, 4.0)
             spin.setDecimals(2)
