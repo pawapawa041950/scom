@@ -41,15 +41,19 @@ LogCb = Callable[[str], None]
 # int8 の活性量子化に融合（situ）して高速化、Qwen3.x TE / LLM の高速化。
 # 融合経路は int8 / int4 の量子化重み全般が通るので、scom のマージ出力
 # （int8 / int4 ConvRot）でも生成できることを確認済み。
-COMFYUI_REF = os.environ.get("SCOM_COMFYUI_REF",
-                             "5cc4b870094c89090db54bd8d12649dcaf89f2ba")
+# v0.42.4 (2026-10-21): 上記をすべて含むリリースタグに戻す。comfy-kitchen
+# 0.2.39（W4A8 = int4 マージの活性量子化を融合して高速化）、model_prefetch
+# の同期漏れ修正、TextGenerate の後始末（中断・失敗時の VRAM 解放）と
+# Qwen の think ブロック整理、MOSS-Image の色・深度コントロールノード。
+# master にだけある top-p の修正・MOSS の rope scaling・FIBO 2.0 は含まない。
+COMFYUI_REF = os.environ.get("SCOM_COMFYUI_REF", "v0.42.4")
 COMFYUI_ZIP = f"https://github.com/comfyanonymous/ComfyUI/archive/{COMFYUI_REF}.zip"
 
 # Bump when a newer ComfyUI is required (e.g. for a new model architecture such
 # as Krea-2). Changing this re-fetches ComfyUI and reinstalls its deps on
 # machines that were provisioned with an older copy. Tied to the pinned ref so
 # the provisioned version is self-documenting.
-COMFYUI_MARKER = os.environ.get("SCOM_COMFYUI_MARKER", "master-5cc4b87")
+COMFYUI_MARKER = os.environ.get("SCOM_COMFYUI_MARKER", "v0.42.4")
 
 # Fixed (non-model) steps, in order: (step_id, title).
 # Technical names (uv / PyTorch / ComfyUI) are kept in English by request.
