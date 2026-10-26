@@ -243,13 +243,15 @@ class XyzMixin:
 
         # 個別保存はセル完成のたびに行う（キャンセルしても済んだ分は残る）。
         # フォーマットは押した時点の設定で run 全体を通して固定する。
+        # 比較グリッドも同じ形式で保存する（None = 保存しない）。
+        fmt = self.cb_img_format.currentText()
+        run_fmt = None if fmt == NO_SAVE else (fmt, *self._encode_params(fmt))
         cell_fmt = None
         if spec.get("save_cells"):
-            fmt = self.cb_img_format.currentText()
-            if fmt == NO_SAVE:
+            if run_fmt is None:
                 self.append_log("Format = 保存しない のため個別画像は保存しません")
             else:
-                cell_fmt = (fmt, *self._encode_params(fmt))
+                cell_fmt = run_fmt
         ctx = {
             "spec": spec,
             "base": base,
@@ -260,6 +262,7 @@ class XyzMixin:
             "nx": len(values[0]), "ny": len(values[1]), "nz": len(values[2]),
             "total": total,
             "cell_fmt": cell_fmt,   # (fmt, ext, quality) | None
+            "grid_fmt": run_fmt,    # (fmt, ext, quality) | None（保存しない）
             "cells_saved": 0,
             "embed": self.chk_embed_meta.isChecked(),  # run 全体で固定
         }
@@ -525,15 +528,17 @@ class XyzMixin:
         for idx, data in results.items():
             cells[idx] = data or None
         labels = [a["labels"] for a in spec.get("axes", [])] or [[""]] * 3
-        save_path = None
+        save_path = None   # 拡張子なし（形式は grid_fmt、ワーカーが付ける）
+        grid_fmt = ctx.get("grid_fmt")
         if spec.get("save_grid", True):
-            if metadata.AVAILABLE:
+            if grid_fmt is None:
+                self.append_log("Format = 保存しない のため比較画像は保存しません")
+            elif metadata.AVAILABLE:
                 from datetime import datetime
                 stamp = (ctx.get("stamp")
                          or datetime.now().strftime("%Y%m%d_%H%M%S"))
-                # グリッドは本機能の成果物なので Format 設定に関わらず PNG。
                 save_path = (self.paths.output_dir
-                             / f"xyz_{stamp}_{self._last_seed}.png")
+                             / f"xyz_{stamp}_{self._last_seed}")
             else:
                 self.append_log("警告: Pillow/piexif が無いため保存できません")
         # メタデータ文字列は UI の値を読むためここ（UIスレッド）で組み立てる。
@@ -544,13 +549,16 @@ class XyzMixin:
                 extra[f"xyz_{name}_values"] = ", ".join(a["labels"])
         self._start_xyz_compose(
             cells, nx, ny, nz, labels, int(spec.get("margin", 0)),
-            save_path, params_text, extra, bool(ctx.get("embed", True)))
+            save_path, grid_fmt, params_text, extra,
+            bool(ctx.get("embed", True)))
 
     def _start_xyz_compose(self, cells, nx, ny, nz, labels, margin,
-                           save_path, params_text, extra, embed) -> None:
+                           save_path, save_fmt, params_text, extra,
+                           embed) -> None:
         thread = QThread(self)
         worker = _XyzComposeWorker(cells, nx, ny, nz, labels, True, margin,
-                                   save_path, params_text, extra, embed)
+                                   save_path, save_fmt, params_text, extra,
+                                   embed)
         worker.moveToThread(thread)
         thread.started.connect(worker.run)
         worker.done.connect(self._on_xyz_grid_ready)

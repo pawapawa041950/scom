@@ -135,6 +135,9 @@ class GrowingTextEdit(QTextEdit):
     scrollbar appears (a huge prompt must not stretch the window without
     limit). The scrollbar narrows the text, which only makes the document
     taller, so switching it on/off at the limit cannot oscillate.
+
+    Tab / Shift+Tab move the focus instead of typing a tab (a tab means
+    nothing in a prompt); tabs in pasted text become spaces.
     """
 
     def __init__(self, parent=None, min_lines: int = 3, max_lines: int = 15):
@@ -142,6 +145,7 @@ class GrowingTextEdit(QTextEdit):
         self._min_lines = min_lines
         self._max_lines = max(max_lines, min_lines)
         self.setAcceptRichText(False)
+        self.setTabChangesFocus(True)
         self.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self.setLineWrapMode(QTextEdit.WidgetWidth)
@@ -150,6 +154,12 @@ class GrowingTextEdit(QTextEdit):
         # does not change the document width, so there is no feedback loop.
         self.document().documentLayout().documentSizeChanged.connect(self._fit)
         self._fit()
+
+    def insertFromMimeData(self, source) -> None:  # noqa: N802 (Qt API)
+        if source.hasText():
+            self.insertPlainText(source.text().replace("\t", " "))
+            return
+        super().insertFromMimeData(source)
 
     def _fit(self, *args) -> None:
         doc_h = self.document().documentLayout().documentSize().height()

@@ -156,16 +156,21 @@ class _XyzComposeWorker(QObject):
     """
     done = Signal(object)   # {"png": bytes, "w": int, "h": int, "log": [str]}
 
+    # 形式ごとの 1 辺の上限（px）。超えるグリッドは PNG で保存する。
+    _MAX_SIDE = {"webp": 16383, "jpg": 65500}
+
     def __init__(self, cells: list, nx: int, ny: int, nz: int,
                  labels: list, legend: bool, margin: int,
-                 save_path, params_text: str, extra: dict, embed: bool):
+                 save_path, save_fmt, params_text: str, extra: dict,
+                 embed: bool):
         super().__init__()
         self._cells = cells          # list[bytes | None] (grid order)
         self._nx, self._ny, self._nz = nx, ny, nz
         self._labels = labels
         self._legend = legend
         self._margin = margin
-        self._save_path = save_path  # Path | None (None = 保存しない)
+        self._save_path = save_path  # Path（拡張子なし）| None (None = 保存しない)
+        self._save_fmt = save_fmt    # (fmt, ext, quality)：メインの Format 設定
         self._params_text = params_text
         self._extra = extra
         self._embed = embed
@@ -178,13 +183,21 @@ class _XyzComposeWorker(QObject):
             self._labels[0], self._labels[1], self._labels[2],
             draw_legend=self._legend, margin=self._margin)
         png = xyz.qimage_png_bytes(grid)
-        if self._save_path is not None:
+        if self._save_path is not None and self._save_fmt is not None:
+            fmt, ext, quality = self._save_fmt
+            side = max(grid.width(), grid.height())
+            limit = self._MAX_SIDE.get(fmt)
+            if limit is not None and side > limit:
+                log.append(f"比較画像が {fmt} の上限（1 辺 {limit}px）を超える"
+                           f"（{grid.width()}×{grid.height()}）ため PNG で保存します")
+                fmt, ext, quality = "png", "png", 6
+            path = self._save_path.with_name(f"{self._save_path.name}.{ext}")
             try:
                 metadata.save_with_metadata(
-                    png, self._save_path, "png", 6, self._params_text,
+                    png, path, fmt, quality, self._params_text,
                     extra=self._extra, embed=self._embed)
                 note = "メタデータ付き" if self._embed else "メタデータなし"
-                log.append(f"{self._save_path} に保存しました（{note}）")
+                log.append(f"{path} に保存しました（{note}）")
             except Exception as e:  # noqa: BLE001
                 log.append(f"グリッド画像の保存に失敗: {e}")
         self.done.emit({"png": png, "w": grid.width(), "h": grid.height(),
