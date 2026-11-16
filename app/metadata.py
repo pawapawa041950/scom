@@ -61,6 +61,8 @@ def build_parameters(meta: dict) -> str:
         # LLM 整形: 使ったモデルと人間が書いた元のプロンプト（カンマや改行を
         # 含むので JSON 文字列としてクォートする）。
         fields.append(f"Prompt LLM: {meta.get('prompt_llm')}")
+        if meta.get("prompt_llm_skill"):
+            fields.append(f"Prompt LLM skill: {meta.get('prompt_llm_skill')}")
         fields.append("Original prompt: "
                       + json.dumps(str(meta.get("prompt_original", "")),
                                    ensure_ascii=False))

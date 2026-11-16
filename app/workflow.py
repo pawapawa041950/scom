@@ -105,6 +105,9 @@ class GenParams:
     # が行い、prompt を書き換えて元の文を prompt_original に退避する。
     llm_file: str = ""
     llm_style: str = "natural"      # natural | tags
+    # 「skillsを利用」: 系統 id（app/prompt_skills.py に公式資料がある系統）。
+    # 空なら scom 同梱の汎用の指示文で整形する。
+    llm_skill: str = ""
     prompt_original: str = ""
 
 

@@ -293,6 +293,32 @@ def _is_qwen35(keys) -> bool:
     return any(k.endswith(_QWEN35_SUFFIX) for k in keys)
 
 
+# path -> (size, mtime, 文章生成できるか)
+_text_llm_cache: dict[str, tuple[int, float, bool]] = {}
+
+
+def is_text_llm(path: Path) -> bool:
+    """文章生成に使える LLM か（出力層 lm_head を持つ Qwen3.5）。
+    text_encoders に置かれた素の Qwen3.5（MOSS-Image の TE）を「LLMで整形」
+    の候補に出すための判定。ヘッダだけ読み、size+mtime でキャッシュする。"""
+    try:
+        st = path.stat()
+    except OSError:
+        return False
+    key = str(path)
+    c = _text_llm_cache.get(key)
+    if c and c[0] == st.st_size and c[1] == st.st_mtime:
+        return c[2]
+    ok = False
+    if path.suffix.lower() == ".safetensors":
+        h = _read_header(path)
+        if h:
+            ok = _is_qwen35(h) and any(
+                k in h for k in ("lm_head.weight", "model.lm_head.weight"))
+    _text_llm_cache[key] = (st.st_size, st.st_mtime, ok)
+    return ok
+
+
 def _classify_header(kind: str, h: dict) -> str:
     keys = [k for k in h if k != "__metadata__"]
     if not keys:

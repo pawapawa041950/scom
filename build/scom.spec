@@ -32,7 +32,9 @@ a = Analysis(
     [os.path.join(ROOT, "scom.py")],
     pathex=[ROOT],
     binaries=[],
-    datas=[],
+    # モデル公式のプロンプト整形資料（app/prompt_skills.py が実行時に読む。
+    # .py を含むが import ではなくファイルとして読むのでデータ扱い）。
+    datas=[(os.path.join(ROOT, "app", "skills"), os.path.join("app", "skills"))],
     hiddenimports=["websocket", "piexif", "PIL", "tomli"],
     hookspath=[],
     hooksconfig={},

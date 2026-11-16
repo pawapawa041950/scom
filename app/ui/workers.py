@@ -65,7 +65,9 @@ class _GenWorker(QObject):
         text, cached = prompt_llm.rewrite(
             self.backend, p.llm_file, p.prompt, p.llm_style,
             self.user_data or config.AppPaths().user_data,
-            cancel=lambda: self._cancel)
+            cancel=lambda: self._cancel,
+            skill=p.llm_skill, width=p.width, height=p.height,
+            on_note=self.status.emit)
         if text:
             p.prompt_original = p.prompt
             p.prompt = text

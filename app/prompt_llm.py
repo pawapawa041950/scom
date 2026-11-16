@@ -27,7 +27,7 @@ import re
 from pathlib import Path
 from typing import Callable, Optional
 
-from . import config, families
+from . import config, families, prompt_skills
 
 LLM_KIND = "llm"   # config.MODEL_DIRS のキー（models/llm）
 SUFFIX_NATURAL = ".system_prompt.txt"
@@ -96,6 +96,18 @@ def list_llm_files() -> list[str]:
     return config.scan_models(LLM_KIND)
 
 
+def list_te_llm_files() -> list[str]:
+    """models/text_encoders にある、文章生成もできる text encoder
+    （出力層つきの Qwen3.5。MOSS-Image の TE = 素の Qwen3.5 9B など）。
+    ComfyUI は models/llm も text_encoders として読むので、同じファイル名で
+    CLIPLoader から読める。models/llm に同名があればそちらを優先する。"""
+    from . import modelinfo
+    root = config.models_root() / "text_encoders"
+    own = set(list_llm_files())
+    return [f for f in config.scan_models("text_encoders")
+            if f not in own and modelinfo.is_text_llm(root / f)]
+
+
 # ----- システムプロンプト --------------------------------------------------------
 def system_prompt_for(llm_path: Path, style: str) -> str:
     suffix = SUFFIX_TAGS if style == STYLE_TAGS else SUFFIX_NATURAL
@@ -128,15 +140,34 @@ def chat_text(system: str, user: str, thinking: bool = False) -> str:
 
 # ----- ComfyUI グラフ ------------------------------------------------------------
 def build_graph(llm_file: str, text: str, style: str,
-                seed: int = LLM_SEED, max_length: int = MAX_LENGTH) -> dict:
+                seed: int = LLM_SEED, max_length: int = MAX_LENGTH,
+                greedy: bool = False,
+                presence_penalty: Optional[float] = None) -> dict:
     """CLIPLoader -> TextGenerate -> PreviewAny。
 
     TextGenerate の sampling_mode は DynamicCombo なので、API 形式では
     "sampling_mode": "on" と "sampling_mode.<param>" の平坦なキーで渡す。
     サンプリング値は PE の README 推奨（temperature 1.0 / top_p 0.95 /
     top_k 20、T2I は presence_penalty 1.5）。タグ整形は繰り返し抑制を弱める。
+    ``greedy`` は乱数を使わない生成（sampling_mode off）、``presence_penalty``
+    は既定値の上書き（どちらも prompt_skills の資料ごとの指定）。
     """
     presence = 1.5 if style == STYLE_NATURAL else 0.5
+    if presence_penalty is not None:
+        presence = float(presence_penalty)
+    if greedy:
+        sampling = {"sampling_mode": "off"}
+    else:
+        sampling = {
+            "sampling_mode": "on",
+            "sampling_mode.temperature": 1.0,
+            "sampling_mode.top_k": 20,
+            "sampling_mode.top_p": 0.95,
+            "sampling_mode.min_p": 0.0,
+            "sampling_mode.repetition_penalty": 1.0,
+            "sampling_mode.seed": int(seed),
+            "sampling_mode.presence_penalty": presence,
+        }
     return {
         "1": {"class_type": "CLIPLoader",
               "inputs": {"clip_name": llm_file, "type": "qwen_image"}},
@@ -145,14 +176,7 @@ def build_graph(llm_file: str, text: str, style: str,
                   "clip": ["1", 0],
                   "prompt": text,
                   "max_length": int(max_length),
-                  "sampling_mode": "on",
-                  "sampling_mode.temperature": 1.0,
-                  "sampling_mode.top_k": 20,
-                  "sampling_mode.top_p": 0.95,
-                  "sampling_mode.min_p": 0.0,
-                  "sampling_mode.repetition_penalty": 1.0,
-                  "sampling_mode.seed": int(seed),
-                  "sampling_mode.presence_penalty": presence,
+                  **sampling,
                   "thinking": True,
                   "use_default_template": False,
               }},
@@ -163,19 +187,26 @@ def build_graph(llm_file: str, text: str, style: str,
 # ----- 出力の解釈 ------------------------------------------------------------------
 _THINK_RE = re.compile(r"<think>.*?</think>", re.DOTALL)
 _KEY_RE = re.compile(
-    r'"(?:rewritten_prompt|prompt|positive_prompt|positive)"\s*:\s*'
+    r'"(?:rewritten_prompt|prompt|positive_prompt|positive|caption)"\s*:\s*'
     r'"((?:\\.|[^"\\])*)"', re.DOTALL)
 
 
-def parse_output(raw: str) -> tuple[str, str]:
-    """LLM の生出力から (プロンプト, 推奨アスペクト比 or "") を取り出す。"""
+def strip_thinking(raw: str) -> Optional[str]:
+    """思考ブロックを除いた本文。思考が上限で途切れて答えが無いときは None。"""
     text = raw or ""
     text = _THINK_RE.sub("", text)
     if "</think>" in text:            # 閉じタグだけ残った形
         text = text.rsplit("</think>", 1)[1]
     elif "<think>" in text:           # 思考が上限で途切れた: 答えは無い
+        return None
+    return text.strip()
+
+
+def parse_output(raw: str) -> tuple[str, str]:
+    """LLM の生出力から (プロンプト, 推奨アスペクト比 or "") を取り出す。"""
+    text = strip_thinking(raw)
+    if text is None:
         return "", ""
-    text = text.strip()
     ratio = ""
     # 1) JSON オブジェクト（コードフェンス内でも可）
     start, end = text.find("{"), text.rfind("}")
@@ -188,7 +219,7 @@ def parse_output(raw: str) -> tuple[str, str]:
         if isinstance(data, dict):
             ratio = str(data.get("wh_ratio") or "")
             for k in ("rewritten_prompt", "prompt", "positive_prompt",
-                      "positive"):
+                      "positive", "caption"):
                 v = data.get(k)
                 if isinstance(v, str) and v.strip():
                     return v.strip(), ratio
@@ -256,23 +287,53 @@ class RewriteCache:
 def rewrite(backend, llm_file: str, user_prompt: str, style: str,
             cache_dir: Path,
             cancel: Optional[Callable[[], bool]] = None,
-            thinking: bool = False) -> tuple[str, bool]:
-    """(整形後プロンプト, キャッシュ命中か)。失敗は BackendError。"""
+            thinking: bool = False,
+            skill: str = "", width: int = 0, height: int = 0,
+            on_note: Optional[Callable[[str], None]] = None
+            ) -> tuple[str, bool]:
+    """(整形後プロンプト, キャッシュ命中か)。失敗は BackendError。
+
+    ``skill`` は系統 id（prompt_skills に資料がある系統）。指定すると
+    その公式資料をシステムプロンプトにし、出力もその資料の決まりで
+    仕上げる（MOSS-Image は下書き JSON を公式スクリプトでコンパイル）。
+    ``width`` / ``height`` は生成サイズ（Layout の座標系）。``on_note`` には
+    使った資料・出力の種類などの補足を渡す（ログ用）。"""
     from .comfy_backend import BackendError
 
+    note = on_note or (lambda _m: None)
     llm_path = llm_dir() / llm_file
-    system = system_prompt_for(llm_path, style)
+    spec = prompt_skills.usable(skill, llm_file) if skill else None
+    if spec is not None:
+        style = STYLE_NATURAL
+        system = prompt_skills.system_prompt(spec.family, llm_file,
+                                             width, height)
+    else:
+        system = system_prompt_for(llm_path, style)
     user = user_prompt.strip()
     if not user:
         return "", True
     cache = RewriteCache(Path(cache_dir) / "prompt_llm_cache.json")
     key = RewriteCache.key(llm_file, style, system, user, thinking=thinking)
+    if spec is not None:
+        note(f"公式資料を使用: {spec.title}")
     hit = cache.get(key)
     if hit:
         return hit, True
-    graph = build_graph(llm_file, chat_text(system, user, thinking), style)
+    graph = build_graph(
+        llm_file, chat_text(system, user, thinking), style,
+        greedy=bool(spec and spec.greedy),
+        presence_penalty=spec.presence_penalty if spec else None)
     raw = backend.generate_text(graph, cancel=cancel)
-    text, _ratio = parse_output(raw)
+    text = ""
+    if spec is not None:
+        body = strip_thinking(raw)
+        if body:
+            text, detail = prompt_skills.finalize(spec.family, body,
+                                                  width, height)
+            if detail:
+                note(f"整形結果の種類: {detail}")
+    if not text:
+        text, _ratio = parse_output(raw)
     if not text:
         raise BackendError(
             "LLM の出力からプロンプトを取り出せませんでした"

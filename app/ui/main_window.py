@@ -21,6 +21,7 @@ from PySide6.QtWidgets import (
 )
 
 from .. import (config, families, settings, metadata, modelinfo, prompt_llm,
+                prompt_skills,
                 prompt_presets)
 from .. import lora as lora_meta
 from . import ansi_log
@@ -321,6 +322,11 @@ class MainWindow(MergeMixin, LoraMixin, XyzMixin, QMainWindow):
             "候補: models/llm に置いた LLM（Qwen-Image 2.1 の PE モデルは"
             "「設定…」からダウンロードできます）")
         llm_row.addWidget(self.cb_prompt_llm, stretch=1)
+        # モデル公式のプロンプト整形資料（app/prompt_skills.py）を使う。
+        # 資料の無い系統・使えない LLM のときはグレーアウトする。
+        self.chk_llm_skill = QCheckBox("skillsを利用")
+        self.chk_llm_skill.setEnabled(False)
+        llm_row.addWidget(self.chk_llm_skill)
         layout.addLayout(llm_row)
         layout.addWidget(QLabel("Positive"))
         layout.addWidget(self.txt_prompt)
@@ -645,9 +651,43 @@ class MainWindow(MergeMixin, LoraMixin, XyzMixin, QMainWindow):
         self.cb_prompt_llm.addItem("使わない", "")
         for f in files:
             self.cb_prompt_llm.addItem(f, f)
+        # text_encoders にある、文章生成もできる TE（MOSS-Image 用の素の
+        # Qwen3.5 9B など）。汎用 LLM としてそのまま使える。
+        for f in prompt_llm.list_te_llm_files():
+            self.cb_prompt_llm.addItem(f"{f}（text_encoders）", f)
         idx = self.cb_prompt_llm.findData(current)
         self.cb_prompt_llm.setCurrentIndex(max(0, idx))
         self.cb_prompt_llm.blockSignals(False)
+        self._update_llm_skill_checkbox()
+
+    def _llm_skill(self):
+        """今の表示モデルと LLM で使える公式資料（prompt_skills.Skill | None）。"""
+        return prompt_skills.usable(
+            self._current_preset(),
+            str(self.cb_prompt_llm.currentData() or ""))
+
+    def _update_llm_skill_checkbox(self, *_a) -> None:
+        """「skillsを利用」の有効/無効と説明を、表示モデルと LLM に合わせる。"""
+        family = self._current_preset()
+        llm = str(self.cb_prompt_llm.currentData() or "")
+        skill = prompt_skills.usable(family, llm)
+        self.chk_llm_skill.setEnabled(skill is not None)
+        if skill is not None:
+            tip = (f"{skill.title} を使って整形します。\n出所: {skill.source}\n"
+                   "OFF のときは scom 同梱の汎用の指示文で整形します。")
+            if family == modelinfo.MOSS:
+                tip += ("\n文字入りのポスターなど配置が重要な依頼では、枠で"
+                        "配置を指定する Layout 形式（JSON）のプロンプトに"
+                        "なります。")
+        elif prompt_skills.get(family) is None:
+            tip = ("この表示モデルには公式のプロンプト整形資料がありません"
+                   "（対応: MOSS-Image / Krea-2 / FLUX.3）。")
+        elif not llm:
+            tip = "「LLMで整形」で LLM を選ぶと使えます。"
+        else:
+            tip = ("この LLM は特定のモデル用に調整されていて、他の資料の指示に"
+                   "従いません。汎用の LLM（素の Qwen3.5 など）を選んでください。")
+        self.chk_llm_skill.setToolTip(tip)
 
     @staticmethod
     def _fill_combo(combo: QComboBox, items: list[str], allow_empty: bool = False) -> None:
@@ -1118,6 +1158,8 @@ class MainWindow(MergeMixin, LoraMixin, XyzMixin, QMainWindow):
         self.cb_dtype.setCurrentText(str(s.get("dtype", "default")))
         idx = self.cb_prompt_llm.findData(str(s.get("prompt_llm", "")))
         self.cb_prompt_llm.setCurrentIndex(max(0, idx))
+        self.chk_llm_skill.setChecked(bool(s.get("prompt_llm_skill", False)))
+        self._update_llm_skill_checkbox()
         # Hires fix (latent)
         self.grp_hires.setChecked(bool(s.get("hires_enabled", False)))
         self.sp_hires_scale.setValue(float(s.get("hires_scale", 1.5)))
@@ -1161,6 +1203,11 @@ class MainWindow(MergeMixin, LoraMixin, XyzMixin, QMainWindow):
         self.chk_embed_meta.toggled.connect(self._schedule_save)
         self.ed_seed.textChanged.connect(self._schedule_save)
         self.cb_prompt_llm.currentIndexChanged.connect(self._schedule_save)
+        self.chk_llm_skill.toggled.connect(self._schedule_save)
+        self.cb_prompt_llm.currentIndexChanged.connect(
+            self._update_llm_skill_checkbox)
+        self.cb_preset.currentIndexChanged.connect(
+            self._update_llm_skill_checkbox)
 
     def _schedule_save(self, *args) -> None:
         if self._loading:
@@ -1214,6 +1261,7 @@ class MainWindow(MergeMixin, LoraMixin, XyzMixin, QMainWindow):
             "hires_steps": self.sp_hires_steps.value(),
             "hires_method": self.cb_hires_method.currentText(),
             "prompt_llm": str(self.cb_prompt_llm.currentData() or ""),
+            "prompt_llm_skill": self.chk_llm_skill.isChecked(),
             "image_format": self.cb_img_format.currentText(),
             "embed_metadata": self.chk_embed_meta.isChecked(),
             "png_compress": self.sp_png_compress.value(),
@@ -1323,6 +1371,9 @@ class MainWindow(MergeMixin, LoraMixin, XyzMixin, QMainWindow):
             llm_style=prompt_llm.effective_style(
                 self._current_preset(),
                 str(self.cb_prompt_llm.currentData() or "")),
+            llm_skill=(self._current_preset()
+                       if self.chk_llm_skill.isChecked()
+                       and self._llm_skill() is not None else ""),
         )
 
     # ----- prompt presets (prompts.csv) -------------------------------------
@@ -1723,6 +1774,8 @@ class MainWindow(MergeMixin, LoraMixin, XyzMixin, QMainWindow):
                 meta["lora_hashes"] = ", ".join(hashes)
         if p.llm_file and p.prompt_original:
             meta["prompt_llm"] = p.llm_file
+            if p.llm_skill:
+                meta["prompt_llm_skill"] = p.llm_skill
             meta["prompt_original"] = p.prompt_original
         params_text = metadata.build_parameters(meta)
         return params_text, {"app": "scom", **meta}
