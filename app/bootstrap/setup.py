@@ -46,14 +46,20 @@ LogCb = Callable[[str], None]
 # の同期漏れ修正、TextGenerate の後始末（中断・失敗時の VRAM 解放）と
 # Qwen の think ブロック整理、MOSS-Image の色・深度コントロールノード。
 # master にだけある top-p の修正・MOSS の rope scaling・FIBO 2.0 は含まない。
-COMFYUI_REF = os.environ.get("SCOM_COMFYUI_REF", "v0.42.4")
+# v0.46.0 (2026-11-18): LLM（Generate Text）の高速化（MTP の木探索、Qwen3.x
+# の線形層の結合）と fp8 の Qwen で文章生成が落ちる不具合の修正、FLUX.2 VAE
+# （FLUX.3 / MOSS-Image）のデコード高速化、MOSS-Image のピークメモリ削減、
+# モデル切り替え時にサンプリング設定が次のモデルへ漏れる不具合の修正、
+# comfy-aimdo 0.6.0（VRAM 管理の刷新）/ comfy-kitchen 0.2.41。TextGenerate
+# は非推奨になったので後継の TextGenerateV2 を使う（app/prompt_llm.py）。
+COMFYUI_REF = os.environ.get("SCOM_COMFYUI_REF", "v0.46.0")
 COMFYUI_ZIP = f"https://github.com/comfyanonymous/ComfyUI/archive/{COMFYUI_REF}.zip"
 
 # Bump when a newer ComfyUI is required (e.g. for a new model architecture such
 # as Krea-2). Changing this re-fetches ComfyUI and reinstalls its deps on
 # machines that were provisioned with an older copy. Tied to the pinned ref so
 # the provisioned version is self-documenting.
-COMFYUI_MARKER = os.environ.get("SCOM_COMFYUI_MARKER", "v0.42.4")
+COMFYUI_MARKER = os.environ.get("SCOM_COMFYUI_MARKER", "v0.46.0")
 
 # Fixed (non-model) steps, in order: (step_id, title).
 # Technical names (uv / PyTorch / ComfyUI) are kept in English by request.

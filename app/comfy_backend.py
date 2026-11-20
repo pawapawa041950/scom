@@ -656,7 +656,7 @@ class ComfyBackend:
     def generate_text(self, graph: dict,
                       cancel: Optional[Callable[[], bool]] = None,
                       timeout: float = 900.0) -> str:
-        """文字列を出力するグラフ（TextGenerate -> PreviewAny 等）を実行し、
+        """文字列を出力するグラフ（TextGenerateV2 -> PreviewAny 等）を実行し、
         履歴の "text" 出力を連結して返す。進捗は不要なので websocket は
         使わず /history のポーリングで完了を待つ。"""
         if not self.is_running():

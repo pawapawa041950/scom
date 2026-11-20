@@ -1,7 +1,7 @@
 """プロンプトを LLM に書き直させる（Qwen-Image 2.1 の PE モデルなど）。
 
 ComfyUI 本体のノードだけで完結する:
-  CLIPLoader(type=qwen_image) -> TextGenerate(生のチャット書式) -> PreviewAny
+  CLIPLoader(type=qwen_image) -> TextGenerateV2(生のチャット書式) -> PreviewAny
 生成した文字列は /history から取り出す（app/comfy_backend.generate_text）。
 
 使える LLM = models/llm/ に置いた safetensors（ComfyUI が「文章生成できる」
@@ -143,9 +143,9 @@ def build_graph(llm_file: str, text: str, style: str,
                 seed: int = LLM_SEED, max_length: int = MAX_LENGTH,
                 greedy: bool = False,
                 presence_penalty: Optional[float] = None) -> dict:
-    """CLIPLoader -> TextGenerate -> PreviewAny。
+    """CLIPLoader -> TextGenerateV2 -> PreviewAny。
 
-    TextGenerate の sampling_mode は DynamicCombo なので、API 形式では
+    TextGenerateV2 の sampling_mode は DynamicCombo なので、API 形式では
     "sampling_mode": "on" と "sampling_mode.<param>" の平坦なキーで渡す。
     サンプリング値は PE の README 推奨（temperature 1.0 / top_p 0.95 /
     top_k 20、T2I は presence_penalty 1.5）。タグ整形は繰り返し抑制を弱める。
@@ -171,7 +171,7 @@ def build_graph(llm_file: str, text: str, style: str,
     return {
         "1": {"class_type": "CLIPLoader",
               "inputs": {"clip_name": llm_file, "type": "qwen_image"}},
-        "2": {"class_type": "TextGenerate",
+        "2": {"class_type": "TextGenerateV2",
               "inputs": {
                   "clip": ["1", 0],
                   "prompt": text,
